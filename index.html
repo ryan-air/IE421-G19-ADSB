@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Aircraft Tracker</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>✈ AIR TRAFFIC CONTROL</h1>
+            <div class="status">
+                <span id="status-indicator" class="status-dot"></span>
+                <span id="status-text">Connecting...</span>
+            </div>
+        </header>
+
+        <div class="stats-bar">
+            <div class="stat">
+                <span class="stat-label">Aircraft Tracked:</span>
+                <span class="stat-value" id="aircraft-count">0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Last Update:</span>
+                <span class="stat-value" id="last-update">--</span>
+            </div>
+        </div>
+
+        <div id="map"></div>
+
+        <div class="aircraft-list-container">
+            <h2>Aircraft List</h2>
+            <div id="aircraft-list" class="aircraft-list"></div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

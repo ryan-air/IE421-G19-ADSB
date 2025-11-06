@@ -28,7 +28,7 @@
 ## About Me
 
 <div align="center">
-  <img src="apoorv.png" alt="Apoorv" width="200" style="border-radius: 50%;">
+  <img src="apoorv.jpg" alt="Apoorv" width="200" style="border-radius: 50%;">
 </div>
 
 ### Education & Career Timeline

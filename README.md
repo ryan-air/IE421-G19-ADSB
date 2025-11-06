@@ -6,10 +6,6 @@
   <img src="saksham.png" alt="Saksham" width="200" style="border-radius: 50%;">
 </div>
 
-### Biography
-
-[Add your brief biography here. Include your academic background, interests, relevant experience, and what makes you passionate about high-frequency trading or quantitative finance.]
-
 ### Education & Career Timeline
 
 - **Expected Graduation:** Spring 2027

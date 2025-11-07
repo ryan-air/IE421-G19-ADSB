@@ -42,22 +42,27 @@ function formatTime(timestamp) {
     return date.toLocaleTimeString();
 }
 
-// Create aircraft marker icon with plane SVG
+// Create aircraft marker icon with plane SVG and label
 function createAircraftIcon(aircraft) {
     const heading = aircraft.track || 0;
+    const identifier = aircraft.flight || aircraft.hex || 'N/A';
+    
     const planeSVG = `
-        <svg width="24" height="24" viewBox="0 0 24 24" class="aircraft-icon" style="transform: rotate(${heading}deg);">
-            <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="#7a9a7a" stroke="#5a8a5a" stroke-width="0.5"/>
-            <path d="M2 17L12 22L22 17" stroke="#7a9a7a" stroke-width="1" fill="none"/>
-            <circle cx="12" cy="12" r="2" fill="#6b8e6b"/>
-        </svg>
+        <div class="aircraft-marker-container">
+            <div class="aircraft-label">${identifier}</div>
+            <svg width="24" height="24" viewBox="0 0 24 24" class="aircraft-icon" style="transform: rotate(${heading}deg);">
+                <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="#7a9a7a" stroke="#5a8a5a" stroke-width="0.5"/>
+                <path d="M2 17L12 22L22 17" stroke="#7a9a7a" stroke-width="1" fill="none"/>
+                <circle cx="12" cy="12" r="2" fill="#6b8e6b"/>
+            </svg>
+        </div>
     `;
     
     return L.divIcon({
         className: 'aircraft-marker',
         html: planeSVG,
-        iconSize: [24, 24],
-        iconAnchor: [12, 12]
+        iconSize: [60, 40], // Wider to accommodate label
+        iconAnchor: [30, 35] // Anchor at bottom center (below label)
     });
 }
 
@@ -151,6 +156,22 @@ function updateAircraftOnMap(aircraftData) {
                 );
             }
             
+            // Update label and icon rotation if needed
+            if (marker._icon) {
+                const labelElement = marker._icon.querySelector('.aircraft-label');
+                const newIdentifier = aircraft.flight || aircraft.hex || 'N/A';
+                if (labelElement && marker._identifier !== newIdentifier) {
+                    labelElement.textContent = newIdentifier;
+                    marker._identifier = newIdentifier;
+                }
+                // Update icon rotation for small movements
+                const iconElement = marker._icon.querySelector('.aircraft-icon');
+                if (iconElement && aircraft.track !== undefined) {
+                    iconElement.style.transform = `rotate(${aircraft.track}deg)`;
+                    marker._heading = aircraft.track;
+                }
+            }
+            
             // Update popup content
             const popupContent = `
                 <div style="font-family: 'Courier New', monospace; color: #7a9a7a;">
@@ -170,6 +191,7 @@ function updateAircraftOnMap(aircraftData) {
             }).addTo(map);
             
             marker._heading = aircraft.track || 0;
+            marker._identifier = aircraft.flight || aircraft.hex || 'N/A';
 
             // Add popup with aircraft info
             const popupContent = `

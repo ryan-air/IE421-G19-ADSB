@@ -79,54 +79,61 @@ A web application to display live aircraft data from a SQLite database.
 - 📋 Aircraft list with details (altitude, speed, heading, etc.)
 - 🔄 Auto-updates every 2 seconds
 - 🎨 ATC-style interface with smooth aircraft movement
-- 💾 SQLite database for aircraft data storage
+- ☁️ Supabase (PostgreSQL) cloud database for aircraft data storage
 
 ### Database Setup
 
-The application uses SQLite to store aircraft data. The database file (`aircraft.db`) is created automatically when you first start the server.
+The application uses **Supabase** (PostgreSQL) to store aircraft data. The Raspberry Pi writes directly to the database, and the web server reads from it.
 
-**Database Schema:**
-- Stores aircraft positions, flight data, altitude, speed, heading
-- Automatically indexes aircraft by hex code and timestamp
-- Keeps last 30 seconds of data visible
+**Setup Steps:**
+
+1. **Create Supabase Project:**
+   - Sign up at https://supabase.com
+   - Create a new project
+   - Note your database password
+
+2. **Get Connection String:**
+   - Go to Settings → Database
+   - Copy the "Connection string" → "URI"
+   - It looks like: `postgresql://postgres:[PASSWORD]@db.xxxxx.supabase.co:5432/postgres`
+
+3. **Create `.env` file:**
+   ```bash
+   DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@db.xxxxx.supabase.co:5432/postgres
+   ```
+
+4. **Create Database Table:**
+   - In Supabase dashboard, go to SQL Editor
+   - Run this SQL:
+   ```sql
+   CREATE TABLE IF NOT EXISTS aircraft (
+       id SERIAL PRIMARY KEY,
+       hex VARCHAR(6) NOT NULL,
+       flight VARCHAR(10),
+       lat DECIMAL(10, 7),
+       lon DECIMAL(10, 7),
+       altitude INTEGER,
+       speed INTEGER,
+       track INTEGER,
+       messages INTEGER,
+       seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   );
+   
+   CREATE INDEX IF NOT EXISTS idx_hex ON aircraft(hex);
+   CREATE INDEX IF NOT EXISTS idx_seen_at ON aircraft(seen_at);
+   ```
 
 **API Endpoints:**
 
 1. **GET `/api/aircraft`** - Retrieve current aircraft (used by frontend)
-   - Returns aircraft from the last 30 seconds
+   - Returns aircraft from the last 30 seconds (configurable via `?window=60` query param)
    - Automatically groups by hex code to show latest position
 
-2. **POST `/api/aircraft`** - Insert aircraft data (for Raspberry Pi)
-   ```bash
-   curl -X POST http://localhost:3000/api/aircraft \
-     -H "Content-Type: application/json" \
-     -d '{"aircraft": [{"hex": "ABC123", "flight": "TEST01", "lat": 40.11, "lon": -88.24, ...}]}'
-   ```
+2. **GET `/api/health`** - Check database connection status
+   - Returns connection status and total aircraft count
 
-3. **GET `/api/health`** - Check database connection status
-
-### Adding Aircraft Data
-
-To add aircraft data from your Raspberry Pi or other source, POST JSON data to `/api/aircraft`:
-
-```json
-{
-  "aircraft": [
-    {
-      "hex": "ABC123",
-      "flight": "UAL123",
-      "lat": 40.11,
-      "lon": -88.24,
-      "altitude": 35000,
-      "speed": 450,
-      "track": 90,
-      "messages": 100
-    }
-  ]
-}
-```
-
-The frontend will automatically pick up new data and display it on the map.
+**Note:** The Raspberry Pi writes directly to Supabase using the same connection string. The web server only reads from the database.
 
 ### Project Structure
 

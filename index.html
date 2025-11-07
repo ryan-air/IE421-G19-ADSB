@@ -8,32 +8,53 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>✈ AIR TRAFFIC CONTROL</h1>
+    <!-- Top header bar -->
+    <header class="top-header">
+        <h1>✈ AIR TRAFFIC CONTROL</h1>
+        <div class="header-controls">
             <div class="status">
                 <span id="status-indicator" class="status-dot"></span>
                 <span id="status-text">Connecting...</span>
             </div>
-        </header>
-
-        <div class="stats-bar">
-            <div class="stat">
-                <span class="stat-label">Aircraft Tracked:</span>
+            <div class="stat-inline">
+                <span class="stat-label">Aircraft:</span>
                 <span class="stat-value" id="aircraft-count">0</span>
             </div>
-            <div class="stat">
-                <span class="stat-label">Last Update:</span>
+            <div class="stat-inline">
+                <span class="stat-label">Update:</span>
                 <span class="stat-value" id="last-update">--</span>
             </div>
         </div>
+    </header>
 
-        <div id="map"></div>
+    <!-- Map container (fullscreen) -->
+    <div id="map"></div>
 
-        <div class="aircraft-list-container">
-            <h2>Aircraft List</h2>
-            <div id="aircraft-list" class="aircraft-list"></div>
+    <!-- Controls overlay (top-right) -->
+    <div class="controls-overlay">
+        <div class="control-panel">
+            <h3>Controls</h3>
+            <div class="control-group">
+                <label for="time-window">Time Window:</label>
+                <select id="time-window" class="control-select">
+                    <option value="30">30 seconds</option>
+                    <option value="60">1 minute</option>
+                    <option value="120">2 minutes</option>
+                    <option value="300">5 minutes</option>
+                    <option value="0">All data</option>
+                </select>
+            </div>
+            <button id="toggle-list" class="control-button">Toggle Aircraft List</button>
         </div>
+    </div>
+
+    <!-- Aircraft list panel (bottom, collapsible) -->
+    <div id="aircraft-list-panel" class="aircraft-list-panel">
+        <div class="aircraft-list-header">
+            <h2>Aircraft List</h2>
+            <button id="close-list" class="close-button">×</button>
+        </div>
+        <div id="aircraft-list" class="aircraft-list"></div>
     </div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

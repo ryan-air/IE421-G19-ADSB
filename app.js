@@ -1,18 +1,25 @@
-// Initialize the map centered on a default location (you can change this)
-const map = L.map('map').setView([40.11, -88.24], 10); // Default: Champaign, IL
-
-// Add dark CartoDB tiles for ATC/radar look
-L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    attribution: '© OpenStreetMap contributors © CARTO',
-    maxZoom: 19,
-    subdomains: 'abcd'
-}).addTo(map);
-
 // Store aircraft data and markers
+let map;
 const aircraftMarkers = new Map();
 const aircraftState = new Map(); // Store previous state for interpolation
 let updateInterval;
 const INTERPOLATION_DURATION = 2000; // Match polling interval for smooth movement
+
+// Initialize map
+function initializeMap() {
+    // Initialize the map centered on a default location (you can change this)
+    map = L.map('map', {
+        zoomControl: true,
+        attributionControl: true
+    }).setView([40.11, -88.24], 10); // Default: Champaign, IL
+
+    // Add dark CartoDB tiles for ATC/radar look
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        attribution: '© OpenStreetMap contributors © CARTO',
+        maxZoom: 19,
+        subdomains: 'abcd'
+    }).addTo(map);
+}
 
 // Update status indicator
 function updateStatus(connected, text) {
@@ -105,10 +112,13 @@ function smoothMoveMarker(marker, targetLat, targetLon, targetHeading, duration)
 
 // Update aircraft on map with smooth movement
 function updateAircraftOnMap(aircraftData) {
+    if (!map) return; // Map not initialized yet
+    
     const currentTime = Date.now();
     const seenAircraftIds = new Set();
     
-    aircraftData.forEach(aircraft => {
+    // Process all aircraft in the current dataset
+    (aircraftData || []).forEach(aircraft => {
         if (!aircraft.lat || !aircraft.lon) return;
         
         const aircraftId = aircraft.hex || aircraft.id || `aircraft-${aircraft.flight}`;
@@ -188,11 +198,18 @@ function updateAircraftOnMap(aircraftData) {
     // Remove markers for aircraft that are no longer visible
     aircraftMarkers.forEach((marker, id) => {
         if (!seenAircraftIds.has(id)) {
-            map.removeLayer(marker);
+            // Remove marker from map
+            if (map.hasLayer(marker)) {
+                map.removeLayer(marker);
+            }
+            // Clean up
             aircraftMarkers.delete(id);
             aircraftState.delete(id);
         }
     });
+    
+    // Debug log (can be removed later)
+    console.log(`Map updated: ${seenAircraftIds.size} aircraft visible, ${aircraftMarkers.size} markers on map`);
 }
 
 // Update aircraft list
@@ -220,10 +237,17 @@ function updateAircraftList(aircraftData) {
     }).join('');
 }
 
+// Get current time window from selector
+function getTimeWindow() {
+    const selector = document.getElementById('time-window');
+    return selector ? parseInt(selector.value) : 30;
+}
+
 // Fetch aircraft data from backend
 async function fetchAircraftData() {
     try {
-        const response = await fetch('http://localhost:3000/api/aircraft?window=0');
+        const timeWindow = getTimeWindow();
+        const response = await fetch(`http://localhost:3000/api/aircraft?window=${timeWindow}`);
         
         if (!response.ok) {
             throw new Error('Failed to fetch aircraft data');
@@ -235,13 +259,9 @@ async function fetchAircraftData() {
         document.getElementById('aircraft-count').textContent = data.aircraft?.length || 0;
         document.getElementById('last-update').textContent = formatTime(data.now || Date.now());
 
-        // Update map and list
-        if (data.aircraft && data.aircraft.length > 0) {
-            updateAircraftOnMap(data.aircraft);
-            updateAircraftList(data.aircraft);
-        } else {
-            updateAircraftList([]);
-        }
+        // Update map and list (always update map, even if empty)
+        updateAircraftOnMap(data.aircraft || []);
+        updateAircraftList(data.aircraft || []);
     } catch (error) {
         console.error('Error fetching aircraft data:', error);
         updateStatus(false, 'Connection Error');
@@ -261,9 +281,38 @@ function stopPolling() {
     }
 }
 
+// Toggle aircraft list panel
+function setupControls() {
+    const toggleButton = document.getElementById('toggle-list');
+    const closeButton = document.getElementById('close-list');
+    const listPanel = document.getElementById('aircraft-list-panel');
+    const timeWindowSelector = document.getElementById('time-window');
+    
+    if (toggleButton) {
+        toggleButton.addEventListener('click', () => {
+            listPanel.classList.toggle('open');
+        });
+    }
+    
+    if (closeButton) {
+        closeButton.addEventListener('click', () => {
+            listPanel.classList.remove('open');
+        });
+    }
+    
+    // Update data when time window changes
+    if (timeWindowSelector) {
+        timeWindowSelector.addEventListener('change', () => {
+            fetchAircraftData(); // Immediately fetch with new window
+        });
+    }
+}
+
 // Initialize when page loads
 document.addEventListener('DOMContentLoaded', () => {
+    initializeMap();
     updateStatus(false, 'Connecting...');
+    setupControls();
     startPolling();
 });
 

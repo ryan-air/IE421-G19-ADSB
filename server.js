@@ -1,130 +1,148 @@
-const express = require('express');
-const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
-const initSqlJs = require('sql.js');
+import dotenv from "dotenv";
+dotenv.config();
+
+import express from 'express';
+import cors from 'cors';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { Pool } from 'pg';
+
+// ES module equivalent of __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = 3000;
 
-// SQLite database configuration
-const DB_PATH = process.env.DB_PATH || './aircraft.db';
+// Check if DATABASE_URL is set
+if (!process.env.DATABASE_URL) {
+    console.error('❌ DATABASE_URL not found in environment variables');
+    console.error('   Make sure you have a .env file with DATABASE_URL set');
+    console.error('   Example: DATABASE_URL=postgresql://postgres:password@host:5432/postgres');
+    process.exit(1);
+}
 
-let db = null;
-let SQL = null;
+// Parse connection string to show host (for debugging, without password)
+let dbHostname, dbPort;
+try {
+    const url = new URL(process.env.DATABASE_URL);
+    dbHostname = url.hostname;
+    dbPort = url.port || 5432;
+    console.log(`📊 Connecting to: ${dbHostname}:${dbPort}`);
+    
+    // Check if using direct connection (IPv6-only) instead of pooler
+    if (dbHostname.includes('.supabase.co') && !dbHostname.includes('.pooler.')) {
+        console.warn('⚠️  WARNING: Using Direct Connection (may not work on IPv4 networks)');
+        console.warn('   Consider using Session Pooler connection string instead:');
+        console.warn('   Settings → Database → Connection string → Session mode');
+        console.warn('   Format: postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres');
+    }
+} catch (e) {
+    console.error('❌ Invalid DATABASE_URL format');
+    process.exit(1);
+}
 
-// Initialize database
-async function initializeDatabase() {
+// Supabase PostgreSQL connection
+// Use Session Pooler connection string for IPv4 compatibility
+// Format: postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres
+const db = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false  // Supabase requires SSL
+    },
+    // Connection pool settings for better performance
+    max: 20, // Maximum number of clients in the pool
+    idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
+    connectionTimeoutMillis: 10000, // Return an error after 10 seconds if connection could not be established
+});
+
+// Test database connection
+async function testConnection() {
     try {
-        SQL = await initSqlJs();
+        const result = await db.query('SELECT NOW()');
+        console.log('✅ Connected to Supabase database');
+        console.log(`   Database time: ${result.rows[0].now}`);
+    } catch (error) {
+        console.error('❌ Database connection failed:', error.message);
         
-        // Load existing database or create new one
-        if (fs.existsSync(DB_PATH)) {
-            const buffer = fs.readFileSync(DB_PATH);
-            db = new SQL.Database(buffer);
-            console.log('✅ Database loaded from file');
+        if (error.message.includes('ENOTFOUND') || error.message.includes('getaddrinfo')) {
+            console.error('\n   🔍 DNS Resolution Error - This usually means:');
+            console.error('   1. Your network is IPv4-only and the hostname is IPv6-only');
+            console.error('   2. You need to use the Session Pooler connection string');
+            console.error('\n   ✅ Solution:');
+            console.error('   1. Go to Supabase Dashboard → Settings → Database');
+            console.error('   2. Under "Connection string", select "Session mode" (NOT "Direct connection")');
+            console.error('   3. Copy the connection string (should have .pooler. in hostname and port 6543)');
+            console.error('   4. Update your .env file with the Session Pooler connection string');
+            console.error('\n   Session Pooler format:');
+            console.error('   postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres');
         } else {
-            db = new SQL.Database();
-            console.log('✅ New database created');
+            console.error('\n   Troubleshooting:');
+            console.error('   1. Check your .env file has DATABASE_URL set correctly');
+            console.error('   2. Verify the connection string from Supabase dashboard');
+            console.error('   3. Make sure your password doesn\'t contain special characters that need URL encoding');
+            console.error('   4. Check your internet connection');
         }
-        
-        // Create table if it doesn't exist
-        db.run(`
-            CREATE TABLE IF NOT EXISTS aircraft (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                hex TEXT NOT NULL,
-                flight TEXT,
-                lat REAL,
-                lon REAL,
-                altitude INTEGER,
-                speed INTEGER,
-                track INTEGER,
-                messages INTEGER,
-                seen_at DATETIME DEFAULT (datetime('now')),
-                created_at DATETIME DEFAULT (datetime('now'))
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_hex ON aircraft(hex);
-            CREATE INDEX IF NOT EXISTS idx_seen_at ON aircraft(seen_at);
-        `);
-        
-        // Save database to file
-        saveDatabase();
-        console.log('✅ Database initialized');
-    } catch (error) {
-        console.error('❌ Database initialization failed:', error);
-        throw error;
+        process.exit(1);
     }
 }
 
-// Save database to file
-function saveDatabase() {
-    try {
-        const data = db.export();
-        const buffer = Buffer.from(data);
-        fs.writeFileSync(DB_PATH, buffer);
-    } catch (error) {
-        console.error('Error saving database:', error);
-    }
-}
-
-// Initialize database on startup
-(async () => {
-    await initializeDatabase();
-})();
+// Initialize connection on startup
+testConnection();
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname)));
 
-// Fetch aircraft from database (configurable time window)
-function fetchAircraftFromDB(timeWindowSeconds = 30) {
+// Fetch aircraft from database (last 30 seconds)
+async function fetchAircraftFromDB(timeWindowSeconds = 30) {
     try {
-        let timeFilter = '';
+        let query;
+        let params = [];
+        
         if (timeWindowSeconds > 0) {
-            timeFilter = `WHERE seen_at >= datetime('now', '-${timeWindowSeconds} seconds') AND lat IS NOT NULL AND lon IS NOT NULL`;
+            query = `
+                SELECT 
+                    hex,
+                    flight,
+                    lat,
+                    lon,
+                    altitude,
+                    speed,
+                    track,
+                    messages,
+                    EXTRACT(EPOCH FROM seen_at)::bigint as seen
+                FROM aircraft
+                WHERE seen_at >= NOW() - INTERVAL '${timeWindowSeconds} seconds'
+                AND lat IS NOT NULL 
+                AND lon IS NOT NULL
+                ORDER BY seen_at DESC
+            `;
         } else {
-            timeFilter = `WHERE lat IS NOT NULL AND lon IS NOT NULL`;
+            query = `
+                SELECT 
+                    hex,
+                    flight,
+                    lat,
+                    lon,
+                    altitude,
+                    speed,
+                    track,
+                    messages,
+                    EXTRACT(EPOCH FROM seen_at)::bigint as seen
+                FROM aircraft
+                WHERE lat IS NOT NULL 
+                AND lon IS NOT NULL
+                ORDER BY seen_at DESC
+            `;
         }
         
-        const query = `
-            SELECT 
-                hex,
-                flight,
-                lat,
-                lon,
-                altitude,
-                speed,
-                track,
-                messages,
-                strftime('%s', seen_at) as seen
-            FROM aircraft
-            ${timeFilter}
-            ORDER BY seen_at DESC
-        `;
-        
-        const result = db.exec(query);
-        
-        if (!result || result.length === 0) {
-            return [];
-        }
-        
-        const rows = result[0].values;
-        const columns = result[0].columns;
-        
-        // Convert to array of objects
-        const aircraft = rows.map(row => {
-            const obj = {};
-            columns.forEach((col, idx) => {
-                obj[col] = row[idx];
-            });
-            return obj;
-        });
+        const result = await db.query(query, params);
         
         // Group by hex to get latest position for each aircraft
         const aircraftMap = new Map();
-        aircraft.forEach(ac => {
+        result.rows.forEach(ac => {
             const seen = parseInt(ac.seen);
             const existing = aircraftMap.get(ac.hex);
             
@@ -133,8 +151,8 @@ function fetchAircraftFromDB(timeWindowSeconds = 30) {
                 aircraftMap.set(ac.hex, {
                     hex: ac.hex,
                     flight: ac.flight || null,
-                    lat: ac.lat,
-                    lon: ac.lon,
+                    lat: parseFloat(ac.lat),
+                    lon: parseFloat(ac.lon),
                     altitude: ac.altitude || null,
                     speed: ac.speed || null,
                     track: ac.track || null,
@@ -151,60 +169,12 @@ function fetchAircraftFromDB(timeWindowSeconds = 30) {
     }
 }
 
-// API endpoint to insert aircraft data (for Raspberry Pi to use)
-app.post('/api/aircraft', express.json(), (req, res) => {
-    try {
-        const aircraft = req.body.aircraft || [];
-        
-        if (!Array.isArray(aircraft)) {
-            return res.status(400).json({ error: 'aircraft must be an array' });
-        }
-        
-        let inserted = 0;
-        
-        // Insert each aircraft
-        for (const ac of aircraft) {
-            if (ac.hex && ac.lat != null && ac.lon != null) {
-                db.run(`
-                    INSERT INTO aircraft (hex, flight, lat, lon, altitude, speed, track, messages, seen_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                `, [
-                    ac.hex || null,
-                    ac.flight ? ac.flight.trim() : null,
-                    ac.lat || null,
-                    ac.lon || null,
-                    ac.altitude || null,
-                    ac.speed || null,
-                    ac.track || null,
-                    ac.messages || 0
-                ]);
-                inserted++;
-            }
-        }
-        
-        // Save database after inserts
-        saveDatabase();
-        
-        res.json({ 
-            success: true, 
-            inserted: inserted,
-            message: 'Aircraft data inserted successfully' 
-        });
-    } catch (error) {
-        console.error('Error inserting aircraft data:', error);
-        res.status(500).json({ 
-            error: 'Failed to insert aircraft data',
-            message: error.message 
-        });
-    }
-});
-
 // API endpoint to get aircraft data
-app.get('/api/aircraft', (req, res) => {
+app.get('/api/aircraft', async (req, res) => {
     try {
         // Allow query parameter to control time window (0 = all data, default = 30 seconds)
         const timeWindow = req.query.window ? parseInt(req.query.window) : 30;
-        const aircraft = fetchAircraftFromDB(timeWindow);
+        const aircraft = await fetchAircraftFromDB(timeWindow);
         
         res.json({
             now: Date.now(),
@@ -221,14 +191,11 @@ app.get('/api/aircraft', (req, res) => {
 });
 
 // Health check endpoint
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
     try {
-        // Test database connection
-        const result = db.exec('SELECT COUNT(*) as count FROM aircraft');
-        let count = 0;
-        if (result && result.length > 0 && result[0].values.length > 0) {
-            count = result[0].values[0][0];
-        }
+        // Test database connection and get count
+        const result = await db.query('SELECT COUNT(*) as count FROM aircraft');
+        const count = parseInt(result.rows[0].count);
         
         res.json({ 
             status: 'ok', 
@@ -251,19 +218,16 @@ app.get('/', (req, res) => {
 });
 
 // Cleanup on exit
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
     console.log('\n🛑 Shutting down gracefully...');
-    if (db) {
-        saveDatabase();
-        db.close();
-    }
+    await db.end();
     process.exit(0);
 });
 
 // Start server
 app.listen(PORT, () => {
     console.log(`🚀 Aircraft Tracker Server running on http://localhost:${PORT}`);
-    console.log(`📊 Database: ${DB_PATH}`);
-    console.log(`💡 POST aircraft data to: http://localhost:${PORT}/api/aircraft`);
-    console.log(`   GET aircraft data from: http://localhost:${PORT}/api/aircraft`);
+    console.log(`📊 Database: Supabase PostgreSQL`);
+    console.log(`💡 GET aircraft data from: http://localhost:${PORT}/api/aircraft`);
+    console.log(`   Health check: http://localhost:${PORT}/api/health`);
 });

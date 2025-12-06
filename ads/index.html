@@ -44,7 +44,17 @@
                     <option value="0">All data</option>
                 </select>
             </div>
+            <div class="control-group">
+                <label for="trail-duration">Trail Length:</label>
+                <select id="trail-duration" class="control-select">
+                    <option value="10">10 minutes</option>
+                    <option value="30" selected>30 minutes</option>
+                    <option value="60">1 hour</option>
+                </select>
+            </div>
+            <button id="toggle-trails" class="control-button">Show All Trails</button>
             <button id="toggle-list" class="control-button">Toggle Aircraft List</button>
+            <button id="toggle-statistics" class="control-button">Toggle Statistics</button>
         </div>
     </div>
 
@@ -55,6 +65,17 @@
             <button id="close-list" class="close-button">×</button>
         </div>
         <div id="aircraft-list" class="aircraft-list"></div>
+    </div>
+
+    <!-- Statistics panel (right side, collapsible) -->
+    <div id="statistics-panel" class="statistics-panel">
+        <div class="statistics-header">
+            <h2>Statistics Dashboard</h2>
+            <button id="close-statistics" class="close-button">×</button>
+        </div>
+        <div id="statistics-content" class="statistics-content">
+            <div class="loading-state">Loading statistics...</div>
+        </div>
     </div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

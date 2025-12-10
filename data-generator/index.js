@@ -10,7 +10,7 @@ const SENSOR_CONFIG = {
     lon: -88.2434,
     // Maximum detection range in nautical miles (typical ADS-B range: 100-200nm)
     // Can be overridden via MAX_RANGE_NM environment variable
-    maxRangeNm: parseFloat(process.env.MAX_RANGE_NM) || 10
+    maxRangeNm: parseFloat(process.env.MAX_RANGE_NM) || 200
 };
 
 // Use Session Pooler connection string for IPv4 compatibility
@@ -60,62 +60,108 @@ function isAircraftInRange(lat, lon) {
 }
 
 // Delete all records for specific aircraft from database
-async function deleteAircraftFromDB(hexCodes) {
+// Also marks their sessions as ended
+// Pass cleanupHistory=true to also delete trail and session data (for shutdown cleanup)
+async function deleteAircraftFromDB(hexCodes, cleanupHistory = false) {
     if (hexCodes.length === 0) return 0;
-    
+
     try {
+        let totalDeleted = 0;
+
+        if (cleanupHistory) {
+            // Delete trail history
+            const historyResult = await db.query(`
+                DELETE FROM aircraft_history
+                WHERE hex = ANY($1::varchar[])
+            `, [hexCodes]);
+            totalDeleted += historyResult.rowCount;
+
+            // Delete sessions completely
+            const sessionsResult = await db.query(`
+                DELETE FROM aircraft_sessions
+                WHERE hex = ANY($1::varchar[])
+            `, [hexCodes]);
+            totalDeleted += sessionsResult.rowCount;
+        } else {
+            // Just mark sessions as ended (keep for historical data)
+            await db.query(`
+                UPDATE aircraft_sessions
+                SET ended_at = NOW()
+                WHERE hex = ANY($1::varchar[])
+                AND ended_at IS NULL
+            `, [hexCodes]);
+        }
+
+        // Delete from main aircraft table
         const result = await db.query(`
-            DELETE FROM aircraft 
+            DELETE FROM aircraft
             WHERE hex = ANY($1::varchar[])
         `, [hexCodes]);
-        
-        return result.rowCount;
+        totalDeleted += result.rowCount;
+
+        return totalDeleted;
     } catch (error) {
         console.error('Error deleting aircraft from database:', error.message);
         throw error;
     }
 }
 
-// Generate mock aircraft data (within sensor range)
+// Cleanup old history records to prevent database bloat
+// Deletes position snapshots older than specified hours (default: 2 hours)
+async function cleanupOldHistory(hoursToKeep = 2) {
+    try {
+        const result = await db.query(`
+            DELETE FROM aircraft_history
+            WHERE recorded_at < NOW() - INTERVAL '${hoursToKeep} hours'
+        `);
+
+        return result.rowCount;
+    } catch (error) {
+        console.error('Error cleaning up old history:', error.message);
+        throw error;
+    }
+}
+
+// Generate mock aircraft data (within sensor range) with realistic movement patterns
 function generateMockAircraft() {
     const flights = ['UAL123', 'AAL456', 'SWA789', 'DAL321', 'JBU654', 'FDX901', 'UPS234', 'N12345'];
     const hexCodes = ['A1B2C3', 'B2C3D4', 'C3D4E5', 'D4E5F6', 'E5F6A1', 'F6A1B2', 'A2B3C4', 'B3C4D5'];
-    
+    const categories = ['A1', 'A2', 'A3', 'A5', 'B2', 'C2']; // Light, Small, Large, Heavy, etc.
+
     // Generate 3-8 aircraft
     const numAircraft = Math.floor(Math.random() * 6) + 3;
     const aircraft = [];
-    
+
     for (let i = 0; i < numAircraft; i++) {
         // Generate position within sensor range (spread around sensor location)
-        // Use smaller initial distance to ensure aircraft start within range
-        const angle = (Math.PI * 2 * i) / numAircraft + Math.random() * 0.5;
-        // Generate within 70% of max range to ensure room for movement
+        const angle = Math.random() * Math.PI * 2; // Random angle
         const maxInitialDistance = SENSOR_CONFIG.maxRangeNm * 0.7;
         const distanceNm = Math.random() * maxInitialDistance;
-        const distanceDeg = distanceNm / 60; // Rough conversion: 1 degree ≈ 60 nm
-        
+        const distanceDeg = distanceNm / 60;
+
         const lat = SENSOR_CONFIG.lat + Math.cos(angle) * distanceDeg;
         const lon = SENSOR_CONFIG.lon + Math.sin(angle) * distanceDeg;
-        
-        // Only add if within range (safety check)
+
         if (!isAircraftInRange(lat, lon)) {
-            continue; // Skip this aircraft if somehow out of range
+            continue;
         }
-        
+
         // Generate realistic flight data
         const flight = flights[Math.floor(Math.random() * flights.length)];
         const hex = hexCodes[i] || `TEST${i.toString(16).toUpperCase().padStart(2, '0')}`;
-        
-        // Calculate initial track (heading) based on angle from sensor
-        // In generation: angle uses cos() for lat (north-south) and sin() for lon (east-west)
-        // So: angle 0 = North (cos=1, sin=0), π/2 = East (cos=0, sin=1)
-        // Track in aviation: 0° = North, 90° = East, 180° = South, 270° = West
-        // Therefore: track = angle * 180 / π (direct conversion)
-        const track = ((angle * 180 / Math.PI) % 360 + 360) % 360;
-        
+        const category = categories[Math.floor(Math.random() * categories.length)];
+
+        // Random track direction (not necessarily away from sensor)
+        const track = Math.floor(Math.random() * 360);
+
         const speed = Math.floor(Math.random() * 400) + 200; // 200-600 kt
         const altitude = Math.floor(Math.random() * 30000) + 10000; // 10,000-40,000 ft
-        
+        const verticalRate = Math.floor((Math.random() - 0.5) * 4000); // -2000 to +2000 ft/min
+
+        // Assign movement pattern
+        const patterns = ['straight', 'circling', 'waypoint'];
+        const pattern = patterns[Math.floor(Math.random() * patterns.length)];
+
         aircraft.push({
             hex: hex,
             flight: flight,
@@ -123,27 +169,37 @@ function generateMockAircraft() {
             lon: lon,
             altitude: altitude,
             speed: speed,
-            track: Math.floor(track),
-            messages: Math.floor(Math.random() * 500) + 100
+            track: track,
+            verticalRate: verticalRate,
+            category: category,
+            messages: Math.floor(Math.random() * 500) + 100,
+            // Movement pattern metadata
+            pattern: pattern,
+            targetTrack: track, // For gradual turns
+            waypointLat: pattern === 'waypoint' ? SENSOR_CONFIG.lat + (Math.random() - 0.5) * 2 : null,
+            waypointLon: pattern === 'waypoint' ? SENSOR_CONFIG.lon + (Math.random() - 0.5) * 2 : null
         });
     }
-    
+
     return aircraft;
 }
 
 // Insert or update aircraft data into Supabase
 // Uses UPSERT to update existing records (since hex is primary key)
+// Also inserts into aircraft_history for trail visualization
+// And updates aircraft_sessions for flight duration tracking
 async function insertAircraftData(aircraft) {
     if (aircraft.length === 0) return 0;
-    
+
     try {
         let processed = 0;
-        
+
         for (const ac of aircraft) {
+            // Update main aircraft table
             await db.query(`
                 INSERT INTO aircraft (hex, flight, lat, lon, altitude, speed, track, messages, seen_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-                ON CONFLICT (hex) 
+                ON CONFLICT (hex)
                 DO UPDATE SET
                     flight = EXCLUDED.flight,
                     lat = EXCLUDED.lat,
@@ -163,9 +219,38 @@ async function insertAircraftData(aircraft) {
                 Math.floor(ac.track || 0), // Ensure integer
                 Math.floor(ac.messages || 0) // Ensure integer
             ]);
+
+            // Insert position snapshot into aircraft_history for trail visualization
+            // Store every position update (every 2 seconds)
+            await db.query(`
+                INSERT INTO aircraft_history (hex, lat, lon, altitude, speed, track, recorded_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            `, [
+                ac.hex,
+                ac.lat,
+                ac.lon,
+                Math.floor(ac.altitude || 0),
+                Math.floor(ac.speed || 0),
+                Math.floor(ac.track || 0)
+            ]);
+
+            // Update aircraft_sessions for flight duration tracking
+            // UPSERT: create session if new, update last_seen if existing
+            await db.query(`
+                INSERT INTO aircraft_sessions (hex, flight, first_seen, last_seen)
+                VALUES ($1, $2, NOW(), NOW())
+                ON CONFLICT (hex)
+                DO UPDATE SET
+                    flight = EXCLUDED.flight,
+                    last_seen = NOW()
+            `, [
+                ac.hex,
+                ac.flight || null
+            ]);
+
             processed++;
         }
-        
+
         return processed;
     } catch (error) {
         console.error('Error inserting/updating aircraft data:', error.message);
@@ -173,53 +258,103 @@ async function insertAircraftData(aircraft) {
     }
 }
 
-// Simulate aircraft movement (update positions slightly)
+// Simulate realistic aircraft movement with different patterns
 function updateAircraftPositions(aircraft) {
     return aircraft.map(ac => {
-        // Convert track (heading) to radians
-        // Track 0° = North, 90° = East, 180° = South, 270° = West
-        const trackRad = (ac.track * Math.PI) / 180;
-        const speedKts = ac.speed;
-        
-        // Calculate distance traveled in 2 seconds
-        // Speed is in knots (nautical miles per hour)
-        // Convert to nautical miles per second, then multiply by time step
         const timeStepSeconds = 2;
+        const speedKts = ac.speed;
         const distanceNm = (speedKts / 3600) * timeStepSeconds;
-        
-        // Convert distance to degrees
-        // 1 degree of latitude ≈ 60 nautical miles (constant)
-        // 1 degree of longitude ≈ 60 * cos(latitude) nautical miles (varies with latitude)
+
         const nmPerDegreeLat = 60;
         const nmPerDegreeLon = 60 * Math.cos(ac.lat * Math.PI / 180);
-        
-        // Calculate position change
-        // Track 0° (North): cos(0) = 1, sin(0) = 0 → moves north (+lat)
-        // Track 90° (East): cos(90) = 0, sin(90) = 1 → moves east (+lon)
-        // Track 180° (South): cos(180) = -1, sin(180) = 0 → moves south (-lat)
-        // Track 270° (West): cos(270) = 0, sin(270) = -1 → moves west (-lon)
+
+        let newTrack = ac.track;
+        let newAltitude = ac.altitude;
+        let newVerticalRate = ac.verticalRate || 0;
+
+        // Update movement based on pattern
+        if (ac.pattern === 'circling') {
+            // Circling: turn 3-5 degrees every update (smooth circle)
+            const turnRate = 3 + Math.random() * 2; // 3-5 degrees per 2 seconds
+            newTrack = (ac.track + turnRate) % 360;
+        } else if (ac.pattern === 'waypoint' && ac.waypointLat && ac.waypointLon) {
+            // Navigate toward waypoint
+            const bearing = calculateBearing(ac.lat, ac.lon, ac.waypointLat, ac.waypointLon);
+            const distance = calculateDistance(ac.lat, ac.lon, ac.waypointLat, ac.waypointLon);
+
+            // Gradually turn toward waypoint
+            let trackDiff = bearing - ac.track;
+            if (trackDiff > 180) trackDiff -= 360;
+            if (trackDiff < -180) trackDiff += 360;
+
+            // Turn up to 5 degrees per update toward waypoint
+            if (Math.abs(trackDiff) > 5) {
+                newTrack = ac.track + (trackDiff > 0 ? 5 : -5);
+            } else {
+                newTrack = bearing;
+            }
+            newTrack = ((newTrack % 360) + 360) % 360;
+
+            // If close to waypoint, pick new one
+            if (distance < 10) { // Within 10nm
+                ac.waypointLat = SENSOR_CONFIG.lat + (Math.random() - 0.5) * 2;
+                ac.waypointLon = SENSOR_CONFIG.lon + (Math.random() - 0.5) * 2;
+            }
+        } else {
+            // Straight flight with occasional minor course corrections
+            if (Math.random() < 0.02) { // 2% chance
+                newTrack = ac.track + (Math.random() - 0.5) * 10; // ±5 degrees
+                newTrack = ((newTrack % 360) + 360) % 360;
+            }
+        }
+
+        // Update altitude based on vertical rate
+        newAltitude = ac.altitude + (newVerticalRate * timeStepSeconds) / 60; // Convert ft/min to ft/2s
+
+        // Level off at cruise altitudes or change climb/descent rate occasionally
+        if (Math.random() < 0.05) { // 5% chance to change vertical rate
+            if (newAltitude > 38000) {
+                newVerticalRate = -500; // Start descending
+            } else if (newAltitude < 12000) {
+                newVerticalRate = 500; // Start climbing
+            } else {
+                // Random: level off, climb, or descend
+                const options = [0, 500, -500, 1000, -1000];
+                newVerticalRate = options[Math.floor(Math.random() * options.length)];
+            }
+        }
+
+        // Clamp altitude to reasonable range
+        newAltitude = Math.max(10000, Math.min(42000, newAltitude));
+
+        // Calculate new position
+        const trackRad = (newTrack * Math.PI) / 180;
         const latChange = (distanceNm / nmPerDegreeLat) * Math.cos(trackRad);
         const lonChange = (distanceNm / nmPerDegreeLon) * Math.sin(trackRad);
-        
-        // Calculate new position
-        const newLat = ac.lat + latChange;
-        const newLon = ac.lon + lonChange;
-        
-        // Only make small random track adjustments occasionally (reduce randomness)
-        let newTrack = ac.track;
-        if (Math.random() < 0.05) { // 5% chance of small heading change (down from higher chance)
-            // Small heading adjustment: ±2 degrees max (reduced from ±5)
-            newTrack = ac.track + (Math.random() - 0.5) * 2;
-        }
-        newTrack = ((newTrack % 360) + 360) % 360; // Normalize to 0-360
-        
+
         return {
             ...ac,
-            lat: newLat,
-            lon: newLon,
-            track: Math.floor(newTrack)
+            lat: ac.lat + latChange,
+            lon: ac.lon + lonChange,
+            altitude: Math.floor(newAltitude),
+            track: Math.floor(newTrack),
+            verticalRate: newVerticalRate
         };
     });
+}
+
+// Calculate bearing from point A to point B
+function calculateBearing(lat1, lon1, lat2, lon2) {
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const lat1Rad = lat1 * Math.PI / 180;
+    const lat2Rad = lat2 * Math.PI / 180;
+
+    const y = Math.sin(dLon) * Math.cos(lat2Rad);
+    const x = Math.cos(lat1Rad) * Math.sin(lat2Rad) -
+              Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(dLon);
+
+    let bearing = Math.atan2(y, x) * 180 / Math.PI;
+    return ((bearing + 360) % 360);
 }
 
 // Store current aircraft state for movement simulation
@@ -253,28 +388,37 @@ function generateUniqueHexCode(existingHexCodes) {
 // Generate a single new aircraft with a unique hex code
 function generateNewAircraft(existingHexCodes) {
     const flights = ['UAL123', 'AAL456', 'SWA789', 'DAL321', 'JBU654', 'FDX901', 'UPS234', 'N12345'];
-    
+    const categories = ['A1', 'A2', 'A3', 'A5', 'B2', 'C2'];
+
     // Generate position within sensor range
     const angle = Math.random() * Math.PI * 2;
     const maxInitialDistance = SENSOR_CONFIG.maxRangeNm * 0.7;
     const distanceNm = Math.random() * maxInitialDistance;
     const distanceDeg = distanceNm / 60;
-    
+
     const lat = SENSOR_CONFIG.lat + Math.cos(angle) * distanceDeg;
     const lon = SENSOR_CONFIG.lon + Math.sin(angle) * distanceDeg;
-    
+
     // Only generate if within range
     if (!isAircraftInRange(lat, lon)) {
         return null;
     }
-    
+
     // Generate unique hex code
     const hex = generateUniqueHexCode(existingHexCodes);
     const flight = flights[Math.floor(Math.random() * flights.length)];
-    const track = ((angle * 180 / Math.PI) % 360 + 360) % 360;
+    const category = categories[Math.floor(Math.random() * categories.length)];
+
+    // Random track direction (not necessarily away from sensor)
+    const track = Math.floor(Math.random() * 360);
     const speed = Math.floor(Math.random() * 400) + 200;
     const altitude = Math.floor(Math.random() * 30000) + 10000;
-    
+    const verticalRate = Math.floor((Math.random() - 0.5) * 4000);
+
+    // Assign movement pattern
+    const patterns = ['straight', 'circling', 'waypoint'];
+    const pattern = patterns[Math.floor(Math.random() * patterns.length)];
+
     return {
         hex: hex,
         flight: flight,
@@ -282,8 +426,15 @@ function generateNewAircraft(existingHexCodes) {
         lon: lon,
         altitude: altitude,
         speed: speed,
-        track: Math.floor(track),
-        messages: Math.floor(Math.random() * 500) + 100
+        track: track,
+        verticalRate: verticalRate,
+        category: category,
+        messages: Math.floor(Math.random() * 500) + 100,
+        // Movement pattern metadata
+        pattern: pattern,
+        targetTrack: track,
+        waypointLat: pattern === 'waypoint' ? SENSOR_CONFIG.lat + (Math.random() - 0.5) * 2 : null,
+        waypointLon: pattern === 'waypoint' ? SENSOR_CONFIG.lon + (Math.random() - 0.5) * 2 : null
     };
 }
 
@@ -313,7 +464,19 @@ async function runDataGenerator() {
     currentAircraft.forEach(ac => trackedHexCodes.add(ac.hex));
     await insertAircraftData(currentAircraft);
     console.log(`✅ Inserted ${currentAircraft.length} aircraft at ${new Date().toLocaleTimeString()}`);
-    
+
+    // Cleanup old history periodically (every 5 minutes)
+    const cleanupInterval = setInterval(async () => {
+        try {
+            const deleted = await cleanupOldHistory(2); // Keep last 2 hours
+            if (deleted > 0) {
+                console.log(`🧹 Cleaned up ${deleted} old history records (older than 2 hours)`);
+            }
+        } catch (error) {
+            console.error('❌ Error during history cleanup:', error.message);
+        }
+    }, 5 * 60 * 1000); // Every 5 minutes
+
     // Update loop - every 2 seconds
     const interval = setInterval(async () => {
         try {
@@ -343,14 +506,15 @@ async function runDataGenerator() {
             });
             
             // Delete out-of-range aircraft from database
+            // Also cleanup trail history since hex codes will be reused
             if (aircraftToDelete.length > 0) {
                 const hexCodes = aircraftToDelete.map(ac => ac.hex);
-                const deletedCount = await deleteAircraftFromDB(hexCodes);
-                
+                const deletedCount = await deleteAircraftFromDB(hexCodes, true); // true = cleanup history
+
                 aircraftToDelete.forEach(ac => {
                     console.log(`✈️  Aircraft ${ac.hex} (${ac.flight}) out of range (${ac.distance} nm) - deleted from database`);
                 });
-                console.log(`🗑️  Deleted ${deletedCount} database records for ${aircraftToDelete.length} out-of-range aircraft`);
+                console.log(`🗑️  Deleted ${deletedCount} total records (aircraft, trails, sessions) for ${aircraftToDelete.length} out-of-range aircraft`);
             }
             
             // Update current aircraft list (only keep those in range)
@@ -386,13 +550,14 @@ async function runDataGenerator() {
     }, 2000); // Update every 2 seconds
     
     // Cleanup function to delete all tracked aircraft from database
+    // Also removes their trail history and session data on shutdown
     const cleanup = async () => {
         if (trackedHexCodes.size > 0) {
             console.log(`\n🧹 Cleaning up ${trackedHexCodes.size} aircraft from database...`);
             try {
                 const hexCodesArray = Array.from(trackedHexCodes);
-                const deletedCount = await deleteAircraftFromDB(hexCodesArray);
-                console.log(`✅ Deleted ${deletedCount} database records for ${trackedHexCodes.size} aircraft`);
+                const deletedCount = await deleteAircraftFromDB(hexCodesArray, true); // true = cleanup history
+                console.log(`✅ Deleted ${deletedCount} total records (aircraft, trails, and sessions) for ${trackedHexCodes.size} aircraft`);
             } catch (error) {
                 console.error('❌ Error during cleanup:', error.message);
             }
@@ -405,10 +570,11 @@ async function runDataGenerator() {
     const shutdown = async (signal) => {
         console.log(`\n🛑 Received ${signal}, shutting down data generator...`);
         clearInterval(interval);
-        
+        clearInterval(cleanupInterval);
+
         // Clean up all tracked aircraft
         await cleanup();
-        
+
         // Close database connection
         try {
             await db.end();
@@ -416,7 +582,7 @@ async function runDataGenerator() {
         } catch (error) {
             console.error('❌ Error closing database:', error.message);
         }
-        
+
         process.exit(0);
     };
     

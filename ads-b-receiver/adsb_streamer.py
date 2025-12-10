@@ -106,7 +106,9 @@ class SBS1Parser:
             lat = safe_float(parts[14]) if len(parts) > 14 else None
             lon = safe_float(parts[15]) if len(parts) > 15 else None
             vertical_rate = safe_int(parts[16]) if len(parts) > 16 else None
-            squawk = safe_str(parts[17]) if len(parts) > 17 else None
+            squawk_raw = safe_str(parts[17]) if len(parts) > 17 else None
+            # Truncate squawk to 4 characters (database limit)
+            squawk = squawk_raw[:4] if squawk_raw else None
 
             # Parse timestamp (use logged time if available, otherwise generated time)
             timestamp = datetime.now(timezone.utc)
@@ -276,7 +278,7 @@ class AircraftDataManager:
                 WHERE seen_at < NOW() - INTERVAL '%s minutes'
             """, (timeout_minutes,))
 
-            deleted_count = cursor.rowCount
+            deleted_count = cursor.rowcount
 
             # Mark sessions as ended
             cursor.execute("""
@@ -315,7 +317,7 @@ class AircraftDataManager:
                 WHERE recorded_at < NOW() - INTERVAL '%s hours'
             """, (hours_to_keep,))
 
-            deleted_count = cursor.rowCount
+            deleted_count = cursor.rowcount
             conn.commit()
 
             if deleted_count > 0:

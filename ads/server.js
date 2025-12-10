@@ -120,11 +120,10 @@ async function fetchAircraftFromDB(timeWindowSeconds = 30) {
                     altitude,
                     speed,
                     track,
-                    messages,
                     EXTRACT(EPOCH FROM seen_at)::bigint as seen
-                FROM aircraft
+                FROM aircraft_real
                 WHERE seen_at >= NOW() - INTERVAL '${timeWindowSeconds} seconds'
-                AND lat IS NOT NULL 
+                AND lat IS NOT NULL
                 AND lon IS NOT NULL
                 ORDER BY seen_at DESC
             `;
@@ -138,10 +137,9 @@ async function fetchAircraftFromDB(timeWindowSeconds = 30) {
                     altitude,
                     speed,
                     track,
-                    messages,
                     EXTRACT(EPOCH FROM seen_at)::bigint as seen
-                FROM aircraft
-                WHERE lat IS NOT NULL 
+                FROM aircraft_real
+                WHERE lat IS NOT NULL
                 AND lon IS NOT NULL
                 ORDER BY seen_at DESC
             `;
@@ -165,7 +163,6 @@ async function fetchAircraftFromDB(timeWindowSeconds = 30) {
                     altitude: ac.altitude || null,
                     speed: ac.speed || null,
                     track: ac.track || null,
-                    messages: ac.messages || 0,
                     seen: seen
                 });
             }
@@ -214,7 +211,7 @@ app.get('/api/aircraft/:hex/trail', async (req, res) => {
                 speed,
                 track,
                 EXTRACT(EPOCH FROM recorded_at)::bigint as timestamp
-            FROM aircraft_history
+            FROM aircraft_history_real
             WHERE hex = $1
             AND recorded_at >= NOW() - INTERVAL '${minutes} minutes'
             ORDER BY recorded_at ASC
@@ -262,7 +259,7 @@ app.get('/api/statistics', async (req, res) => {
                 MAX(altitude) as max_altitude,
                 MIN(speed) as min_speed,
                 MAX(speed) as max_speed
-            FROM aircraft
+            FROM aircraft_real
             ${timeFilter}
             AND lat IS NOT NULL
             AND lon IS NOT NULL
@@ -279,7 +276,7 @@ app.get('/api/statistics', async (req, res) => {
                     ELSE '40k+'
                 END as altitude_range,
                 COUNT(DISTINCT hex) as count
-            FROM aircraft
+            FROM aircraft_real
             ${timeFilter}
             AND altitude IS NOT NULL
             GROUP BY altitude_range
@@ -299,8 +296,8 @@ app.get('/api/statistics', async (req, res) => {
                 EXTRACT(EPOCH FROM (s.last_seen - s.first_seen))::integer as duration_seconds,
                 EXTRACT(EPOCH FROM s.first_seen)::bigint as first_seen,
                 EXTRACT(EPOCH FROM s.last_seen)::bigint as last_seen
-            FROM aircraft_sessions s
-            INNER JOIN aircraft a ON s.hex = a.hex
+            FROM aircraft_sessions_real s
+            INNER JOIN aircraft_real a ON s.hex = a.hex
             WHERE s.ended_at IS NULL
             ${sessionTimeFilter}
             ORDER BY duration_seconds DESC
@@ -344,7 +341,7 @@ app.get('/api/statistics', async (req, res) => {
 app.get('/api/health', async (req, res) => {
     try {
         // Test database connection and get count
-        const result = await db.query('SELECT COUNT(*) as count FROM aircraft');
+        const result = await db.query('SELECT COUNT(*) as count FROM aircraft_real');
         const count = parseInt(result.rows[0].count);
 
         res.json({

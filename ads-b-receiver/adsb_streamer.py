@@ -99,7 +99,9 @@ class SBS1Parser:
                     return None
 
             # Extract fields based on position
-            flight = safe_str(parts[10]) if len(parts) > 10 else None
+            flight_raw = safe_str(parts[10]) if len(parts) > 10 else None
+            # Truncate flight to 10 characters (database limit)
+            flight = flight_raw[:10] if flight_raw else None
             altitude = safe_int(parts[11]) if len(parts) > 11 else None
             speed = safe_int(parts[12]) if len(parts) > 12 else None
             track = safe_int(parts[13]) if len(parts) > 13 else None

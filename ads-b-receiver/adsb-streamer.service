@@ -1,0 +1,32 @@
+[Unit]
+Description=ADS-B Data Streamer to Supabase
+After=network.target dump1090.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/ads-b-receiver
+
+# Load environment variables from .env file
+EnvironmentFile=/home/pi/ads-b-receiver/.env
+
+# Run the streamer
+ExecStart=/home/pi/ads-b-receiver/venv/bin/python3 /home/pi/ads-b-receiver/adsb_streamer.py
+
+# Restart on failure
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=adsb-streamer
+
+# Security hardening (optional)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

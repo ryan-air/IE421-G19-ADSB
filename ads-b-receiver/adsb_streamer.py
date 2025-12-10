@@ -18,6 +18,13 @@ from psycopg2 import pool
 from psycopg2.extras import execute_values
 import argparse
 
+# Load environment variables from .env file if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, will use system env vars only
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,

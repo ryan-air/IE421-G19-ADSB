@@ -50,10 +50,19 @@ const db = new Pool({
     ssl: {
         rejectUnauthorized: false  // Supabase requires SSL
     },
-    // Connection pool settings for better performance
-    max: 20, // Maximum number of clients in the pool
-    idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
+    // Connection pool settings optimized for Supabase
+    max: 10, // Maximum number of clients in the pool
+    idleTimeoutMillis: 20000, // Close idle clients after 20 seconds (Supabase pooler timeout is ~60s)
     connectionTimeoutMillis: 10000, // Return an error after 10 seconds if connection could not be established
+    allowExitOnIdle: false, // Keep pool alive even when all clients are idle
+});
+
+// Handle pool errors to prevent crashes
+db.on('error', (err, client) => {
+    console.error('❌ Unexpected database pool error:', err.message);
+    if (err.message.includes('db_termination') || err.message.includes('Connection terminated')) {
+        console.log('💡 Database connection will be automatically recreated on next query');
+    }
 });
 
 // Test database connection
@@ -190,24 +199,165 @@ app.get('/api/aircraft', async (req, res) => {
     }
 });
 
+// Get aircraft trail (historical positions)
+app.get('/api/aircraft/:hex/trail', async (req, res) => {
+    try {
+        const { hex } = req.params;
+        const limit = req.query.limit ? parseInt(req.query.limit) : 100;
+        const minutes = req.query.minutes ? parseInt(req.query.minutes) : 30;
+
+        const result = await db.query(`
+            SELECT
+                lat,
+                lon,
+                altitude,
+                speed,
+                track,
+                EXTRACT(EPOCH FROM recorded_at)::bigint as timestamp
+            FROM aircraft_history
+            WHERE hex = $1
+            AND recorded_at >= NOW() - INTERVAL '${minutes} minutes'
+            ORDER BY recorded_at ASC
+            LIMIT $2
+        `, [hex.toUpperCase(), limit]);
+
+        res.json({
+            hex: hex.toUpperCase(),
+            trail: result.rows.map(row => ({
+                lat: parseFloat(row.lat),
+                lon: parseFloat(row.lon),
+                altitude: row.altitude,
+                speed: row.speed,
+                track: row.track,
+                timestamp: parseInt(row.timestamp)
+            })),
+            count: result.rows.length
+        });
+    } catch (error) {
+        console.error('Error fetching aircraft trail:', error);
+        res.status(500).json({
+            error: 'Failed to fetch aircraft trail',
+            message: error.message
+        });
+    }
+});
+
+// Get statistics dashboard data
+app.get('/api/statistics', async (req, res) => {
+    try {
+        const timeWindow = req.query.window ? parseInt(req.query.window) : 30;
+
+        // Build WHERE clause based on time window
+        const timeFilter = timeWindow > 0
+            ? `WHERE seen_at >= NOW() - INTERVAL '${timeWindow} seconds'`
+            : 'WHERE 1=1'; // No time filter for window=0
+
+        // Get overall statistics
+        const statsResult = await db.query(`
+            SELECT
+                COUNT(DISTINCT hex) as total_flights,
+                ROUND(AVG(speed)::numeric, 1) as avg_speed,
+                ROUND(AVG(altitude)::numeric, 0) as avg_altitude,
+                MIN(altitude) as min_altitude,
+                MAX(altitude) as max_altitude,
+                MIN(speed) as min_speed,
+                MAX(speed) as max_speed
+            FROM aircraft
+            ${timeFilter}
+            AND lat IS NOT NULL
+            AND lon IS NOT NULL
+        `);
+
+        // Get altitude distribution (buckets: 0-10k, 10-20k, 20-30k, 30-40k, 40k+)
+        const altitudeDistResult = await db.query(`
+            SELECT
+                CASE
+                    WHEN altitude < 10000 THEN '0-10k'
+                    WHEN altitude < 20000 THEN '10-20k'
+                    WHEN altitude < 30000 THEN '20-30k'
+                    WHEN altitude < 40000 THEN '30-40k'
+                    ELSE '40k+'
+                END as altitude_range,
+                COUNT(DISTINCT hex) as count
+            FROM aircraft
+            ${timeFilter}
+            AND altitude IS NOT NULL
+            GROUP BY altitude_range
+            ORDER BY MIN(altitude)
+        `);
+
+        // Build time filter for sessions (same logic)
+        const sessionTimeFilter = timeWindow > 0
+            ? `AND a.seen_at >= NOW() - INTERVAL '${timeWindow} seconds'`
+            : ''; // No time filter for window=0
+
+        // Get flight durations for active aircraft
+        const durationsResult = await db.query(`
+            SELECT
+                s.hex,
+                s.flight,
+                EXTRACT(EPOCH FROM (s.last_seen - s.first_seen))::integer as duration_seconds,
+                EXTRACT(EPOCH FROM s.first_seen)::bigint as first_seen,
+                EXTRACT(EPOCH FROM s.last_seen)::bigint as last_seen
+            FROM aircraft_sessions s
+            INNER JOIN aircraft a ON s.hex = a.hex
+            WHERE s.ended_at IS NULL
+            ${sessionTimeFilter}
+            ORDER BY duration_seconds DESC
+        `);
+
+        const stats = statsResult.rows[0];
+
+        res.json({
+            summary: {
+                total_flights: parseInt(stats.total_flights) || 0,
+                avg_speed: parseFloat(stats.avg_speed) || 0,
+                avg_altitude: parseInt(stats.avg_altitude) || 0,
+                min_altitude: stats.min_altitude || 0,
+                max_altitude: stats.max_altitude || 0,
+                min_speed: stats.min_speed || 0,
+                max_speed: stats.max_speed || 0
+            },
+            altitude_distribution: altitudeDistResult.rows.map(row => ({
+                range: row.altitude_range,
+                count: parseInt(row.count)
+            })),
+            flight_durations: durationsResult.rows.map(row => ({
+                hex: row.hex,
+                flight: row.flight,
+                duration_seconds: row.duration_seconds,
+                first_seen: parseInt(row.first_seen),
+                last_seen: parseInt(row.last_seen)
+            })),
+            timestamp: Date.now()
+        });
+    } catch (error) {
+        console.error('Error fetching statistics:', error);
+        res.status(500).json({
+            error: 'Failed to fetch statistics',
+            message: error.message
+        });
+    }
+});
+
 // Health check endpoint
 app.get('/api/health', async (req, res) => {
     try {
         // Test database connection and get count
         const result = await db.query('SELECT COUNT(*) as count FROM aircraft');
         const count = parseInt(result.rows[0].count);
-        
-        res.json({ 
-            status: 'ok', 
+
+        res.json({
+            status: 'ok',
             database: 'connected',
             aircraft_count: count,
-            timestamp: Date.now() 
+            timestamp: Date.now()
         });
     } catch (error) {
-        res.status(500).json({ 
+        res.status(500).json({
             status: 'error',
             database: 'disconnected',
-            error: error.message 
+            error: error.message
         });
     }
 });

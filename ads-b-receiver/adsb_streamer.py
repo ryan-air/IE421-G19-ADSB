@@ -101,7 +101,11 @@ class SBS1Parser:
             # Extract fields based on position
             flight_raw = safe_str(parts[10]) if len(parts) > 10 else None
             # Truncate flight to 10 characters (database limit)
-            flight = flight_raw[:10] if flight_raw else None
+            # Filter out obviously invalid callsigns (single digits, etc.)
+            if flight_raw and len(flight_raw.strip()) >= 2:
+                flight = flight_raw[:10]
+            else:
+                flight = None
             altitude = safe_int(parts[11]) if len(parts) > 11 else None
             speed = safe_int(parts[12]) if len(parts) > 12 else None
             track = safe_int(parts[13]) if len(parts) > 13 else None
@@ -277,8 +281,8 @@ class AircraftDataManager:
             # Delete aircraft not seen in timeout_minutes
             cursor.execute("""
                 DELETE FROM aircraft_real
-                WHERE seen_at < NOW() - INTERVAL '%s minutes'
-            """, (timeout_minutes,))
+                WHERE seen_at < NOW() - INTERVAL %s
+            """, (f'{timeout_minutes} minutes',))
 
             deleted_count = cursor.rowcount
 
@@ -288,10 +292,10 @@ class AircraftDataManager:
                 SET ended_at = NOW()
                 WHERE hex IN (
                     SELECT hex FROM aircraft_sessions_real
-                    WHERE last_seen < NOW() - INTERVAL '%s minutes'
+                    WHERE last_seen < NOW() - INTERVAL %s
                     AND ended_at IS NULL
                 )
-            """, (timeout_minutes,))
+            """, (f'{timeout_minutes} minutes',))
 
             conn.commit()
 
@@ -316,8 +320,8 @@ class AircraftDataManager:
 
             cursor.execute("""
                 DELETE FROM aircraft_history_real
-                WHERE recorded_at < NOW() - INTERVAL '%s hours'
-            """, (hours_to_keep,))
+                WHERE recorded_at < NOW() - INTERVAL %s
+            """, (f'{hours_to_keep} hours',))
 
             deleted_count = cursor.rowcount
             conn.commit()

@@ -201,7 +201,7 @@ app.get('/api/aircraft/:hex/trail', async (req, res) => {
     try {
         const { hex } = req.params;
         const limit = req.query.limit ? parseInt(req.query.limit) : 100;
-        const minutes = req.query.minutes ? parseInt(req.query.minutes) : 30;
+        const minutes = req.query.minutes ? parseInt(req.query.minutes) : 120; // Increased to 120 minutes (2 hours) to match cleanup interval
 
         const result = await db.query(`
             SELECT

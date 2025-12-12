@@ -10,7 +10,7 @@ const INTERPOLATION_DURATION = 2000; // Match polling interval for smooth moveme
 
 // Trail settings
 let showTrails = false;
-let trailDuration = 30; // minutes
+let trailDuration = 120; // minutes (2 hours to match cleanup interval)
 let selectedAircraftForTrail = null;
 
 // Initialize map
@@ -464,8 +464,8 @@ function updateAircraftList(aircraftData) {
 
 // Get current time window from selector
 function getTimeWindow() {
-    const selector = document.getElementById('time-window');
-    return selector ? parseInt(selector.value) : 30;
+    // Always return 0 to show all data
+    return 0;
 }
 
 // Fetch aircraft data from backend
@@ -615,7 +615,6 @@ function setupControls() {
     const toggleButton = document.getElementById('toggle-list');
     const closeButton = document.getElementById('close-list');
     const listPanel = document.getElementById('aircraft-list-panel');
-    const timeWindowSelector = document.getElementById('time-window');
 
     if (toggleButton) {
         toggleButton.addEventListener('click', () => {
@@ -659,32 +658,11 @@ function setupControls() {
         });
     }
 
-    // Trail controls
+    // Trail controls (no selectors needed anymore - using hardcoded values)
     const toggleTrailsButton = document.getElementById('toggle-trails');
-    const trailDurationSelector = document.getElementById('trail-duration');
 
     if (toggleTrailsButton) {
         toggleTrailsButton.addEventListener('click', toggleAllTrails);
-    }
-
-    if (trailDurationSelector) {
-        trailDurationSelector.addEventListener('change', (e) => {
-            trailDuration = parseInt(e.target.value);
-            // Redraw trails if any are visible
-            if (showTrails || selectedAircraftForTrail) {
-                aircraftTrails.forEach((_, hex) => {
-                    drawAircraftTrail(hex);
-                });
-            }
-        });
-    }
-
-    // Update data when time window changes
-    if (timeWindowSelector) {
-        timeWindowSelector.addEventListener('change', () => {
-            fetchAircraftData(); // Immediately fetch with new window
-            fetchStatistics(); // Also update statistics
-        });
     }
 }
 

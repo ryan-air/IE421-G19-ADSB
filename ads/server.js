@@ -574,6 +574,11 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
+// Serve the 3D page
+app.get('/3d.html', (req, res) => {
+    res.sendFile(path.join(__dirname, '3d.html'));
+});
+
 // Cleanup on exit
 process.on('SIGINT', async () => {
     console.log('\n🛑 Shutting down gracefully...');

@@ -83,6 +83,16 @@ controller.inertiaZoom = 0.9;
 // Prevent camera from going below ground
 controller.enableCollisionDetection = true;
 
+// Initial camera configuration
+const INITIAL_CAMERA_CONFIG = {
+    longitude: -87.6298,  // Chicago longitude
+    latitude: 41.8781,    // Chicago latitude
+    altitude: 500000,     // 500km above ground
+    heading: 0,           // Degrees (0 = North)
+    pitch: -100,           // Degrees (negative = looking down)
+    roll: 0               // Degrees
+};
+
 // Aircraft entities storage
 const aircraftEntities = new Map();
 const aircraftTrails = new Map();
@@ -98,13 +108,17 @@ let followedAircraft = null;
 let updateInterval;
 let collisionInterval;
 
-// Initial camera position (centered on Champaign, IL with wider view)
+// Set initial camera position
 viewer.camera.setView({
-    destination: Cesium.Cartesian3.fromDegrees(-88.24, 40.11, 500000), // 500km altitude
+    destination: Cesium.Cartesian3.fromDegrees(
+        INITIAL_CAMERA_CONFIG.longitude,
+        INITIAL_CAMERA_CONFIG.latitude,
+        INITIAL_CAMERA_CONFIG.altitude
+    ),
     orientation: {
-        heading: Cesium.Math.toRadians(0),
-        pitch: Cesium.Math.toRadians(-45),
-        roll: 0.0
+        heading: Cesium.Math.toRadians(INITIAL_CAMERA_CONFIG.heading),
+        pitch: Cesium.Math.toRadians(INITIAL_CAMERA_CONFIG.pitch),
+        roll: Cesium.Math.toRadians(INITIAL_CAMERA_CONFIG.roll)
     }
 });
 
@@ -464,11 +478,15 @@ function resetView() {
     document.getElementById('view-globe').classList.add('active');
 
     viewer.camera.flyTo({
-        destination: Cesium.Cartesian3.fromDegrees(-88.24, 40.11, 500000),
+        destination: Cesium.Cartesian3.fromDegrees(
+            INITIAL_CAMERA_CONFIG.longitude,
+            INITIAL_CAMERA_CONFIG.latitude,
+            INITIAL_CAMERA_CONFIG.altitude
+        ),
         orientation: {
-            heading: Cesium.Math.toRadians(0),
-            pitch: Cesium.Math.toRadians(-45),
-            roll: 0.0
+            heading: Cesium.Math.toRadians(INITIAL_CAMERA_CONFIG.heading),
+            pitch: Cesium.Math.toRadians(INITIAL_CAMERA_CONFIG.pitch),
+            roll: Cesium.Math.toRadians(INITIAL_CAMERA_CONFIG.roll)
         },
         duration: 2.0
     });

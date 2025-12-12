@@ -6,6 +6,11 @@ let updateInterval;
 let statisticsInterval;
 const INTERPOLATION_DURATION = 2000; // Match polling interval for smooth movement
 
+// Airport visualization
+let airportsLayer = null;
+let airportsData = null;
+let showAirports = false;
+
 // Initialize map
 function initializeMap() {
     // Initialize the map centered on a default location (you can change this)
@@ -20,6 +25,92 @@ function initializeMap() {
         maxZoom: 19,
         subdomains: 'abcd'
     }).addTo(map);
+
+    // Load airports data
+    loadAirports();
+}
+
+// Load airports from GeoJSON file
+async function loadAirports() {
+    try {
+        const response = await fetch('airports.json');
+        if (!response.ok) {
+            console.warn('Could not load airports.json');
+            return;
+        }
+        airportsData = await response.json();
+        console.log(`Loaded ${airportsData.features.length} airports`);
+    } catch (error) {
+        console.error('Error loading airports:', error);
+    }
+}
+
+// Toggle airport visibility
+function toggleAirports() {
+    showAirports = !showAirports;
+
+    if (showAirports) {
+        displayAirports();
+    } else {
+        hideAirports();
+    }
+}
+
+// Display airports on map
+function displayAirports() {
+    if (!airportsData || !map) return;
+
+    // Remove existing layer if any
+    if (airportsLayer) {
+        map.removeLayer(airportsLayer);
+    }
+
+    // Create GeoJSON layer with custom markers
+    airportsLayer = L.geoJSON(airportsData, {
+        pointToLayer: (feature, latlng) => {
+            const props = feature.properties;
+
+            // Different colors by airport type
+            let color = '#e8a628'; // Default: orange for small/medium
+            if (props.type === 'large_airport') {
+                color = '#ff5533'; // Red for large airports
+            }
+
+            return L.circleMarker(latlng, {
+                radius: props.type === 'large_airport' ? 5 : 3,
+                fillColor: color,
+                color: '#000',
+                weight: 1,
+                opacity: 0.8,
+                fillOpacity: 0.6
+            });
+        },
+        onEachFeature: (feature, layer) => {
+            const props = feature.properties;
+
+            // Create popup with airport info
+            const popupContent = `
+                <div style="font-family: 'Courier New', monospace; color: #e8a628;">
+                    <strong style="color: #ffa628;">${props.name}</strong><br>
+                    ${props.icao ? `ICAO: ${props.icao}` : ''}${props.iata ? ` (${props.iata})` : ''}<br>
+                    ${props.municipality ? `Location: ${props.municipality}` : ''}<br>
+                    ${props.elevation ? `Elevation: ${props.elevation} ft` : ''}<br>
+                    <em style="color: #888;">${props.type.replace('_', ' ')}</em>
+                </div>
+            `;
+            layer.bindPopup(popupContent);
+        }
+    });
+
+    airportsLayer.addTo(map);
+}
+
+// Hide airports from map
+function hideAirports() {
+    if (airportsLayer && map) {
+        map.removeLayer(airportsLayer);
+        airportsLayer = null;
+    }
 }
 
 // Update status indicator
@@ -459,6 +550,14 @@ function setupControls() {
         closeStatsButton.addEventListener('click', () => {
             statsPanel.classList.remove('open');
             updateAircraftListWidth();
+        });
+    }
+
+    // Airports toggle control
+    const toggleAirportsButton = document.getElementById('toggle-airports');
+    if (toggleAirportsButton) {
+        toggleAirportsButton.addEventListener('click', () => {
+            toggleAirports();
         });
     }
 }

@@ -156,3 +156,30 @@ $$ LANGUAGE plpgsql;
 -- GRANT SELECT, INSERT, DELETE ON aircraft_history_real TO authenticated;
 -- GRANT SELECT, INSERT, UPDATE ON aircraft_sessions_real TO authenticated;
 -- GRANT SELECT, UPDATE ON receiver_stats TO authenticated;
+
+
+-- Table: collision_alerts
+-- Tracks proximity violations between aircraft pairs
+CREATE TABLE IF NOT EXISTS collision_alerts (
+    id BIGSERIAL PRIMARY KEY,
+    hex1 VARCHAR(6) NOT NULL,              -- First aircraft hex
+    hex2 VARCHAR(6) NOT NULL,              -- Second aircraft hex
+    flight1 VARCHAR(10),                   -- First aircraft flight number
+    flight2 VARCHAR(10),                   -- Second aircraft flight number
+    horizontal_distance_nm DOUBLE PRECISION, -- Horizontal distance in nautical miles
+    vertical_distance_ft INTEGER,         -- Vertical distance in feet
+    severity VARCHAR(20),                  -- 'warning', 'caution', 'critical'
+    detected_at TIMESTAMPTZ DEFAULT NOW(), -- When alert was detected
+    resolved_at TIMESTAMPTZ,               -- When alert was resolved (NULL if active)
+    CONSTRAINT unique_alert_pair UNIQUE(hex1, hex2, resolved_at)
+);
+
+-- Index for active alerts
+CREATE INDEX IF NOT EXISTS idx_collision_alerts_active ON collision_alerts(hex1, hex2, resolved_at)
+WHERE resolved_at IS NULL;
+
+-- Index for cleanup queries
+CREATE INDEX IF NOT EXISTS idx_collision_alerts_detected_at ON collision_alerts(detected_at);
+
+-- Grant permissions
+GRANT SELECT, INSERT, UPDATE, DELETE ON collision_alerts TO authenticated;

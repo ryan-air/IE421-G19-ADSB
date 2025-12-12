@@ -73,10 +73,10 @@ class SBS1Parser:
                 return None
 
             transmission_type = parts[1]
-            hex_code = parts[4].strip()
+            hex_code = parts[4].strip().upper()
 
-            # Skip if no hex code (essential identifier)
-            if not hex_code:
+            # Validate hex code (must be exactly 6 characters, alphanumeric)
+            if not hex_code or len(hex_code) != 6 or not hex_code.isalnum():
                 return None
 
             # Parse optional fields with safe conversion
@@ -117,13 +117,19 @@ class SBS1Parser:
             squawk = squawk_raw[:4] if squawk_raw else None
 
             # Parse timestamp (use logged time if available, otherwise generated time)
+            # dump1090 sends timestamps in system local time, we need to convert to UTC
             timestamp = datetime.now(timezone.utc)
             if len(parts) > 9 and parts[8] and parts[9]:
                 try:
                     date_str = parts[8].strip()
                     time_str = parts[9].strip()
                     timestamp_str = f"{date_str} {time_str}"
-                    timestamp = datetime.strptime(timestamp_str, "%Y/%m/%d %H:%M:%S.%f")
+                    # Parse as naive datetime (no timezone)
+                    local_time = datetime.strptime(timestamp_str, "%Y/%m/%d %H:%M:%S.%f")
+                    # Convert from local time to UTC by getting the current UTC offset
+                    # This automatically handles DST changes
+                    utc_offset = datetime.now().astimezone().utcoffset()
+                    timestamp = local_time - utc_offset
                     timestamp = timestamp.replace(tzinfo=timezone.utc)
                 except (ValueError, IndexError):
                     pass

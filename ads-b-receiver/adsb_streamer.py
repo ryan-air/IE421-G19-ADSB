@@ -27,7 +27,7 @@ except ImportError:
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed to DEBUG to see trail insertion logs
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -218,22 +218,30 @@ class AircraftDataManager:
 
             # Insert into history table if we have position data
             if position.lat is not None and position.lon is not None:
-                cursor.execute("""
-                    INSERT INTO aircraft_history_real (
-                        hex, lat, lon, altitude, speed, track,
-                        receiver_id, recorded_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    position.hex,
-                    position.lat,
-                    position.lon,
-                    position.altitude,
-                    position.speed,
-                    position.track,
-                    position.receiver_id,
-                    position.timestamp
-                ))
+                try:
+                    logger.debug(f"Inserting trail for {position.hex}: lat={position.lat}, lon={position.lon}")
+                    cursor.execute("""
+                        INSERT INTO aircraft_history_real (
+                            hex, lat, lon, altitude, speed, track,
+                            receiver_id, recorded_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        position.hex,
+                        position.lat,
+                        position.lon,
+                        position.altitude,
+                        position.speed,
+                        position.track,
+                        position.receiver_id,
+                        position.timestamp
+                    ))
+                    logger.debug(f"Trail inserted successfully for {position.hex}")
+                except Exception as trail_error:
+                    logger.error(f"Failed to insert trail for {position.hex}: {trail_error}")
+                    raise  # Re-raise to trigger rollback
+            else:
+                logger.debug(f"Skipping trail for {position.hex}: lat={position.lat}, lon={position.lon}")
 
             # Update or create session
             cursor.execute("""

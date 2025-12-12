@@ -27,7 +27,7 @@ except ImportError:
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Temporarily set to DEBUG to diagnose trail insertion issue
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -216,32 +216,7 @@ class AircraftDataManager:
                 position.timestamp
             ))
 
-            # Insert into history table if we have position data
-            if position.lat is not None and position.lon is not None:
-                try:
-                    logger.debug(f"Inserting trail for {position.hex}: lat={position.lat}, lon={position.lon}")
-                    cursor.execute("""
-                        INSERT INTO aircraft_history_real (
-                            hex, lat, lon, altitude, speed, track,
-                            receiver_id, recorded_at
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        position.hex,
-                        position.lat,
-                        position.lon,
-                        position.altitude,
-                        position.speed,
-                        position.track,
-                        position.receiver_id,
-                        position.timestamp
-                    ))
-                    logger.debug(f"Trail inserted successfully for {position.hex}")
-                except Exception as trail_error:
-                    logger.error(f"Failed to insert trail for {position.hex}: {trail_error}")
-                    raise  # Re-raise to trigger rollback
-            else:
-                logger.debug(f"Skipping trail for {position.hex}: lat={position.lat}, lon={position.lon}")
+            # Trail functionality removed - no longer storing history
 
             # Update or create session
             cursor.execute("""
@@ -350,12 +325,18 @@ class AircraftDataManager:
 class ADSBStreamer:
     """Main ADS-B data streamer"""
 
-    def __init__(self, host: str, port: int, receiver_id: str, db_url: str):
+    def __init__(self, host: str, port: int, receiver_id: str, db_url: str,
+                 cleanup_interval_minutes: int = 5,
+                 history_cleanup_hours: int = 2):
         self.host = host
         self.port = port
         self.receiver_id = receiver_id
         self.db_url = db_url
         self.running = False
+
+        # Cleanup configuration
+        self.cleanup_interval_minutes = cleanup_interval_minutes
+        self.history_cleanup_hours = history_cleanup_hours
 
         # Initialize database connection pool
         self.db_pool = psycopg2.pool.ThreadedConnectionPool(
@@ -416,12 +397,12 @@ class ADSBStreamer:
 
         # Cleanup old aircraft every 1 minute
         if current_time - self.last_cleanup_time >= 60:
-            self.data_manager.cleanup_old_aircraft(timeout_minutes=5)
+            self.data_manager.cleanup_old_aircraft(timeout_minutes=self.cleanup_interval_minutes)
             self.last_cleanup_time = current_time
 
-        # Cleanup old history every 5 minutes
-        if current_time - self.last_history_cleanup_time >= 300:
-            self.data_manager.cleanup_old_history(hours_to_keep=2)
+        # Cleanup old history every 5 minutes (if configured)
+        if self.history_cleanup_hours > 0 and current_time - self.last_history_cleanup_time >= 300:
+            self.data_manager.cleanup_old_history(hours_to_keep=self.history_cleanup_hours)
             self.last_history_cleanup_time = current_time
 
     def run(self):
@@ -534,6 +515,20 @@ def main():
         help='PostgreSQL/Supabase connection URL (default: DATABASE_URL env var)'
     )
 
+    parser.add_argument(
+        '--cleanup-interval',
+        type=int,
+        default=5,
+        help='Minutes of inactivity before removing aircraft from tracking (default: 5)'
+    )
+
+    parser.add_argument(
+        '--history-cleanup',
+        type=int,
+        default=0,
+        help='Hours to keep position history (0 = disable history, default: 0)'
+    )
+
     args = parser.parse_args()
 
     # Validate database URL
@@ -546,9 +541,12 @@ def main():
         host=args.host,
         port=args.port,
         receiver_id=args.receiver_id,
-        db_url=args.db_url
+        db_url=args.db_url,
+        cleanup_interval_minutes=args.cleanup_interval,
+        history_cleanup_hours=args.history_cleanup
     )
 
+    logger.info(f"Configuration: cleanup={args.cleanup_interval}min, history={args.history_cleanup}h")
     streamer.run()
 
 

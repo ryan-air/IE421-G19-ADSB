@@ -27,7 +27,7 @@ except ImportError:
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,  # Set back to INFO for normal operation
+    level=logging.DEBUG,  # Temporarily set to DEBUG to diagnose trail insertion issue
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )

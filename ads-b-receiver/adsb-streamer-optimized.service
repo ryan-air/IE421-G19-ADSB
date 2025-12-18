@@ -1,0 +1,38 @@
+[Unit]
+Description=ADS-B Data Streamer to Supabase (Optimized)
+After=network.target dump1090.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/ads-b-receiver
+
+# Load environment variables from .env file
+EnvironmentFile=/home/pi/ads-b-receiver/.env
+
+# Run the optimized streamer with recommended settings
+# --batch-size=100: Batch 100 records before flushing
+# --flush-interval=1.0: Auto-flush every 1 second
+# CSV COPY is used by default (100-1000x faster than individual inserts)
+ExecStart=/home/pi/ads-b-receiver/venv/bin/python3 /home/pi/ads-b-receiver/adsb_streamer_optimized.py \
+    --batch-size=100 \
+    --flush-interval=1.0 \
+    --cleanup-interval=5
+
+# Restart on failure
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=adsb-streamer-optimized
+
+# Security hardening (optional)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

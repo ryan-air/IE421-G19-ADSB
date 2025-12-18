@@ -359,6 +359,7 @@ class AircraftDataManager:
         # Prepare CSV data for aircraft_position_history table (for Kalman filter)
         # Only insert positions with valid lat/lon/altitude for tracking
         history_csv = StringIO()
+        history_count = 0
         for pos in aircraft_list:
             # Only record history if we have valid position data
             if pos.lat is not None and pos.lon is not None and pos.altitude is not None:
@@ -371,11 +372,10 @@ class AircraftDataManager:
                                 f"{pos.track if pos.track is not None else ''}\t"
                                 f"{pos.vertical_rate if pos.vertical_rate is not None else ''}\t"
                                 f"{pos.timestamp.isoformat()}\n")
-
-        history_csv.seek(0)
+                history_count += 1
 
         # Insert position history (no temp table needed - simple insert, no conflicts)
-        if history_csv.tell() > 0:  # Only if we have data
+        if history_count > 0:
             history_csv.seek(0)
             cursor.copy_from(
                 history_csv,
@@ -383,9 +383,7 @@ class AircraftDataManager:
                 columns=('hex', 'lat', 'lon', 'altitude', 'speed', 'track', 'vertical_rate', 'timestamp'),
                 null=''
             )
-            # Count valid history records
-            total_inserted += sum(1 for pos in aircraft_list
-                                if pos.lat is not None and pos.lon is not None and pos.altitude is not None)
+            total_inserted += history_count
 
         return total_inserted
 

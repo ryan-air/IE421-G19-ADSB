@@ -74,6 +74,8 @@ cd ~/adsb-web
 # - index.html
 # - 3d.html
 # - cesium-app.js
+# - kalman-filter.js
+# - probability-cone.js
 # - styles.css
 # - airports.json
 # - package.json

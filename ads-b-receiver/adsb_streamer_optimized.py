@@ -356,6 +356,37 @@ class AircraftDataManager:
                 last_seen = EXCLUDED.last_seen
         """)
 
+        # Prepare CSV data for aircraft_position_history table (for Kalman filter)
+        # Only insert positions with valid lat/lon/altitude for tracking
+        history_csv = StringIO()
+        for pos in aircraft_list:
+            # Only record history if we have valid position data
+            if pos.lat is not None and pos.lon is not None and pos.altitude is not None:
+                # Format: hex, lat, lon, altitude, speed, track, vertical_rate, timestamp
+                history_csv.write(f"{pos.hex}\t"
+                                f"{pos.lat}\t"
+                                f"{pos.lon}\t"
+                                f"{pos.altitude}\t"
+                                f"{pos.speed if pos.speed is not None else ''}\t"
+                                f"{pos.track if pos.track is not None else ''}\t"
+                                f"{pos.vertical_rate if pos.vertical_rate is not None else ''}\t"
+                                f"{pos.timestamp.isoformat()}\n")
+
+        history_csv.seek(0)
+
+        # Insert position history (no temp table needed - simple insert, no conflicts)
+        if history_csv.tell() > 0:  # Only if we have data
+            history_csv.seek(0)
+            cursor.copy_from(
+                history_csv,
+                'aircraft_position_history',
+                columns=('hex', 'lat', 'lon', 'altitude', 'speed', 'track', 'vertical_rate', 'timestamp'),
+                null=''
+            )
+            # Count valid history records
+            total_inserted += sum(1 for pos in aircraft_list
+                                if pos.lat is not None and pos.lon is not None and pos.altitude is not None)
+
         return total_inserted
 
     def _bulk_insert_execute_values(self, cursor, aircraft_list: List[AircraftPosition],
@@ -419,6 +450,25 @@ class AircraftDataManager:
             )
             total_inserted += len(session_values)
 
+        # Bulk insert position history (for Kalman filter)
+        # Only insert positions with valid lat/lon/altitude
+        history_values = [
+            (pos.hex, pos.lat, pos.lon, pos.altitude, pos.speed, pos.track, pos.vertical_rate, pos.timestamp)
+            for pos in aircraft_list
+            if pos.lat is not None and pos.lon is not None and pos.altitude is not None
+        ]
+
+        if history_values:
+            execute_values(
+                cursor,
+                """
+                INSERT INTO aircraft_position_history (hex, lat, lon, altitude, speed, track, vertical_rate, timestamp)
+                VALUES %s
+                """,
+                history_values
+            )
+            total_inserted += len(history_values)
+
         return total_inserted
 
     def periodic_flush(self):
@@ -472,6 +522,48 @@ class AircraftDataManager:
 
     def cleanup_old_history(self, hours_to_keep: int = 2):
         """Remove old position history to prevent database bloat"""
+        conn = None
+        try:
+            conn = self.db_pool.getconn()
+            cursor = conn.cursor()
+
+            # Clean up old aircraft_history_real if it exists
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_name = 'aircraft_history_real'
+                )
+            """)
+            if cursor.fetchone()[0]:
+                cursor.execute("""
+                    DELETE FROM aircraft_history_real
+                    WHERE recorded_at < NOW() - INTERVAL %s
+                """, (f'{hours_to_keep} hours',))
+
+            # Clean up aircraft_position_history (for Kalman filter)
+            # Keep last 10 minutes only (enough for predictions)
+            cursor.execute("""
+                DELETE FROM aircraft_position_history
+                WHERE timestamp < NOW() - INTERVAL '10 minutes'
+            """)
+
+            deleted_count = cursor.rowcount
+            conn.commit()
+
+            if deleted_count > 0:
+                logger.info(f"Cleaned up {deleted_count} old position history records (older than 10min)")
+
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.error(f"Error during history cleanup: {e}")
+
+        finally:
+            if conn:
+                self.db_pool.putconn(conn)
+
+    def cleanup_old_history_legacy(self, hours_to_keep: int = 2):
+        """DEPRECATED: Old method - kept for backwards compatibility"""
         conn = None
         try:
             conn = self.db_pool.getconn()
@@ -593,8 +685,9 @@ class ADSBStreamer:
             self.data_manager.cleanup_old_aircraft(timeout_minutes=self.cleanup_interval_minutes)
             self.last_cleanup_time = current_time
 
-        # Cleanup old history every 5 minutes (if configured)
-        if self.history_cleanup_hours > 0 and current_time - self.last_history_cleanup_time >= 300:
+        # Cleanup old position history every 2 minutes (for Kalman filter)
+        # This runs regardless of history_cleanup_hours setting
+        if current_time - self.last_history_cleanup_time >= 120:
             self.data_manager.cleanup_old_history(hours_to_keep=self.history_cleanup_hours)
             self.last_history_cleanup_time = current_time
 

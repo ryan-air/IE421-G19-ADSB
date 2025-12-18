@@ -386,7 +386,7 @@ function getTimeWindow() {
 async function fetchAircraftData() {
     try {
         const timeWindow = getTimeWindow();
-        const response = await fetch(`http://localhost:3000/api/aircraft?window=${timeWindow}`);
+        const response = await fetch(`/api/aircraft?window=${timeWindow}`);
 
         if (!response.ok) {
             throw new Error('Failed to fetch aircraft data');
@@ -413,7 +413,7 @@ async function fetchAircraftData() {
 async function fetchStatistics() {
     try {
         const timeWindow = getTimeWindow();
-        const response = await fetch(`http://localhost:3000/api/statistics?window=${timeWindow}`);
+        const response = await fetch(`/api/statistics?window=${timeWindow}`);
 
         if (!response.ok) {
             throw new Error('Failed to fetch statistics');
@@ -498,7 +498,7 @@ function updateStatisticsDashboard(data) {
 // Fetch and display collision alerts
 async function fetchCollisions() {
     try {
-        const response = await fetch('http://localhost:3000/api/collisions');
+        const response = await fetch('/api/collisions');
         if (!response.ok) return;
         
         const data = await response.json();
@@ -569,7 +569,7 @@ function startPolling() {
 
     updateInterval = setInterval(fetchAircraftData, 2000); // Update every 2 seconds
     statisticsInterval = setInterval(fetchStatistics, 5000); // Update statistics every 5 seconds
-    trailRefreshInterval = setInterval(refreshActiveTrails, 10000); // Refresh trails every 10 seconds
+    // trailRefreshInterval = setInterval(refreshActiveTrails, 10000); // Refresh trails every 10 seconds (function not implemented)
     collisionInterval = setInterval(fetchCollisions, 3000); // Check collisions every 3 seconds
 }
 

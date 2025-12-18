@@ -6,6 +6,7 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Pool } from 'pg';
+import { detectCollisions, formatCollision } from './probability-cone.js';
 
 // ES module equivalent of __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -362,8 +363,92 @@ app.get('/api/health', async (req, res) => {
 
 //APOORV'S CODE
 
-// Old collision detection system removed
-// Will be replaced with Kalman filter-based system with probability cones
+// Kalman filter-based collision detection with probability cones
+app.get('/api/collisions/kalman', async (req, res) => {
+    try {
+        // Get prediction time horizon (default 5 minutes = 300 seconds)
+        const timeHorizon = parseInt(req.query.time_horizon) || 300;
+
+        // Get confidence level (default 95%)
+        const confidence = parseFloat(req.query.confidence) || 0.95;
+
+        // Get all active aircraft with current positions
+        const aircraftResult = await db.query(`
+            SELECT
+                hex,
+                flight,
+                lat,
+                lon,
+                altitude,
+                speed,
+                track,
+                vertical_rate,
+                last_seen
+            FROM aircraft_sessions_real
+            WHERE ended_at IS NULL
+              AND lat IS NOT NULL
+              AND lon IS NOT NULL
+              AND altitude IS NOT NULL
+              AND last_seen > NOW() - INTERVAL '2 minutes'
+        `);
+
+        const aircraft = aircraftResult.rows;
+
+        // Get position history for each aircraft (last 10 minutes)
+        const aircraftWithHistory = await Promise.all(
+            aircraft.map(async (ac) => {
+                const historyResult = await db.query(`
+                    SELECT lat, lon, altitude, speed, track, vertical_rate, timestamp
+                    FROM aircraft_position_history
+                    WHERE hex = $1
+                      AND timestamp > NOW() - INTERVAL '10 minutes'
+                    ORDER BY timestamp ASC
+                `, [ac.hex]);
+
+                return {
+                    ...ac,
+                    positionHistory: historyResult.rows
+                };
+            })
+        );
+
+        // Only use aircraft with sufficient history (at least 2 data points)
+        const validAircraft = aircraftWithHistory.filter(
+            ac => ac.positionHistory && ac.positionHistory.length >= 2
+        );
+
+        if (validAircraft.length < 2) {
+            return res.json({
+                collisions: [],
+                message: 'Not enough aircraft with sufficient position history',
+                aircraft_count: validAircraft.length,
+                time_horizon: timeHorizon,
+                confidence_level: confidence
+            });
+        }
+
+        // Detect collisions using Kalman filter probability cones
+        const collisions = detectCollisions(validAircraft, timeHorizon, confidence);
+
+        // Format collisions for response
+        const formattedCollisions = collisions.map(formatCollision);
+
+        res.json({
+            collisions: formattedCollisions,
+            aircraft_count: validAircraft.length,
+            time_horizon: timeHorizon,
+            confidence_level: confidence,
+            timestamp: Date.now()
+        });
+
+    } catch (error) {
+        console.error('Error detecting collisions:', error);
+        res.status(500).json({
+            error: 'Failed to detect collisions',
+            message: error.message
+        });
+    }
+});
 
 
 // Serve the main page

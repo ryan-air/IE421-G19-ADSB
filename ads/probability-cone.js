@@ -1,0 +1,316 @@
+/**
+ * Probability Cone Generator for Collision Detection
+ *
+ * Creates a 3D cone representing the probability distribution of future aircraft positions
+ * Uses Kalman filter to predict position with uncertainty that grows over time
+ */
+
+import math from 'mathjs';
+import { KalmanFilter, latLonAltToECEF, ecefToLatLonAlt, distance3D } from './kalman-filter.js';
+
+/**
+ * Represents a probability cone for an aircraft's predicted trajectory
+ */
+export class ProbabilityCone {
+    /**
+     * @param {Object} aircraft - Current aircraft state
+     * @param {Array} positionHistory - Array of past positions {lat, lon, altitude, timestamp}
+     * @param {number} predictionTimeHorizon - How far into future to predict (seconds)
+     * @param {number} confidenceLevel - Confidence level for cone (e.g., 0.95 for 95%)
+     */
+    constructor(aircraft, positionHistory, predictionTimeHorizon = 300, confidenceLevel = 0.95) {
+        this.aircraft = aircraft;
+        this.positionHistory = positionHistory;
+        this.predictionTimeHorizon = predictionTimeHorizon;
+        this.confidenceLevel = confidenceLevel;
+
+        // Chi-squared value for 3D confidence ellipsoid
+        // For 95% confidence in 3D: chi2(3, 0.95) ≈ 7.815
+        // For 99% confidence in 3D: chi2(3, 0.99) ≈ 11.345
+        this.chiSquared = confidenceLevel >= 0.99 ? 11.345 : 7.815;
+
+        // Initialize Kalman filter with historical data
+        this.kalmanFilter = this.initializeKalmanFilter();
+
+        // Generate predictions
+        this.predictions = this.generatePredictions();
+    }
+
+    /**
+     * Initialize Kalman filter from position history
+     * @returns {KalmanFilter}
+     */
+    initializeKalmanFilter() {
+        if (!this.positionHistory || this.positionHistory.length < 2) {
+            // Not enough history - use current position and velocity
+            const currentECEF = latLonAltToECEF(
+                this.aircraft.lat,
+                this.aircraft.lon,
+                this.aircraft.altitude
+            );
+
+            // Estimate velocity from speed and track
+            const speedMS = (this.aircraft.speed || 0) * 0.514444; // knots to m/s
+            const trackRad = ((this.aircraft.track || 0) * Math.PI) / 180;
+            const vx = speedMS * Math.sin(trackRad);
+            const vy = speedMS * Math.cos(trackRad);
+            const vz = (this.aircraft.vertical_rate || 0) * 0.00508; // feet/min to m/s
+
+            const initialState = math.matrix([[currentECEF.x], [currentECEF.y], [currentECEF.z],
+                                              [vx], [vy], [vz]]);
+
+            return new KalmanFilter(initialState);
+        }
+
+        // Sort history by timestamp (oldest first)
+        const sorted = [...this.positionHistory].sort((a, b) =>
+            new Date(a.timestamp) - new Date(b.timestamp)
+        );
+
+        // Initialize with first position
+        const first = sorted[0];
+        const firstECEF = latLonAltToECEF(first.lat, first.lon, first.altitude);
+
+        // Estimate initial velocity from first two positions
+        let vx = 0, vy = 0, vz = 0;
+        if (sorted.length >= 2) {
+            const second = sorted[1];
+            const secondECEF = latLonAltToECEF(second.lat, second.lon, second.altitude);
+            const dt = (new Date(second.timestamp) - new Date(first.timestamp)) / 1000;
+
+            if (dt > 0) {
+                vx = (secondECEF.x - firstECEF.x) / dt;
+                vy = (secondECEF.y - firstECEF.y) / dt;
+                vz = (secondECEF.z - firstECEF.z) / dt;
+            }
+        }
+
+        const initialState = math.matrix([[firstECEF.x], [firstECEF.y], [firstECEF.z],
+                                          [vx], [vy], [vz]]);
+        const kf = new KalmanFilter(initialState);
+
+        // Train Kalman filter with historical positions
+        let prevTime = new Date(first.timestamp);
+
+        for (let i = 1; i < sorted.length; i++) {
+            const pos = sorted[i];
+            const currentTime = new Date(pos.timestamp);
+            const dt = (currentTime - prevTime) / 1000; // seconds
+
+            if (dt > 0) {
+                // Predict
+                kf.predict(dt);
+
+                // Update with measurement
+                const ecef = latLonAltToECEF(pos.lat, pos.lon, pos.altitude);
+                kf.update([ecef.x, ecef.y, ecef.z]);
+
+                prevTime = currentTime;
+            }
+        }
+
+        return kf;
+    }
+
+    /**
+     * Generate future position predictions with uncertainty
+     * @returns {Array} Array of predictions {time, position, uncertainty}
+     */
+    generatePredictions() {
+        const predictions = [];
+        const timeSteps = 20; // Number of prediction points
+        const dt = this.predictionTimeHorizon / timeSteps;
+
+        for (let i = 1; i <= timeSteps; i++) {
+            const time = i * dt;
+
+            // Predict next state
+            this.kalmanFilter.predict(dt);
+
+            // Get predicted position and uncertainty
+            const state = this.kalmanFilter.getStateArray();
+            const position = { x: state[0], y: state[1], z: state[2] };
+            const velocity = { vx: state[3], vy: state[4], vz: state[5] };
+
+            // Get uncertainty (standard deviation in each dimension)
+            const uncertainty = this.kalmanFilter.getPositionUncertainty();
+
+            // Convert to lat/lon/alt
+            const latLonAlt = ecefToLatLonAlt(position.x, position.y, position.z);
+
+            predictions.push({
+                time: time, // seconds from now
+                position: position, // ECEF coordinates
+                latLonAlt: latLonAlt,
+                velocity: velocity,
+                uncertainty: uncertainty, // {x, y, z} standard deviations in meters
+                radius: Math.sqrt(uncertainty.x * uncertainty.x +
+                                 uncertainty.y * uncertainty.y +
+                                 uncertainty.z * uncertainty.z) // 3D uncertainty
+            });
+        }
+
+        return predictions;
+    }
+
+    /**
+     * Get cone radius at specific time
+     * @param {number} time - Time in seconds from now
+     * @returns {number} Cone radius in meters
+     */
+    getConeRadiusAtTime(time) {
+        // Find closest prediction point
+        const prediction = this.predictions.reduce((prev, curr) =>
+            Math.abs(curr.time - time) < Math.abs(prev.time - time) ? curr : prev
+        );
+
+        // Return radius scaled by chi-squared value for confidence level
+        return prediction.radius * Math.sqrt(this.chiSquared);
+    }
+
+    /**
+     * Check if a point is inside the probability cone at given time
+     * @param {Object} point - {x, y, z} in ECEF
+     * @param {number} time - Time in seconds from now
+     * @returns {boolean}
+     */
+    containsPoint(point, time) {
+        const prediction = this.predictions.reduce((prev, curr) =>
+            Math.abs(curr.time - time) < Math.abs(prev.time - time) ? curr : prev
+        );
+
+        const dist = distance3D(point, prediction.position);
+        const threshold = prediction.radius * Math.sqrt(this.chiSquared);
+
+        return dist <= threshold;
+    }
+
+    /**
+     * Get all prediction points for visualization
+     * @returns {Array}
+     */
+    getPredictionPoints() {
+        return this.predictions.map(p => ({
+            time: p.time,
+            lat: p.latLonAlt.lat,
+            lon: p.latLonAlt.lon,
+            altitude: p.latLonAlt.alt,
+            radius: p.radius * Math.sqrt(this.chiSquared)
+        }));
+    }
+}
+
+/**
+ * Check if two probability cones intersect
+ * @param {ProbabilityCone} cone1
+ * @param {ProbabilityCone} cone2
+ * @returns {Object|null} Collision info or null if no intersection
+ */
+export function checkConeIntersection(cone1, cone2) {
+    const predictions1 = cone1.predictions;
+    const predictions2 = cone2.predictions;
+
+    // Check each time step for intersection
+    for (let i = 0; i < Math.min(predictions1.length, predictions2.length); i++) {
+        const p1 = predictions1[i];
+        const p2 = predictions2[i];
+
+        // Calculate distance between predicted positions
+        const dist = distance3D(p1.position, p2.position);
+
+        // Calculate combined uncertainty (sum of radii for confidence ellipsoids)
+        const radius1 = p1.radius * Math.sqrt(cone1.chiSquared);
+        const radius2 = p2.radius * Math.sqrt(cone2.chiSquared);
+        const combinedRadius = radius1 + radius2;
+
+        // If distance is less than combined radii, cones intersect
+        if (dist <= combinedRadius) {
+            // Calculate collision probability based on overlap
+            // Simple model: probability decreases as distance increases
+            const overlapRatio = Math.max(0, 1 - (dist / combinedRadius));
+            const baseProbability = cone1.confidenceLevel * cone2.confidenceLevel;
+            const probability = baseProbability * overlapRatio;
+
+            return {
+                time: p1.time, // seconds from now
+                probability: probability,
+                distance: dist, // meters
+                position1: p1.latLonAlt,
+                position2: p2.latLonAlt,
+                uncertainty1: radius1,
+                uncertainty2: radius2,
+                aircraft1: cone1.aircraft.hex,
+                aircraft2: cone2.aircraft.hex
+            };
+        }
+    }
+
+    return null; // No intersection found
+}
+
+/**
+ * Find all collisions between a set of aircraft
+ * @param {Array} aircraftList - Array of aircraft with position history
+ * @param {number} predictionTimeHorizon - Prediction time in seconds
+ * @param {number} confidenceLevel - Confidence level (0.95 or 0.99)
+ * @returns {Array} Array of potential collisions
+ */
+export function detectCollisions(aircraftList, predictionTimeHorizon = 300, confidenceLevel = 0.95) {
+    const collisions = [];
+
+    // Generate probability cones for all aircraft
+    const cones = aircraftList.map(aircraft => {
+        try {
+            return new ProbabilityCone(
+                aircraft,
+                aircraft.positionHistory || [],
+                predictionTimeHorizon,
+                confidenceLevel
+            );
+        } catch (error) {
+            console.error(`Error creating cone for ${aircraft.hex}:`, error);
+            return null;
+        }
+    }).filter(cone => cone !== null);
+
+    // Check all pairs for intersections
+    for (let i = 0; i < cones.length; i++) {
+        for (let j = i + 1; j < cones.length; j++) {
+            const collision = checkConeIntersection(cones[i], cones[j]);
+
+            if (collision) {
+                collisions.push(collision);
+            }
+        }
+    }
+
+    // Sort by time (earliest collisions first)
+    collisions.sort((a, b) => a.time - b.time);
+
+    return collisions;
+}
+
+/**
+ * Format collision for display
+ * @param {Object} collision
+ * @returns {Object}
+ */
+export function formatCollision(collision) {
+    return {
+        aircraft1: collision.aircraft1,
+        aircraft2: collision.aircraft2,
+        timeToCollision: Math.round(collision.time),
+        probability: (collision.probability * 100).toFixed(1) + '%',
+        distance: Math.round(collision.distance),
+        position1: {
+            lat: collision.position1.lat.toFixed(4),
+            lon: collision.position1.lon.toFixed(4),
+            alt: Math.round(collision.position1.alt)
+        },
+        position2: {
+            lat: collision.position2.lat.toFixed(4),
+            lon: collision.position2.lon.toFixed(4),
+            alt: Math.round(collision.position2.alt)
+        }
+    };
+}

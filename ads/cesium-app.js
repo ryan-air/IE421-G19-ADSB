@@ -262,7 +262,7 @@ function clearTrails() {
 // Fetch and update aircraft data
 async function fetchAircraftData() {
     try {
-        const response = await fetch('http://localhost:3000/api/aircraft?window=0');
+        const response = await fetch('/api/aircraft?window=0');
         if (!response.ok) {
             throw new Error('Failed to fetch aircraft data');
         }
@@ -352,7 +352,7 @@ function updateAircraftOn3DGlobe(aircraftData) {
 // Fetch and display collision alerts
 async function fetchCollisions() {
     try {
-        const response = await fetch('http://localhost:3000/api/collisions');
+        const response = await fetch('/api/collisions');
         if (!response.ok) return;
 
         const data = await response.json();

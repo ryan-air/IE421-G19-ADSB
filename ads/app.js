@@ -14,9 +14,6 @@ let showAirports = false;
 let showTrails = false;
 let trailDuration = 120; // minutes (2 hours to match cleanup interval)
 let selectedAircraftForTrail = null;
-// APOORV'S CODE
-const collisionLines = new Map(); // Store collision lines on map
-let collisionInterval;
 
 // Initialize map
 function initializeMap() {
@@ -495,82 +492,16 @@ function updateStatisticsDashboard(data) {
 
 // APOORV'S CODE
 
-// Fetch and display collision alerts
-async function fetchCollisions() {
-    try {
-        const response = await fetch('/api/collisions');
-        if (!response.ok) return;
-        
-        const data = await response.json();
-        displayCollisions(data.alerts || []);
-        document.getElementById('collision-count').textContent = data.alerts?.length || 0;
-    } catch (error) {
-        console.error('Error fetching collisions:', error);
-    }
-}
-
-// Display collision lines on map
-function displayCollisions(alerts) {
-    if (!map) return;
-    
-    // Remove old collision lines
-    collisionLines.forEach(line => {
-        if (map.hasLayer(line)) {
-            map.removeLayer(line);
-        }
-    });
-    collisionLines.clear();
-    
-    // Draw new collision lines
-    alerts.forEach(alert => {
-        const color = alert.severity === 'critical' ? '#ff0000' : 
-                     alert.severity === 'caution' ? '#ff8800' : '#ffaa00';
-        
-        const line = L.polyline(
-            [[alert.lat1, alert.lon1], [alert.lat2, alert.lon2]],
-            {
-                color: color,
-                weight: 3,
-                opacity: 0.8,
-                dashArray: '10, 5'
-            }
-        ).addTo(map);
-        
-        // Add popup with alert info
-        line.bindPopup(`
-            <div style="font-family: 'Courier New', monospace;">
-                <strong style="color: ${color};">⚠️ COLLISION ALERT</strong><br>
-                ${alert.flight1 || alert.hex1} ↔ ${alert.flight2 || alert.hex2}<br>
-                Horizontal: ${alert.horizontal_distance_nm.toFixed(2)} nm<br>
-                Vertical: ${alert.vertical_distance_ft} ft<br>
-                Severity: ${alert.severity.toUpperCase()}
-            </div>
-        `);
-        
-        collisionLines.set(`${alert.hex1}-${alert.hex2}`, line);
-        
-        // Highlight aircraft markers
-        const marker1 = aircraftMarkers.get(alert.hex1);
-        const marker2 = aircraftMarkers.get(alert.hex2);
-        if (marker1 && marker1._icon) {
-            marker1._icon.style.filter = `drop-shadow(0 0 8px ${color})`;
-        }
-        if (marker2 && marker2._icon) {
-            marker2._icon.style.filter = `drop-shadow(0 0 8px ${color})`;
-        }
-    });
-}
+// Old collision detection removed - will be replaced with Kalman filter system
 
 // Start polling for aircraft data and statistics
 function startPolling() {
     fetchAircraftData(); // Initial fetch
     fetchStatistics(); // Initial statistics fetch
-    fetchCollisions(); // Initial collision fetch
 
     updateInterval = setInterval(fetchAircraftData, 2000); // Update every 2 seconds
     statisticsInterval = setInterval(fetchStatistics, 5000); // Update statistics every 5 seconds
     // trailRefreshInterval = setInterval(refreshActiveTrails, 10000); // Refresh trails every 10 seconds (function not implemented)
-    collisionInterval = setInterval(fetchCollisions, 3000); // Check collisions every 3 seconds
 }
 
 // Stop polling
@@ -583,9 +514,6 @@ function stopPolling() {
     }
     if (trailRefreshInterval) {
         clearInterval(trailRefreshInterval);
-    }
-    if (collisionInterval) {  // Add this
-        clearInterval(collisionInterval);
     }
 }
 

@@ -96,7 +96,6 @@ const INITIAL_CAMERA_CONFIG = {
 // Aircraft entities storage
 const aircraftEntities = new Map();
 const aircraftTrails = new Map();
-const collisionLines = new Map();
 let airportEntities = [];
 let showAirports = false;
 let showTrails = false;
@@ -106,7 +105,6 @@ let followedAircraft = null;
 
 // Update intervals
 let updateInterval;
-let collisionInterval;
 
 // Set initial camera position
 viewer.camera.setView({
@@ -349,54 +347,7 @@ function updateAircraftOn3DGlobe(aircraftData) {
     console.log(`3D Globe updated: ${seenAircraftIds.size} aircraft visible`);
 }
 
-// Fetch and display collision alerts
-async function fetchCollisions() {
-    try {
-        const response = await fetch('/api/collisions');
-        if (!response.ok) return;
-
-        const data = await response.json();
-        displayCollisions3D(data.alerts || []);
-        document.getElementById('collision-count').textContent = data.alerts?.length || 0;
-    } catch (error) {
-        console.error('Error fetching collisions:', error);
-    }
-}
-
-// Display collision alerts in 3D
-function displayCollisions3D(alerts) {
-    // Remove old collision lines
-    collisionLines.forEach(line => {
-        viewer.entities.remove(line);
-    });
-    collisionLines.clear();
-
-    // Draw new collision lines
-    alerts.forEach(alert => {
-        const color = alert.severity === 'critical' ? Cesium.Color.RED :
-                     alert.severity === 'caution' ? Cesium.Color.ORANGE :
-                     Cesium.Color.YELLOW;
-
-        const alt1Meters = (alert.alt1 || 0) * 0.3048;
-        const alt2Meters = (alert.alt2 || 0) * 0.3048;
-
-        const pos1 = Cesium.Cartesian3.fromDegrees(alert.lon1, alert.lat1, alt1Meters);
-        const pos2 = Cesium.Cartesian3.fromDegrees(alert.lon2, alert.lat2, alt2Meters);
-
-        const line = viewer.entities.add({
-            polyline: {
-                positions: [pos1, pos2],
-                width: 5,
-                material: new Cesium.PolylineDashMaterialProperty({
-                    color: color,
-                    dashLength: 20.0
-                })
-            }
-        });
-
-        collisionLines.set(`${alert.hex1}-${alert.hex2}`, line);
-    });
-}
+// Old collision detection removed - will be replaced with Kalman filter system
 
 // Load and display airports
 async function loadAirports() {
@@ -623,19 +574,14 @@ document.getElementById('view-follow').addEventListener('click', () => {
 function startPolling() {
     loadAirports(); // Load airports once at start
     fetchAircraftData(); // Initial fetch
-    fetchCollisions(); // Initial collision fetch
 
     updateInterval = setInterval(fetchAircraftData, 2000); // Update every 2 seconds
-    collisionInterval = setInterval(fetchCollisions, 3000); // Update collisions every 3 seconds
 }
 
 // Stop polling
 function stopPolling() {
     if (updateInterval) {
         clearInterval(updateInterval);
-    }
-    if (collisionInterval) {
-        clearInterval(collisionInterval);
     }
 }
 

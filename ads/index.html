@@ -41,6 +41,8 @@
             <button id="toggle-list" class="control-button">Toggle Aircraft List</button>
             <button id="toggle-statistics" class="control-button">Toggle Statistics</button>
             <button id="toggle-airports" class="control-button">Toggle Airports</button>
+            <button id="toggle-trails" class="control-button">⚪ Show All Trails</button>
+            <button id="toggle-predictions" class="control-button" onclick="togglePredictionWedges()">⚪ Show Predictions</button>
             <button onclick="window.location.href='3d.html'" class="control-button" style="background: rgba(122, 154, 122, 0.3); border-color: #8aaa8a;">View in 3D 🌍</button>
         </div>
     </div>
@@ -65,7 +67,34 @@
         </div>
     </div>
 
+    <!-- Mobile menu toggle -->
+    <button class="mobile-menu-toggle" id="mobile-menu-toggle" onclick="toggleMobileMenu()">☰</button>
+
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="app.js"></script>
+    <script>
+        // Mobile menu toggle
+        function toggleMobileMenu() {
+            const sidebar = document.querySelector('.controls-overlay');
+            const toggle = document.getElementById('mobile-menu-toggle');
+            sidebar.classList.toggle('mobile-open');
+            toggle.classList.toggle('active');
+            toggle.textContent = sidebar.classList.contains('mobile-open') ? '✕' : '☰';
+        }
+
+        // Close mobile menu when clicking outside
+        document.addEventListener('click', (e) => {
+            const sidebar = document.querySelector('.controls-overlay');
+            const toggle = document.getElementById('mobile-menu-toggle');
+            if (window.innerWidth <= 768 && 
+                sidebar.classList.contains('mobile-open') && 
+                !sidebar.contains(e.target) && 
+                !toggle.contains(e.target)) {
+                sidebar.classList.remove('mobile-open');
+                toggle.classList.remove('active');
+                toggle.textContent = '☰';
+            }
+        });
+    </script>
 </body>
 </html>

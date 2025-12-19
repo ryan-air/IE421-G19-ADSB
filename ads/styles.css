@@ -693,8 +693,37 @@ body {
     background: linear-gradient(180deg, #6a9a6a 0%, #5a8a5a 100%);
 }
 
-/* Responsive adjustments */
-@media (max-width: 768px) {
+/* Mobile menu toggle button */
+.mobile-menu-toggle {
+    display: none;
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    width: 56px;
+    height: 56px;
+    background: linear-gradient(180deg, #2a2a2a 0%, #1f1f1f 100%);
+    border: 2px solid #5a8a5a;
+    border-radius: 50%;
+    color: #8a9a8a;
+    font-size: 24px;
+    cursor: pointer;
+    z-index: 2000;
+    box-shadow: 0 4px 15px rgba(90, 154, 90, 0.4);
+    transition: all 0.3s ease;
+}
+
+.mobile-menu-toggle:hover {
+    background: linear-gradient(180deg, #3a3a3a 0%, #2f2f2f 100%);
+    transform: scale(1.1);
+}
+
+.mobile-menu-toggle.active {
+    background: linear-gradient(180deg, #1a1a1a 0%, #151515 100%);
+    border-color: #7a9a7a;
+}
+
+/* Tablet adjustments */
+@media (max-width: 1024px) {
     .controls-overlay {
         width: 200px;
         padding: 15px 10px;
@@ -706,32 +735,180 @@ body {
     }
 
     .aircraft-list-panel {
-        height: 40vh;
-        max-height: 40vh;
-        bottom: -40vh;
         left: 200px;
         width: calc(100% - 200px);
     }
 
-    .aircraft-list {
-        grid-template-columns: 1fr;
+    .statistics-panel {
+        width: 320px;
+    }
+}
+
+/* Mobile adjustments */
+@media (max-width: 768px) {
+    .mobile-menu-toggle {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .top-header {
+        padding: 8px 12px;
+        height: auto;
+        min-height: 50px;
+        flex-wrap: wrap;
+        gap: 8px;
     }
 
     .top-header h1 {
-        font-size: 16px;
-        letter-spacing: 2px;
+        font-size: 14px;
+        letter-spacing: 1px;
+        width: 100%;
+        text-align: center;
+        order: 1;
     }
 
     .header-controls {
-        gap: 15px;
+        width: 100%;
+        justify-content: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        order: 2;
     }
 
+    .stat-inline {
+        padding: 3px 8px;
+    }
+
+    .stat-label {
+        font-size: 9px;
+    }
+
+    .stat-value {
+        font-size: 13px;
+    }
+
+    .status {
+        padding: 3px 8px;
+    }
+
+    /* Hide sidebar by default on mobile */
+    .controls-overlay {
+        position: fixed;
+        left: -260px;
+        width: 250px;
+        top: 0;
+        bottom: 0;
+        padding-top: 100px;
+        transition: left 0.3s ease;
+        z-index: 1500;
+    }
+
+    .controls-overlay.mobile-open {
+        left: 0;
+    }
+
+    /* Map takes full width */
+    #map {
+        left: 0;
+        width: 100%;
+        top: 85px;
+        height: calc(100vh - 85px);
+    }
+
+    /* Aircraft list panel full width */
+    .aircraft-list-panel {
+        left: 0;
+        width: 100%;
+        height: 50vh;
+        max-height: 50vh;
+        bottom: -50vh;
+    }
+
+    .aircraft-list-panel.open {
+        bottom: 0;
+    }
+
+    .aircraft-list {
+        grid-template-columns: 1fr;
+        padding: 10px;
+        gap: 8px;
+    }
+
+    .aircraft-card {
+        padding: 10px;
+    }
+
+    /* Statistics panel full width */
     .statistics-panel {
-        width: calc(100% - 200px);
-        right: calc(-100% + 200px);
+        width: 100%;
+        right: -100%;
+        top: 85px;
     }
 
     .statistics-panel.open {
         right: 0;
+    }
+
+    .statistics-header h2 {
+        font-size: 14px;
+    }
+
+    .stat-card-value {
+        font-size: 20px;
+    }
+
+    /* Control buttons smaller */
+    .control-button {
+        padding: 10px 12px;
+        font-size: 10px;
+        margin-bottom: 8px;
+    }
+
+    .control-panel h3 {
+        font-size: 14px;
+        margin-bottom: 15px;
+    }
+}
+
+/* Small mobile adjustments */
+@media (max-width: 480px) {
+    .top-header h1 {
+        font-size: 12px;
+    }
+
+    .header-controls {
+        gap: 5px;
+    }
+
+    .stat-inline {
+        padding: 2px 6px;
+    }
+
+    .stat-label {
+        font-size: 8px;
+        letter-spacing: 0.5px;
+    }
+
+    .stat-value {
+        font-size: 11px;
+    }
+
+    .mobile-menu-toggle {
+        width: 48px;
+        height: 48px;
+        font-size: 20px;
+        bottom: 15px;
+        right: 15px;
+    }
+
+    .controls-overlay {
+        width: 220px;
+    }
+
+    .aircraft-list-panel {
+        height: 60vh;
+        max-height: 60vh;
+        bottom: -60vh;
     }
 }

@@ -1,5 +1,6 @@
 // Store aircraft data and markers
 let map;
+let currentAircraftData = []; // Global store for live aircraft positions
 const aircraftMarkers = new Map();
 const aircraftState = new Map(); // Store previous state for interpolation
 let updateInterval;
@@ -10,10 +11,13 @@ const INTERPOLATION_DURATION = 2000; // Match polling interval for smooth moveme
 let airportsLayer = null;
 let airportsData = null;
 let showAirports = false;
+
 // Trail settings
-let showTrails = false;
-let trailDuration = 120; // minutes (2 hours to match cleanup interval)
-let selectedAircraftForTrail = null;
+const aircraftTrails = new Map(); // Store trail polylines: hex -> polyline
+const trailData = new Map(); // Store trail position data: hex -> positions array
+const failedTrailFetches = new Set(); // Track aircraft with no trail data to avoid repeated requests
+let trailRefreshInterval = null;
+let showAllTrails = false; // Global toggle for all trails
 
 // Initialize map
 function initializeMap() {
@@ -21,7 +25,7 @@ function initializeMap() {
     map = L.map('map', {
         zoomControl: true,
         attributionControl: true
-    }).setView([40.11, -88.24], 10); // Default: Champaign, IL
+    }).setView([41.88, -87.63], 9); // Default: Chicago, IL (receiver location)
 
     // Add dark CartoDB tiles for ATC/radar look
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
@@ -157,24 +161,49 @@ function formatDuration(seconds) {
 // Trail functionality removed
 
 // Create aircraft marker icon with plane SVG and label
+// Check if aircraft is a helicopter based on type field from server
+function isHelicopter(aircraft) {
+    // Type field is provided by server (6 = Rotorcraft/Helicopter)
+    return aircraft.type === 6;
+}
+
 function createAircraftIcon(aircraft) {
     const heading = aircraft.track || 0;
     const identifier = aircraft.flight || aircraft.hex || 'N/A';
-    
-    const planeSVG = `
+    const isHeli = isHelicopter(aircraft);
+
+    // Different SVG for helicopters vs fixed-wing
+    const iconSVG = isHeli ? `
+        <svg width="24" height="24" viewBox="0 0 24 24" class="aircraft-icon" style="transform: rotate(${heading}deg);">
+            <!-- Helicopter rotor -->
+            <line x1="4" y1="6" x2="20" y2="6" stroke="#7a9a7a" stroke-width="1.5"/>
+            <circle cx="12" cy="6" r="1.5" fill="#5a8a5a"/>
+            <!-- Helicopter body -->
+            <ellipse cx="12" cy="12" rx="5" ry="7" fill="#7a9a7a" stroke="#5a8a5a" stroke-width="0.5"/>
+            <circle cx="12" cy="12" r="2" fill="#6b8e6b"/>
+            <!-- Tail rotor -->
+            <line x1="12" y1="18" x2="12" y2="22" stroke="#7a9a7a" stroke-width="1.2"/>
+            <line x1="10" y1="22" x2="14" y2="22" stroke="#7a9a7a" stroke-width="1"/>
+        </svg>
+    ` : `
+        <svg width="24" height="24" viewBox="0 0 24 24" class="aircraft-icon" style="transform: rotate(${heading}deg);">
+            <!-- Fixed-wing aircraft -->
+            <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="#7a9a7a" stroke="#5a8a5a" stroke-width="0.5"/>
+            <path d="M2 17L12 22L22 17" stroke="#7a9a7a" stroke-width="1" fill="none"/>
+            <circle cx="12" cy="12" r="2" fill="#6b8e6b"/>
+        </svg>
+    `;
+
+    const markerHTML = `
         <div class="aircraft-marker-container">
             <div class="aircraft-label">${identifier}</div>
-            <svg width="24" height="24" viewBox="0 0 24 24" class="aircraft-icon" style="transform: rotate(${heading}deg);">
-                <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="#7a9a7a" stroke="#5a8a5a" stroke-width="0.5"/>
-                <path d="M2 17L12 22L22 17" stroke="#7a9a7a" stroke-width="1" fill="none"/>
-                <circle cx="12" cy="12" r="2" fill="#6b8e6b"/>
-            </svg>
+            ${iconSVG}
         </div>
     `;
-    
+
     return L.divIcon({
         className: 'aircraft-marker',
-        html: planeSVG,
+        html: markerHTML,
         iconSize: [60, 40], // Wider to accommodate label
         iconAnchor: [30, 35] // Anchor at bottom center (below label)
     });
@@ -307,7 +336,8 @@ function updateAircraftOnMap(aircraftData) {
             marker._heading = aircraft.track || 0;
             marker._identifier = aircraft.flight || aircraft.hex || 'N/A';
 
-            // Add popup with aircraft info
+            // Add popup with aircraft info and trail button
+            const hasTrail = aircraftTrails.has(aircraft.hex);
             const popupContent = `
                 <div style="font-family: 'Courier New', monospace; color: #7a9a7a;">
                     <strong style="color: #8a9a8a;">${aircraft.flight || 'N/A'}</strong><br>
@@ -315,6 +345,11 @@ function updateAircraftOnMap(aircraftData) {
                     ${aircraft.altitude ? `ALT: ${aircraft.altitude} ft` : ''}<br>
                     ${aircraft.speed ? `SPD: ${aircraft.speed} kt` : ''}<br>
                     ${aircraft.track ? `HDG: ${aircraft.track}°` : ''}<br>
+                    <button
+                        onclick="toggleAircraftTrail('${aircraft.hex}')"
+                        style="margin-top: 8px; padding: 4px 12px; background: ${hasTrail ? '#d9534f' : '#5cb85c'}; color: white; border: none; border-radius: 3px; cursor: pointer; font-family: 'Courier New', monospace; font-size: 12px;">
+                        ${hasTrail ? 'Hide Trail' : 'Show Trail'}
+                    </button>
                 </div>
             `;
             marker.bindPopup(popupContent);
@@ -395,16 +430,195 @@ async function fetchAircraftData() {
         document.getElementById('aircraft-count').textContent = data.aircraft?.length || 0;
         document.getElementById('last-update').textContent = formatTime(data.now || Date.now());
 
+        // Store aircraft data globally for collision detection to use
+        currentAircraftData = data.aircraft || [];
+
         // Update map and list (always update map, even if empty)
-        updateAircraftOnMap(data.aircraft || []);
-        updateAircraftList(data.aircraft || []);
+        updateAircraftOnMap(currentAircraftData);
+        updateAircraftList(currentAircraftData);
+
+        // If global trails are enabled, show trails for new aircraft
+        if (showAllTrails) {
+            currentAircraftData.forEach(aircraft => {
+                if (!aircraftTrails.has(aircraft.hex)) {
+                    fetchAndDisplayTrail(aircraft.hex);
+                }
+            });
+        }
     } catch (error) {
         console.error('Error fetching aircraft data:', error);
         updateStatus(false, 'Connection Error');
     }
 }
 
-// Trail functionality removed
+/**
+ * Toggle trail display for a specific aircraft
+ * @param {string} hex - Aircraft ICAO hex code
+ */
+window.toggleAircraftTrail = async function(hex) {
+    // Disable global trails mode when manually toggling individual trails
+    if (showAllTrails) {
+        showAllTrails = false;
+        const button = document.getElementById('toggle-trails');
+        if (button) {
+            button.textContent = '⚪ Show All Trails';
+            button.style.background = '';
+        }
+    }
+
+    if (aircraftTrails.has(hex)) {
+        // Remove trail
+        const trail = aircraftTrails.get(hex);
+        map.removeLayer(trail);
+        aircraftTrails.delete(hex);
+        trailData.delete(hex);
+
+        // Stop refresh if no more trails
+        if (aircraftTrails.size === 0 && trailRefreshInterval) {
+            clearInterval(trailRefreshInterval);
+            trailRefreshInterval = null;
+        }
+    } else {
+        // Show trail
+        await fetchAndDisplayTrail(hex);
+
+        // Start refresh interval if not running
+        if (!trailRefreshInterval) {
+            trailRefreshInterval = setInterval(() => {
+                // Refresh all active trails
+                aircraftTrails.forEach((_trail, hexCode) => {
+                    fetchAndDisplayTrail(hexCode);
+                });
+            }, 5000); // Refresh every 5 seconds
+        }
+    }
+
+    // Update popup to reflect new state
+    updateAircraftOnMap(currentAircraftData);
+};
+
+/**
+ * Fetch and display trail for specific aircraft
+ * @param {string} hex - Aircraft ICAO hex code
+ */
+async function fetchAndDisplayTrail(hex) {
+    // Skip if we already know this aircraft has no trail data
+    if (failedTrailFetches.has(hex)) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/aircraft/${hex}/trail?minutes=120&limit=500`);
+        if (!response.ok) {
+            failedTrailFetches.add(hex);
+            return;
+        }
+
+        const data = await response.json();
+
+        if (!data.trail || data.trail.length === 0) {
+            // Mark as failed to avoid repeated requests
+            failedTrailFetches.add(hex);
+            return;
+        }
+
+        // Store trail data
+        trailData.set(hex, data.trail);
+
+        // Convert trail to Leaflet coordinates
+        const coordinates = data.trail.map(point => [point.lat, point.lon]);
+
+        // Remove existing trail if present
+        if (aircraftTrails.has(hex)) {
+            map.removeLayer(aircraftTrails.get(hex));
+        }
+
+        // Check if this is a helicopter (find aircraft in current data)
+        const aircraft = currentAircraftData.find(ac => ac.hex === hex);
+        const isHeli = aircraft && isHelicopter(aircraft);
+
+        // Create polyline for trail - yellow for helicopters, cyan for fixed-wing
+        const trail = L.polyline(coordinates, {
+            color: isHeli ? '#ffff00' : '#00ffff',
+            weight: 2,
+            opacity: 0.6,
+            smoothFactor: 1
+        }).addTo(map);
+
+        // Add popup with trail info
+        trail.bindPopup(`
+            <div style="font-family: 'Courier New', monospace; color: #7a9a7a;">
+                <strong style="color: #8a9a8a;">Trail: ${hex}${isHeli ? ' 🚁' : ''}</strong><br>
+                Points: ${data.trail.length}<br>
+                Duration: ${Math.round((data.trail[0].seen - data.trail[data.trail.length - 1].seen) / 60)} minutes
+            </div>
+        `);
+
+        aircraftTrails.set(hex, trail);
+
+    } catch (error) {
+        console.error(`Error fetching trail for ${hex}:`, error);
+    }
+}
+
+/**
+ * Clear all trails
+ */
+function clearAllTrails() {
+    aircraftTrails.forEach((trail) => {
+        map.removeLayer(trail);
+    });
+    aircraftTrails.clear();
+    trailData.clear();
+    failedTrailFetches.clear(); // Reset failed fetches cache
+
+    if (trailRefreshInterval) {
+        clearInterval(trailRefreshInterval);
+        trailRefreshInterval = null;
+    }
+}
+
+/**
+ * Toggle trails for all aircraft
+ */
+async function toggleAllTrails() {
+    const button = document.getElementById('toggle-trails');
+
+    if (showAllTrails) {
+        // Hide all trails
+        clearAllTrails();
+        showAllTrails = false;
+        if (button) {
+            button.textContent = '⚪ Show All Trails';
+            button.style.background = '';
+        }
+    } else {
+        // Show trails for all current aircraft
+        showAllTrails = true;
+        if (button) {
+            button.textContent = '🔵 Hide All Trails';
+            button.style.background = 'rgba(0, 255, 255, 0.3)';
+        }
+
+        // Fetch and display trails for all aircraft
+        const promises = currentAircraftData.map(aircraft =>
+            fetchAndDisplayTrail(aircraft.hex)
+        );
+        await Promise.all(promises);
+
+        // Start refresh interval
+        if (!trailRefreshInterval) {
+            trailRefreshInterval = setInterval(() => {
+                if (showAllTrails) {
+                    // Refresh trails for all current aircraft
+                    currentAircraftData.forEach(aircraft => {
+                        fetchAndDisplayTrail(aircraft.hex);
+                    });
+                }
+            }, 5000); // Refresh every 5 seconds
+        }
+    }
+}
 
 // Fetch statistics from backend
 async function fetchStatistics() {
@@ -492,16 +706,271 @@ function updateStatisticsDashboard(data) {
 
 // APOORV'S CODE
 
-// Old collision detection removed - will be replaced with Kalman filter system
+// Kalman filter-based collision detection
+let collisionLines = [];
+let collisionInterval;
+
+// Fetch and display collisions using Kalman filter
+async function fetchCollisions() {
+    try {
+        const response = await fetch('/api/collisions/kalman');
+        const data = await response.json();
+
+        if (data.error) {
+            console.error('Collision detection error:', data.error);
+            return;
+        }
+
+        displayCollisions(data.collisions);
+    } catch (error) {
+        console.error('Error fetching collisions:', error);
+    }
+}
+
+// Display collision warnings on the map
+function displayCollisions(collisions) {
+    // Remove old collision lines
+    collisionLines.forEach(line => map.removeLayer(line));
+    collisionLines = [];
+
+    if (!collisions || collisions.length === 0) {
+        return;
+    }
+
+    // Draw trajectory lines showing current position → predicted collision position
+    collisions.forEach(collision => {
+        // Look up actual current aircraft positions from live data
+        const aircraft1 = currentAircraftData.find(ac => ac.hex === collision.aircraft1);
+        const aircraft2 = currentAircraftData.find(ac => ac.hex === collision.aircraft2);
+
+        // Skip if we can't find current positions
+        if (!aircraft1 || !aircraft2) {
+            return;
+        }
+
+        // Use live current positions
+        const currentPos1 = [aircraft1.lat, aircraft1.lon];
+        const currentPos2 = [aircraft2.lat, aircraft2.lon];
+
+        // Predicted collision positions for each aircraft
+        const futurePos1 = [parseFloat(collision.position1.lat), parseFloat(collision.position1.lon)];
+        const futurePos2 = [parseFloat(collision.position2.lat), parseFloat(collision.position2.lon)];
+
+        // Calculate the collision point as the midpoint between the two predicted positions
+        const collisionLat = (futurePos1[0] + futurePos2[0]) / 2;
+        const collisionLon = (futurePos1[1] + futurePos2[1]) / 2;
+        const collisionPointPos = [collisionLat, collisionLon];
+
+        // Color based on probability and time
+        let color;
+        const probability = parseFloat(collision.probability);
+        const time = collision.timeToCollision;
+
+        if (probability > 15 || time < 60) {
+            color = '#ff0000'; // Red: High risk
+        } else if (probability > 10 || time < 120) {
+            color = '#ff6600'; // Orange: Medium risk
+        } else {
+            color = '#ffaa00'; // Yellow: Low risk
+        }
+
+        // Draw trajectory line for aircraft 1: current position → collision point
+        const trajectory1 = L.polyline([currentPos1, collisionPointPos], {
+            color: color,
+            weight: 2,
+            opacity: 0.6,
+            dashArray: '5, 5'
+        }).addTo(map);
+        collisionLines.push(trajectory1);
+
+        // Draw trajectory line for aircraft 2: current position → collision point
+        const trajectory2 = L.polyline([currentPos2, collisionPointPos], {
+            color: color,
+            weight: 2,
+            opacity: 0.6,
+            dashArray: '5, 5'
+        }).addTo(map);
+        collisionLines.push(trajectory2);
+
+        // Draw collision point marker at the midpoint (where they would collide)
+        const collisionPoint = L.circle(collisionPointPos, {
+            color: color,
+            fillColor: color,
+            fillOpacity: 0.3,
+            radius: 500, // 500 meters radius
+            weight: 2
+        }).addTo(map);
+        collisionLines.push(collisionPoint);
+
+        // Add popup with collision details to the collision point
+        const aircraft1Display = collision.flight1 || collision.aircraft1;
+        const aircraft2Display = collision.flight2 || collision.aircraft2;
+
+        const popupContent = `
+            <div style="min-width: 220px;">
+                <h3 style="margin: 0 0 10px 0; color: ${color};">⚠️ Predicted Collision</h3>
+                <table style="width: 100%; font-size: 12px;">
+                    <tr><td><b>Aircraft 1:</b></td><td>${aircraft1Display}</td></tr>
+                    <tr><td><b>Aircraft 2:</b></td><td>${aircraft2Display}</td></tr>
+                    <tr><td><b>Time to Collision:</b></td><td>${collision.timeToCollision}s (${Math.round(collision.timeToCollision/60)}m)</td></tr>
+                    <tr><td><b>Probability:</b></td><td>${collision.probability}</td></tr>
+                    <tr><td><b>Separation:</b></td><td>${(collision.distance/1000).toFixed(2)} km</td></tr>
+                    <tr><td><b>Vertical Sep:</b></td><td>${collision.verticalSeparation} ft</td></tr>
+                    <tr><td colspan="2"><hr style="margin: 5px 0;"></td></tr>
+                    <tr><td colspan="2"><b>Predicted Positions:</b></td></tr>
+                    <tr><td><b>AC1 Alt:</b></td><td>${collision.position1.alt} ft</td></tr>
+                    <tr><td><b>AC2 Alt:</b></td><td>${collision.position2.alt} ft</td></tr>
+                </table>
+            </div>
+        `;
+
+        collisionPoint.bindPopup(popupContent);
+    });
+
+    // Update collision count in header
+    const collisionCountEl = document.getElementById('collision-count');
+    if (collisionCountEl) {
+        collisionCountEl.textContent = collisions.length;
+    }
+
+    console.log(`🚨 ${collisions.length} potential collision(s) detected`);
+}
+
+// Prediction wedges for 2D map
+let predictionWedges = [];
+let showPredictionWedges = false;
+let predictionWedgeInterval;
+
+// Toggle prediction wedges visibility
+function togglePredictionWedges() {
+    showPredictionWedges = !showPredictionWedges;
+    
+    const button = document.getElementById('toggle-predictions');
+    if (button) {
+        button.textContent = showPredictionWedges ? '🔵 Hide Predictions' : '⚪ Show Predictions';
+        button.classList.toggle('active', showPredictionWedges);
+    }
+    
+    if (showPredictionWedges) {
+        displayPredictionWedges();
+    } else {
+        clearPredictionWedges();
+    }
+}
+
+// Clear all prediction wedges
+function clearPredictionWedges() {
+    predictionWedges.forEach(wedge => map.removeLayer(wedge));
+    predictionWedges = [];
+}
+
+// Display prediction wedges for all aircraft
+function displayPredictionWedges() {
+    clearPredictionWedges();
+    
+    if (!showPredictionWedges || !currentAircraftData || currentAircraftData.length === 0) {
+        return;
+    }
+    
+    const predictionTime = 300; // 5 minutes prediction
+    const spreadAngle = 12; // degrees spread on each side
+    
+    currentAircraftData.forEach(ac => {
+        if (!ac.lat || !ac.lon || !ac.speed || !ac.track) return;
+        
+        const speed = (ac.speed || 250) * 0.514444; // knots to m/s
+        const distance = speed * predictionTime;
+        
+        // Skip stationary aircraft
+        if (distance < 1000) return;
+        
+        const trackRad = (ac.track * Math.PI) / 180;
+        const spreadRad = (spreadAngle * Math.PI) / 180;
+        
+        // Calculate future position (center of wedge)
+        const metersPerDegreeLat = 111320;
+        const metersPerDegreeLon = 111320 * Math.cos(ac.lat * Math.PI / 180);
+        
+        const deltaLat = (distance * Math.cos(trackRad)) / metersPerDegreeLat;
+        const deltaLon = (distance * Math.sin(trackRad)) / metersPerDegreeLon;
+        
+        const futureLat = ac.lat + deltaLat;
+        const futureLon = ac.lon + deltaLon;
+        
+        // Calculate wedge edges (left and right bounds)
+        const leftTrackRad = trackRad - spreadRad;
+        const rightTrackRad = trackRad + spreadRad;
+        
+        const leftDeltaLat = (distance * Math.cos(leftTrackRad)) / metersPerDegreeLat;
+        const leftDeltaLon = (distance * Math.sin(leftTrackRad)) / metersPerDegreeLon;
+        const rightDeltaLat = (distance * Math.cos(rightTrackRad)) / metersPerDegreeLat;
+        const rightDeltaLon = (distance * Math.sin(rightTrackRad)) / metersPerDegreeLon;
+        
+        const leftLat = ac.lat + leftDeltaLat;
+        const leftLon = ac.lon + leftDeltaLon;
+        const rightLat = ac.lat + rightDeltaLat;
+        const rightLon = ac.lon + rightDeltaLon;
+        
+        // Color based on altitude
+        let color;
+        const altitude = ac.altitude || 10000;
+        if (altitude < 10000) {
+            color = '#00ff00'; // Green - low altitude
+        } else if (altitude < 25000) {
+            color = '#ffff00'; // Yellow - mid altitude
+        } else {
+            color = '#ff8800'; // Orange - high altitude
+        }
+        
+        // Create wedge polygon (triangle from current position to future bounds)
+        const wedgeCoords = [
+            [ac.lat, ac.lon],      // Current position (apex)
+            [leftLat, leftLon],    // Left edge of future position
+            [futureLat, futureLon], // Center of future position
+            [rightLat, rightLon],  // Right edge of future position
+            [ac.lat, ac.lon]       // Back to apex
+        ];
+        
+        const wedge = L.polygon(wedgeCoords, {
+            color: color,
+            weight: 1,
+            opacity: 0.6,
+            fillColor: color,
+            fillOpacity: 0.15
+        }).addTo(map);
+        
+        predictionWedges.push(wedge);
+        
+        // Add center trajectory line
+        const trajectoryLine = L.polyline([[ac.lat, ac.lon], [futureLat, futureLon]], {
+            color: color,
+            weight: 2,
+            opacity: 0.7,
+            dashArray: '5, 5'
+        }).addTo(map);
+        
+        predictionWedges.push(trajectoryLine);
+    });
+    
+    console.log(`📊 Displayed ${predictionWedges.length / 2} prediction wedges`);
+}
 
 // Start polling for aircraft data and statistics
 function startPolling() {
     fetchAircraftData(); // Initial fetch
     fetchStatistics(); // Initial statistics fetch
+    fetchCollisions(); // Initial collision check
 
     updateInterval = setInterval(fetchAircraftData, 2000); // Update every 2 seconds
     statisticsInterval = setInterval(fetchStatistics, 5000); // Update statistics every 5 seconds
-    // trailRefreshInterval = setInterval(refreshActiveTrails, 10000); // Refresh trails every 10 seconds (function not implemented)
+    collisionInterval = setInterval(fetchCollisions, 3000); // Check collisions every 3 seconds
+    
+    // Update prediction wedges when enabled
+    predictionWedgeInterval = setInterval(() => {
+        if (showPredictionWedges) {
+            displayPredictionWedges();
+        }
+    }, 3000); // Update wedges every 3 seconds
 }
 
 // Stop polling
@@ -511,6 +980,9 @@ function stopPolling() {
     }
     if (statisticsInterval) {
         clearInterval(statisticsInterval);
+    }
+    if (collisionInterval) {
+        clearInterval(collisionInterval);
     }
     if (trailRefreshInterval) {
         clearInterval(trailRefreshInterval);
@@ -572,9 +1044,18 @@ function setupControls() {
             toggleAirports();
         });
     }
+
+    // Trails toggle control
+    const toggleTrailsButton = document.getElementById('toggle-trails');
+    if (toggleTrailsButton) {
+        toggleTrailsButton.addEventListener('click', () => {
+            toggleAllTrails();
+        });
+    }
 }
 
 // Initialize when page loads
+// Load aircraft types for helicopter detection
 document.addEventListener('DOMContentLoaded', () => {
     initializeMap();
     updateStatus(false, 'Connecting...');

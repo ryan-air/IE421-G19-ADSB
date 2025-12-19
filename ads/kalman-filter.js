@@ -8,7 +8,7 @@
  * Uses constant velocity model for prediction
  */
 
-import math from 'mathjs';
+import * as math from 'mathjs';
 
 export class KalmanFilter {
     constructor(initialState = null) {

@@ -56,6 +56,11 @@ export class ProbabilityCone {
             const vy = speedMS * Math.cos(trackRad);
             const vz = (this.aircraft.vertical_rate || 0) * 0.00508; // feet/min to m/s
 
+            // Debug logging to verify vertical_rate is being used
+            if (this.aircraft.vertical_rate && Math.abs(this.aircraft.vertical_rate) > 100) {
+                console.log(`[${this.aircraft.hex}] Vertical rate: ${this.aircraft.vertical_rate} ft/min, vz: ${vz.toFixed(2)} m/s ${this.aircraft.vertical_rate > 0 ? '↑ CLIMBING' : '↓ DESCENDING'}`);
+            }
+
             const initialState = math.matrix([[currentECEF.x], [currentECEF.y], [currentECEF.z],
                                               [vx], [vy], [vz]]);
 

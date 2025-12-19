@@ -358,7 +358,8 @@ function createAircraftEntity(aircraft) {
             flight: aircraft.flight,
             altitude: aircraft.altitude,
             speed: aircraft.speed,
-            track: aircraft.track
+            track: aircraft.track,
+            vertical_rate: aircraft.vertical_rate
         }
     });
 
@@ -398,7 +399,8 @@ function updateAircraftEntity(entity, aircraft) {
         flight: aircraft.flight,
         altitude: aircraft.altitude,
         speed: aircraft.speed,
-        track: aircraft.track
+        track: aircraft.track,
+        vertical_rate: aircraft.vertical_rate
     };
 
     // Add to trail if enabled
@@ -457,6 +459,27 @@ async function fetchAircraftData() {
         document.getElementById('aircraft-count').textContent = data.aircraft?.length || 0;
 
         currentAircraftData = data.aircraft || []; // Store for collision line updates
+
+        // Debug: Log vertical rate statistics
+        const vrStats = currentAircraftData.reduce((acc, ac) => {
+            if (ac.vertical_rate !== null && ac.vertical_rate !== undefined) {
+                if (Math.abs(ac.vertical_rate) > 100) {
+                    acc.active++;
+                    if (ac.vertical_rate > 100) acc.climbing++;
+                    if (ac.vertical_rate < -100) acc.descending++;
+                } else {
+                    acc.level++;
+                }
+            } else {
+                acc.missing++;
+            }
+            return acc;
+        }, { climbing: 0, descending: 0, level: 0, missing: 0, active: 0 });
+
+        if (vrStats.active > 0 || vrStats.missing > 0) {
+            console.log(`Vertical Rate: ${vrStats.climbing}↑ climbing, ${vrStats.descending}↓ descending, ${vrStats.level} level, ${vrStats.missing} missing data`);
+        }
+
         updateAircraftOn3DGlobe(currentAircraftData);
     } catch (error) {
         console.error('Error fetching aircraft data:', error);
@@ -1283,6 +1306,7 @@ viewer.selectedEntityChanged.addEventListener((selectedEntity) => {
         const altitude = selectedEntity.properties.altitude?.valueOf();
         const speed = selectedEntity.properties.speed?.valueOf();
         const track = selectedEntity.properties.track?.valueOf();
+        const verticalRate = selectedEntity.properties.vertical_rate?.valueOf();
 
         // Store the selected aircraft hex code
         selectedAircraft = hex;
@@ -1295,10 +1319,18 @@ viewer.selectedEntityChanged.addEventListener((selectedEntity) => {
             infoPanel.classList.remove('collision-info');
             infoPanel.style.borderColor = '#7a9a7a';
 
+        // Format vertical rate display
+        let vrDisplay = 'Level';
+        if (verticalRate && Math.abs(verticalRate) > 64) { // Ignore noise below ~64 ft/min
+            const direction = verticalRate > 0 ? '↑' : '↓';
+            vrDisplay = `${direction} ${Math.abs(verticalRate)} ft/min`;
+        }
+
         infoContent.innerHTML = `
             <strong>Flight:</strong> ${flight || 'N/A'}<br>
             <strong>ICAO:</strong> ${hex}<br>
             <strong>Altitude:</strong> ${altitude || 'N/A'} ft<br>
+            <strong>Vertical Rate:</strong> ${vrDisplay}<br>
             <strong>Speed:</strong> ${speed || 'N/A'} kt<br>
             <strong>Heading:</strong> ${track || 'N/A'}°
                 ${isFollowing ? '<br><em style="color: #9aba9a;">Following this aircraft</em>' : '<br><em style="color: #8aaa8a;">Click "Follow" to track</em>'}

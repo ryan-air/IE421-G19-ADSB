@@ -145,19 +145,52 @@ async function fetchAircraftFromDB(timeWindowSeconds = 30) {
             `;
         } else {
             query = `
-                SELECT 
-                    hex,
-                    flight,
-                    lat,
-                    lon,
-                    altitude,
-                    speed,
-                    track,
-                    EXTRACT(EPOCH FROM seen_at)::bigint as seen
-                FROM aircraft_real
-                WHERE lat IS NOT NULL
-                AND lon IS NOT NULL
-                ORDER BY seen_at DESC
+                WITH active_aircraft AS (
+                    SELECT hex
+                    FROM aircraft_real
+                    WHERE lat IS NOT NULL AND lon IS NOT NULL
+                ),
+                recent_positions AS (
+                    SELECT
+                        h.hex,
+                        h.altitude,
+                        h.timestamp,
+                        LAG(h.altitude) OVER (PARTITION BY h.hex ORDER BY h.timestamp) as prev_altitude,
+                        LAG(h.timestamp) OVER (PARTITION BY h.hex ORDER BY h.timestamp) as prev_timestamp
+                    FROM aircraft_position_history h
+                    INNER JOIN active_aircraft aa ON h.hex = aa.hex
+                    WHERE h.altitude IS NOT NULL
+                    AND h.timestamp > NOW() - INTERVAL '30 seconds'
+                ),
+                vertical_rates AS (
+                    SELECT DISTINCT ON (hex)
+                        hex,
+                        CASE
+                            WHEN prev_altitude IS NOT NULL AND prev_timestamp IS NOT NULL
+                                AND EXTRACT(EPOCH FROM (timestamp - prev_timestamp)) BETWEEN 0.5 AND 30
+                            THEN
+                                ((altitude - prev_altitude) / EXTRACT(EPOCH FROM (timestamp - prev_timestamp))) * 60
+                            ELSE NULL
+                        END as calculated_vr
+                    FROM recent_positions
+                    WHERE prev_altitude IS NOT NULL
+                    ORDER BY hex, timestamp DESC
+                )
+                SELECT
+                    a.hex,
+                    a.flight,
+                    a.lat,
+                    a.lon,
+                    a.altitude,
+                    a.speed,
+                    a.track,
+                    EXTRACT(EPOCH FROM a.seen_at)::bigint as seen,
+                    COALESCE(a.vertical_rate, vr.calculated_vr) as vertical_rate
+                FROM aircraft_real a
+                LEFT JOIN vertical_rates vr ON a.hex = vr.hex
+                WHERE a.lat IS NOT NULL
+                AND a.lon IS NOT NULL
+                ORDER BY a.seen_at DESC
             `;
         }
         
@@ -180,6 +213,7 @@ async function fetchAircraftFromDB(timeWindowSeconds = 30) {
                     altitude: ac.altitude || null,
                     speed: ac.speed || null,
                     track: ac.track || null,
+                    vertical_rate: ac.vertical_rate || null, // Vertical rate in feet/min (climb/descent)
                     seen: seen,
                     type: aircraftTypes[hexUpper] || null // Aircraft type (6 = helicopter)
                 });

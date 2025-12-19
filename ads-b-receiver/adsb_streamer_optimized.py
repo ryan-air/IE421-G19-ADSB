@@ -519,7 +519,16 @@ class AircraftDataManager:
                 self.db_pool.putconn(conn)
 
     def cleanup_old_history(self, hours_to_keep: int = 2):
-        """Remove old position history to prevent database bloat"""
+        """Remove old position history to prevent database bloat
+
+        Args:
+            hours_to_keep: Hours of history to keep (0 = keep all history forever)
+        """
+        # If hours_to_keep is 0, don't delete anything (keep all history)
+        if hours_to_keep == 0:
+            logger.debug("History cleanup disabled (hours_to_keep=0)")
+            return
+
         conn = None
         try:
             conn = self.db_pool.getconn()
@@ -538,18 +547,18 @@ class AircraftDataManager:
                     WHERE recorded_at < NOW() - INTERVAL %s
                 """, (f'{hours_to_keep} hours',))
 
-            # Clean up aircraft_position_history (for Kalman filter)
-            # Keep last 10 minutes only (enough for predictions)
+            # Clean up aircraft_position_history
+            # Use same retention period as aircraft_history_real
             cursor.execute("""
                 DELETE FROM aircraft_position_history
-                WHERE timestamp < NOW() - INTERVAL '10 minutes'
-            """)
+                WHERE timestamp < NOW() - INTERVAL %s
+            """, (f'{hours_to_keep} hours',))
 
             deleted_count = cursor.rowcount
             conn.commit()
 
             if deleted_count > 0:
-                logger.info(f"Cleaned up {deleted_count} old position history records (older than 10min)")
+                logger.info(f"Cleaned up {deleted_count} old position history records (older than {hours_to_keep}h)")
 
         except Exception as e:
             if conn:

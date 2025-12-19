@@ -83,3 +83,5 @@ pids/
 # Yarn Integrity file
 .yarn-integrity
 
+# Large FAA data files
+ReleasableAircraft/

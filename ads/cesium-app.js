@@ -290,6 +290,16 @@ viewer.camera.setView({
     }
 });
 
+/**
+ * Check if an aircraft is a helicopter
+ * @param {Object} aircraft - Aircraft object with type field from server
+ * @returns {boolean} True if helicopter (type 6)
+ */
+function isHelicopter(aircraft) {
+    // Type field is provided by server (6 = Rotorcraft/Helicopter)
+    return aircraft.type === 6;
+}
+
 // Aircraft model (simple 3D cone/cylinder to represent plane)
 function createAircraftEntity(aircraft) {
     const position = Cesium.Cartesian3.fromDegrees(
@@ -307,23 +317,24 @@ function createAircraftEntity(aircraft) {
     );
 
     const identifier = aircraft.flight || aircraft.hex || 'N/A';
+    const isHeli = isHelicopter(aircraft);
 
-    // Create entity with Cesium airplane model
+    // Create entity with appropriate model (airplane or helicopter)
     const entity = viewer.entities.add({
         id: aircraft.hex,
         position: positionMeters,
         model: {
-            uri: 'https://raw.githubusercontent.com/CesiumGS/cesium/main/Apps/SampleData/models/CesiumAir/Cesium_Air.glb',
+            uri: isHeli ? './helicopter.glb' : 'https://raw.githubusercontent.com/CesiumGS/cesium/main/Apps/SampleData/models/CesiumAir/Cesium_Air.glb',
             minimumPixelSize: 64,
             maximumScale: 20000,
-            color: Cesium.Color.WHITE, // White for better visibility
-            silhouetteColor: Cesium.Color.CYAN,
+            color: Cesium.Color.WHITE,
+            silhouetteColor: isHeli ? Cesium.Color.YELLOW : Cesium.Color.CYAN,
             silhouetteSize: 1.0
         },
         orientation: Cesium.Transforms.headingPitchRollQuaternion(
             positionMeters,
             new Cesium.HeadingPitchRoll(
-                // Cesium Air model needs -90 degree offset to align nose with track direction
+                // Cesium Air model needs -90 degree offset, helicopter model may need different offset
                 Cesium.Math.toRadians((aircraft.track || 0) - 90),
                 Cesium.Math.toRadians(0),
                 0
@@ -332,7 +343,7 @@ function createAircraftEntity(aircraft) {
         label: {
             text: identifier,
             font: 'bold 13px Courier New',
-            fillColor: Cesium.Color.CYAN, // Bright cyan for visibility
+            fillColor: isHeli ? Cesium.Color.YELLOW : Cesium.Color.CYAN, // Yellow for helicopters
             outlineColor: Cesium.Color.BLACK,
             outlineWidth: 3,
             style: Cesium.LabelStyle.FILL_AND_OUTLINE,
@@ -536,7 +547,9 @@ let collisionLines = [];
 let probabilityCones = [];
 let showProbabilityCones = false;
 let hideGroundedPlanes = false;
+let showStatistics = false;
 let collisionInterval;
+let statisticsInterval;
 
 // Fetch and display collisions with probability cones
 async function fetchCollisions() {
@@ -906,6 +919,118 @@ function toggleHideGroundedPlanes() {
     }
 }
 
+// Statistics functions
+function toggleStatistics() {
+    showStatistics = !showStatistics;
+    const panel = document.getElementById('statistics-panel');
+    if (panel) {
+        panel.classList.toggle('open', showStatistics);
+    }
+    
+    const button = document.getElementById('toggle-statistics');
+    if (button) {
+        button.textContent = showStatistics ? '📊 Stats ✓' : '📊 Stats';
+    }
+    
+    // Fetch immediately when opening
+    if (showStatistics) {
+        fetchStatistics();
+    }
+}
+
+// Format duration from seconds
+function formatDuration(seconds) {
+    if (!seconds || seconds < 0) return '0s';
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+
+    if (hours > 0) {
+        return `${hours}h ${minutes}m`;
+    } else if (minutes > 0) {
+        return `${minutes}m ${secs}s`;
+    } else {
+        return `${secs}s`;
+    }
+}
+
+// Fetch statistics from backend
+async function fetchStatistics() {
+    try {
+        const response = await fetch('/api/statistics?window=60');
+        if (!response.ok) {
+            throw new Error('Failed to fetch statistics');
+        }
+        const data = await response.json();
+        updateStatisticsDashboard(data);
+    } catch (error) {
+        console.error('Error fetching statistics:', error);
+    }
+}
+
+// Update statistics dashboard
+function updateStatisticsDashboard(data) {
+    const dashboardElement = document.getElementById('statistics-content');
+    if (!dashboardElement) return;
+
+    const { summary, altitude_distribution, flight_durations } = data;
+
+    // Build altitude distribution bars
+    const altitudeHTML = altitude_distribution.map(item => {
+        const maxCount = Math.max(10, ...altitude_distribution.map(i => i.count));
+        const barWidth = Math.min((item.count / maxCount) * 100, 100);
+        return `
+            <div class="stat-bar-container-3d">
+                <span class="stat-bar-label-3d">${item.range}</span>
+                <div class="stat-bar-bg-3d">
+                    <div class="stat-bar-3d" style="width: ${barWidth}%"></div>
+                </div>
+                <span class="stat-bar-value-3d">${item.count}</span>
+            </div>
+        `;
+    }).join('');
+
+    // Build flight durations list (top 10)
+    const topFlights = flight_durations.slice(0, 10);
+    const durationsHTML = topFlights.map(item => {
+        return `
+            <div class="duration-item-3d">
+                <span class="duration-flight-3d">${item.flight || item.hex}</span>
+                <span class="duration-time-3d">${formatDuration(item.duration_seconds)}</span>
+            </div>
+        `;
+    }).join('') || '<div style="color: #7a9a7a; font-size: 10px;">No active flights</div>';
+
+    dashboardElement.innerHTML = `
+        <div class="stats-summary-3d">
+            <div class="stat-card-3d">
+                <div class="stat-card-label-3d">Flights</div>
+                <div class="stat-card-value-3d">${summary.total_flights}</div>
+            </div>
+            <div class="stat-card-3d">
+                <div class="stat-card-label-3d">Avg Speed</div>
+                <div class="stat-card-value-3d">${summary.avg_speed.toFixed(0)}</div>
+            </div>
+            <div class="stat-card-3d">
+                <div class="stat-card-label-3d">Avg Alt</div>
+                <div class="stat-card-value-3d">${(summary.avg_altitude / 1000).toFixed(1)}k</div>
+            </div>
+        </div>
+
+        <div class="stats-section-3d">
+            <h4>Altitude Distribution</h4>
+            ${altitudeHTML || '<div style="color: #7a9a7a; font-size: 10px;">No data</div>'}
+        </div>
+
+        <div class="stats-section-3d">
+            <h4>Flight Durations (Top 10)</h4>
+            <div class="durations-list-3d">
+                ${durationsHTML}
+            </div>
+        </div>
+    `;
+}
+
 // Create airport icon as a data URL
 function createAirportIcon(isLarge) {
     const size = isLarge ? 24 : 16;
@@ -1232,6 +1357,13 @@ function startPolling() {
             fetchAndDisplayProbabilityCones();
         }
     }, 5000); // Update cones every 5 seconds
+    
+    // Update statistics when panel is open
+    statisticsInterval = setInterval(() => {
+        if (showStatistics) {
+            fetchStatistics();
+        }
+    }, 5000); // Update stats every 5 seconds
 }
 
 // Stop polling

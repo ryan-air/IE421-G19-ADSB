@@ -4,6 +4,7 @@ dotenv.config();
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { Pool } from 'pg';
 import { detectCollisions, formatCollision } from './probability-cone.js';
@@ -14,6 +15,20 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Load aircraft types lookup table (ICAO hex → aircraft type)
+// Type 6 = Rotorcraft/Helicopter
+let aircraftTypes = {};
+try {
+    const aircraftTypesPath = path.join(__dirname, 'aircraft-types-by-hex.json');
+    aircraftTypes = JSON.parse(fs.readFileSync(aircraftTypesPath, 'utf-8'));
+    const helicopterCount = Object.values(aircraftTypes).filter(t => t === 6).length;
+    console.log(`✅ Loaded ${Object.keys(aircraftTypes).length} aircraft type definitions`);
+    console.log(`🚁 ${helicopterCount} helicopter/rotorcraft models in database`);
+} catch (error) {
+    console.warn('⚠️  Aircraft types lookup file not found, helicopter detection disabled');
+    console.warn('   Run: node parse-faa-data.js to generate aircraft-types-by-hex.json');
+}
 
 // Check if DATABASE_URL is set
 if (!process.env.DATABASE_URL) {
@@ -153,9 +168,10 @@ async function fetchAircraftFromDB(timeWindowSeconds = 30) {
         result.rows.forEach(ac => {
             const seen = parseInt(ac.seen);
             const existing = aircraftMap.get(ac.hex);
-            
+
             // Keep the most recent position for each aircraft
             if (!existing || existing.seen < seen) {
+                const hexUpper = ac.hex.toUpperCase();
                 aircraftMap.set(ac.hex, {
                     hex: ac.hex,
                     flight: ac.flight || null,
@@ -164,7 +180,8 @@ async function fetchAircraftFromDB(timeWindowSeconds = 30) {
                     altitude: ac.altitude || null,
                     speed: ac.speed || null,
                     track: ac.track || null,
-                    seen: seen
+                    seen: seen,
+                    type: aircraftTypes[hexUpper] || null // Aircraft type (6 = helicopter)
                 });
             }
         });
@@ -501,7 +518,6 @@ app.get('/api/collisions/kalman', async (req, res) => {
         });
     }
 });
-
 
 // Serve the main page
 app.get('/', (req, res) => {

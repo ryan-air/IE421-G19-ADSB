@@ -158,24 +158,49 @@ function formatDuration(seconds) {
 // Trail functionality removed
 
 // Create aircraft marker icon with plane SVG and label
+// Check if aircraft is a helicopter based on type field from server
+function isHelicopter(aircraft) {
+    // Type field is provided by server (6 = Rotorcraft/Helicopter)
+    return aircraft.type === 6;
+}
+
 function createAircraftIcon(aircraft) {
     const heading = aircraft.track || 0;
     const identifier = aircraft.flight || aircraft.hex || 'N/A';
-    
-    const planeSVG = `
+    const isHeli = isHelicopter(aircraft);
+
+    // Different SVG for helicopters vs fixed-wing
+    const iconSVG = isHeli ? `
+        <svg width="24" height="24" viewBox="0 0 24 24" class="aircraft-icon" style="transform: rotate(${heading}deg);">
+            <!-- Helicopter rotor -->
+            <line x1="4" y1="6" x2="20" y2="6" stroke="#7a9a7a" stroke-width="1.5"/>
+            <circle cx="12" cy="6" r="1.5" fill="#5a8a5a"/>
+            <!-- Helicopter body -->
+            <ellipse cx="12" cy="12" rx="5" ry="7" fill="#7a9a7a" stroke="#5a8a5a" stroke-width="0.5"/>
+            <circle cx="12" cy="12" r="2" fill="#6b8e6b"/>
+            <!-- Tail rotor -->
+            <line x1="12" y1="18" x2="12" y2="22" stroke="#7a9a7a" stroke-width="1.2"/>
+            <line x1="10" y1="22" x2="14" y2="22" stroke="#7a9a7a" stroke-width="1"/>
+        </svg>
+    ` : `
+        <svg width="24" height="24" viewBox="0 0 24 24" class="aircraft-icon" style="transform: rotate(${heading}deg);">
+            <!-- Fixed-wing aircraft -->
+            <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="#7a9a7a" stroke="#5a8a5a" stroke-width="0.5"/>
+            <path d="M2 17L12 22L22 17" stroke="#7a9a7a" stroke-width="1" fill="none"/>
+            <circle cx="12" cy="12" r="2" fill="#6b8e6b"/>
+        </svg>
+    `;
+
+    const markerHTML = `
         <div class="aircraft-marker-container">
             <div class="aircraft-label">${identifier}</div>
-            <svg width="24" height="24" viewBox="0 0 24 24" class="aircraft-icon" style="transform: rotate(${heading}deg);">
-                <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="#7a9a7a" stroke="#5a8a5a" stroke-width="0.5"/>
-                <path d="M2 17L12 22L22 17" stroke="#7a9a7a" stroke-width="1" fill="none"/>
-                <circle cx="12" cy="12" r="2" fill="#6b8e6b"/>
-            </svg>
+            ${iconSVG}
         </div>
     `;
-    
+
     return L.divIcon({
         className: 'aircraft-marker',
-        html: planeSVG,
+        html: markerHTML,
         iconSize: [60, 40], // Wider to accommodate label
         iconAnchor: [30, 35] // Anchor at bottom center (below label)
     });
@@ -837,6 +862,7 @@ function setupControls() {
 }
 
 // Initialize when page loads
+// Load aircraft types for helicopter detection
 document.addEventListener('DOMContentLoaded', () => {
     initializeMap();
     updateStatus(false, 'Connecting...');

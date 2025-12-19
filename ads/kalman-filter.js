@@ -8,7 +8,16 @@
  * Uses constant velocity model for prediction
  */
 
-import * as math from 'mathjs';
+// Import math - works in both browser (from CDN) and Node.js (from npm)
+let math;
+if (typeof window !== 'undefined' && window.math) {
+    // Browser environment with CDN
+    math = window.math;
+} else {
+    // Node.js environment - dynamic import
+    const mathModule = await import('mathjs');
+    math = mathModule.default || mathModule;
+}
 
 export class KalmanFilter {
     constructor(initialState = null) {

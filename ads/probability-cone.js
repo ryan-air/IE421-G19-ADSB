@@ -5,7 +5,17 @@
  * Uses Kalman filter to predict position with uncertainty that grows over time
  */
 
-import * as math from 'mathjs';
+// Import math - works in both browser (from CDN) and Node.js (from npm)
+let math;
+if (typeof window !== 'undefined' && window.math) {
+    // Browser environment with CDN
+    math = window.math;
+} else {
+    // Node.js environment - dynamic import
+    const mathModule = await import('mathjs');
+    math = mathModule.default || mathModule;
+}
+
 import { KalmanFilter, latLonAltToECEF, ecefToLatLonAlt, distance3D } from './kalman-filter.js';
 
 /**
@@ -49,17 +59,33 @@ export class ProbabilityCone {
                 this.aircraft.altitude
             );
 
-            // Estimate velocity from speed and track
+            // Estimate velocity by computing position delta over 1 second
+            // This avoids ENU→ECEF transformation issues
             const speedMS = (this.aircraft.speed || 0) * 0.514444; // knots to m/s
             const trackRad = ((this.aircraft.track || 0) * Math.PI) / 180;
-            const vx = speedMS * Math.sin(trackRad);
-            const vy = speedMS * Math.cos(trackRad);
-            const vz = (this.aircraft.vertical_rate || 0) * 0.00508; // feet/min to m/s
-
-            // Debug logging to verify vertical_rate is being used
-            if (this.aircraft.vertical_rate && Math.abs(this.aircraft.vertical_rate) > 100) {
-                console.log(`[${this.aircraft.hex}] Vertical rate: ${this.aircraft.vertical_rate} ft/min, vz: ${vz.toFixed(2)} m/s ${this.aircraft.vertical_rate > 0 ? '↑ CLIMBING' : '↓ DESCENDING'}`);
-            }
+            const verticalRateFtPerSec = (this.aircraft.vertical_rate || 0) / 60; // ft/min to ft/sec
+            
+            // Compute lat/lon change per second
+            // North velocity component changes latitude
+            // East velocity component changes longitude (scaled by cos(lat))
+            const latRad = this.aircraft.lat * Math.PI / 180;
+            const metersPerDegreeLat = 111320; // meters per degree latitude
+            const metersPerDegreeLon = 111320 * Math.cos(latRad); // meters per degree longitude
+            
+            const deltaLatPerSec = (speedMS * Math.cos(trackRad)) / metersPerDegreeLat;
+            const deltaLonPerSec = (speedMS * Math.sin(trackRad)) / metersPerDegreeLon;
+            
+            // Compute position after 1 second
+            const futureLat = this.aircraft.lat + deltaLatPerSec;
+            const futureLon = this.aircraft.lon + deltaLonPerSec;
+            const futureAlt = this.aircraft.altitude + verticalRateFtPerSec;
+            
+            // Convert both positions to ECEF and compute velocity as the delta
+            const futureECEF = latLonAltToECEF(futureLat, futureLon, futureAlt);
+            
+            const vx = futureECEF.x - currentECEF.x;
+            const vy = futureECEF.y - currentECEF.y;
+            const vz = futureECEF.z - currentECEF.z;
 
             const initialState = math.matrix([[currentECEF.x], [currentECEF.y], [currentECEF.z],
                                               [vx], [vy], [vz]]);
@@ -96,6 +122,7 @@ export class ProbabilityCone {
 
         // Train Kalman filter with historical positions
         let prevTime = new Date(first.timestamp);
+        let lastHistoricalTime = prevTime;
 
         for (let i = 1; i < sorted.length; i++) {
             const pos = sorted[i];
@@ -111,10 +138,69 @@ export class ProbabilityCone {
                 kf.update([ecef.x, ecef.y, ecef.z]);
 
                 prevTime = currentTime;
+                lastHistoricalTime = currentTime;
             }
         }
 
+        // CRITICAL: Predict forward from last historical position to current time
+        // Without this, predictions start from the past!
+        const now = Date.now();
+        const timeSinceLastUpdate = (now - lastHistoricalTime.getTime()) / 1000; // seconds
+        if (timeSinceLastUpdate > 0 && timeSinceLastUpdate < 300) {  // Only predict forward up to 5 minutes
+            kf.predict(timeSinceLastUpdate);
+        } else if (timeSinceLastUpdate >= 300) {
+            // History is too old (>5min), fall back to velocity-from-track method
+            console.warn(`[${this.aircraft.hex}] History too old (${timeSinceLastUpdate.toFixed(0)}s), using track/speed instead`);
+            return this.initializeKalmanFilterFromVelocity();
+        }
+
         return kf;
+    }
+
+    /**
+     * Initialize Kalman filter using current position and velocity from track/speed
+     * Used as fallback when position history is too old
+     */
+    initializeKalmanFilterFromVelocity() {
+        const currentECEF = latLonAltToECEF(
+            this.aircraft.lat,
+            this.aircraft.lon,
+            this.aircraft.altitude
+        );
+
+        // Estimate velocity from speed and track
+        const speedMS = (this.aircraft.speed || 0) * 0.514444; // knots to m/s
+        const trackRad = ((this.aircraft.track || 0) * Math.PI) / 180;
+        const verticalRateMS = (this.aircraft.vertical_rate || 0) * 0.00508; // feet/min to m/s
+
+        // Estimate velocity by computing position delta over 1 second
+        // This avoids ENU→ECEF transformation issues
+        const verticalRateFtPerSec = (this.aircraft.vertical_rate || 0) / 60; // ft/min to ft/sec
+        
+        // Compute lat/lon change per second
+        const latRad = this.aircraft.lat * Math.PI / 180;
+        const metersPerDegreeLat = 111320;
+        const metersPerDegreeLon = 111320 * Math.cos(latRad);
+        
+        const deltaLatPerSec = (speedMS * Math.cos(trackRad)) / metersPerDegreeLat;
+        const deltaLonPerSec = (speedMS * Math.sin(trackRad)) / metersPerDegreeLon;
+        
+        // Compute position after 1 second
+        const futureLat = this.aircraft.lat + deltaLatPerSec;
+        const futureLon = this.aircraft.lon + deltaLonPerSec;
+        const futureAlt = this.aircraft.altitude + verticalRateFtPerSec;
+        
+        // Convert both positions to ECEF and compute velocity as the delta
+        const futureECEF = latLonAltToECEF(futureLat, futureLon, futureAlt);
+        
+        const vx = futureECEF.x - currentECEF.x;
+        const vy = futureECEF.y - currentECEF.y;
+        const vz = futureECEF.z - currentECEF.z;
+
+        const initialState = math.matrix([[currentECEF.x], [currentECEF.y], [currentECEF.z],
+                                          [vx], [vy], [vz]]);
+
+        return new KalmanFilter(initialState);
     }
 
     /**

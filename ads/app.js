@@ -11,10 +11,12 @@ const INTERPOLATION_DURATION = 2000; // Match polling interval for smooth moveme
 let airportsLayer = null;
 let airportsData = null;
 let showAirports = false;
+
 // Trail settings
-let showTrails = false;
-let trailDuration = 120; // minutes (2 hours to match cleanup interval)
-let selectedAircraftForTrail = null;
+const aircraftTrails = new Map(); // Store trail polylines: hex -> polyline
+const trailData = new Map(); // Store trail position data: hex -> positions array
+let trailRefreshInterval = null;
+let showAllTrails = false; // Global toggle for all trails
 
 // Initialize map
 function initializeMap() {
@@ -333,7 +335,8 @@ function updateAircraftOnMap(aircraftData) {
             marker._heading = aircraft.track || 0;
             marker._identifier = aircraft.flight || aircraft.hex || 'N/A';
 
-            // Add popup with aircraft info
+            // Add popup with aircraft info and trail button
+            const hasTrail = aircraftTrails.has(aircraft.hex);
             const popupContent = `
                 <div style="font-family: 'Courier New', monospace; color: #7a9a7a;">
                     <strong style="color: #8a9a8a;">${aircraft.flight || 'N/A'}</strong><br>
@@ -341,6 +344,11 @@ function updateAircraftOnMap(aircraftData) {
                     ${aircraft.altitude ? `ALT: ${aircraft.altitude} ft` : ''}<br>
                     ${aircraft.speed ? `SPD: ${aircraft.speed} kt` : ''}<br>
                     ${aircraft.track ? `HDG: ${aircraft.track}°` : ''}<br>
+                    <button
+                        onclick="toggleAircraftTrail('${aircraft.hex}')"
+                        style="margin-top: 8px; padding: 4px 12px; background: ${hasTrail ? '#d9534f' : '#5cb85c'}; color: white; border: none; border-radius: 3px; cursor: pointer; font-family: 'Courier New', monospace; font-size: 12px;">
+                        ${hasTrail ? 'Hide Trail' : 'Show Trail'}
+                    </button>
                 </div>
             `;
             marker.bindPopup(popupContent);
@@ -427,13 +435,182 @@ async function fetchAircraftData() {
         // Update map and list (always update map, even if empty)
         updateAircraftOnMap(currentAircraftData);
         updateAircraftList(currentAircraftData);
+
+        // If global trails are enabled, show trails for new aircraft
+        if (showAllTrails) {
+            currentAircraftData.forEach(aircraft => {
+                if (!aircraftTrails.has(aircraft.hex)) {
+                    fetchAndDisplayTrail(aircraft.hex);
+                }
+            });
+        }
     } catch (error) {
         console.error('Error fetching aircraft data:', error);
         updateStatus(false, 'Connection Error');
     }
 }
 
-// Trail functionality removed
+/**
+ * Toggle trail display for a specific aircraft
+ * @param {string} hex - Aircraft ICAO hex code
+ */
+window.toggleAircraftTrail = async function(hex) {
+    // Disable global trails mode when manually toggling individual trails
+    if (showAllTrails) {
+        showAllTrails = false;
+        const button = document.getElementById('toggle-trails');
+        if (button) {
+            button.textContent = '⚪ Show All Trails';
+            button.style.background = '';
+        }
+    }
+
+    if (aircraftTrails.has(hex)) {
+        // Remove trail
+        const trail = aircraftTrails.get(hex);
+        map.removeLayer(trail);
+        aircraftTrails.delete(hex);
+        trailData.delete(hex);
+
+        // Stop refresh if no more trails
+        if (aircraftTrails.size === 0 && trailRefreshInterval) {
+            clearInterval(trailRefreshInterval);
+            trailRefreshInterval = null;
+        }
+    } else {
+        // Show trail
+        await fetchAndDisplayTrail(hex);
+
+        // Start refresh interval if not running
+        if (!trailRefreshInterval) {
+            trailRefreshInterval = setInterval(() => {
+                // Refresh all active trails
+                aircraftTrails.forEach((_trail, hexCode) => {
+                    fetchAndDisplayTrail(hexCode);
+                });
+            }, 5000); // Refresh every 5 seconds
+        }
+    }
+
+    // Update popup to reflect new state
+    updateAircraftOnMap(currentAircraftData);
+};
+
+/**
+ * Fetch and display trail for specific aircraft
+ * @param {string} hex - Aircraft ICAO hex code
+ */
+async function fetchAndDisplayTrail(hex) {
+    try {
+        const response = await fetch(`/api/aircraft/${hex}/trail?minutes=120&limit=500`);
+        if (!response.ok) {
+            console.error(`Failed to fetch trail for ${hex}`);
+            return;
+        }
+
+        const data = await response.json();
+
+        if (!data.trail || data.trail.length === 0) {
+            console.log(`No trail data for ${hex}`);
+            return;
+        }
+
+        // Store trail data
+        trailData.set(hex, data.trail);
+
+        // Convert trail to Leaflet coordinates
+        const coordinates = data.trail.map(point => [point.lat, point.lon]);
+
+        // Remove existing trail if present
+        if (aircraftTrails.has(hex)) {
+            map.removeLayer(aircraftTrails.get(hex));
+        }
+
+        // Check if this is a helicopter (find aircraft in current data)
+        const aircraft = currentAircraftData.find(ac => ac.hex === hex);
+        const isHeli = aircraft && isHelicopter(aircraft);
+
+        // Create polyline for trail - yellow for helicopters, cyan for fixed-wing
+        const trail = L.polyline(coordinates, {
+            color: isHeli ? '#ffff00' : '#00ffff',
+            weight: 2,
+            opacity: 0.6,
+            smoothFactor: 1
+        }).addTo(map);
+
+        // Add popup with trail info
+        trail.bindPopup(`
+            <div style="font-family: 'Courier New', monospace; color: #7a9a7a;">
+                <strong style="color: #8a9a8a;">Trail: ${hex}${isHeli ? ' 🚁' : ''}</strong><br>
+                Points: ${data.trail.length}<br>
+                Duration: ${Math.round((data.trail[0].seen - data.trail[data.trail.length - 1].seen) / 60)} minutes
+            </div>
+        `);
+
+        aircraftTrails.set(hex, trail);
+
+    } catch (error) {
+        console.error(`Error fetching trail for ${hex}:`, error);
+    }
+}
+
+/**
+ * Clear all trails
+ */
+function clearAllTrails() {
+    aircraftTrails.forEach((trail) => {
+        map.removeLayer(trail);
+    });
+    aircraftTrails.clear();
+    trailData.clear();
+
+    if (trailRefreshInterval) {
+        clearInterval(trailRefreshInterval);
+        trailRefreshInterval = null;
+    }
+}
+
+/**
+ * Toggle trails for all aircraft
+ */
+async function toggleAllTrails() {
+    const button = document.getElementById('toggle-trails');
+
+    if (showAllTrails) {
+        // Hide all trails
+        clearAllTrails();
+        showAllTrails = false;
+        if (button) {
+            button.textContent = '⚪ Show All Trails';
+            button.style.background = '';
+        }
+    } else {
+        // Show trails for all current aircraft
+        showAllTrails = true;
+        if (button) {
+            button.textContent = '🔵 Hide All Trails';
+            button.style.background = 'rgba(0, 255, 255, 0.3)';
+        }
+
+        // Fetch and display trails for all aircraft
+        const promises = currentAircraftData.map(aircraft =>
+            fetchAndDisplayTrail(aircraft.hex)
+        );
+        await Promise.all(promises);
+
+        // Start refresh interval
+        if (!trailRefreshInterval) {
+            trailRefreshInterval = setInterval(() => {
+                if (showAllTrails) {
+                    // Refresh trails for all current aircraft
+                    currentAircraftData.forEach(aircraft => {
+                        fetchAndDisplayTrail(aircraft.hex);
+                    });
+                }
+            }, 5000); // Refresh every 5 seconds
+        }
+    }
+}
 
 // Fetch statistics from backend
 async function fetchStatistics() {
@@ -857,6 +1034,14 @@ function setupControls() {
     if (toggleAirportsButton) {
         toggleAirportsButton.addEventListener('click', () => {
             toggleAirports();
+        });
+    }
+
+    // Trails toggle control
+    const toggleTrailsButton = document.getElementById('toggle-trails');
+    if (toggleTrailsButton) {
+        toggleTrailsButton.addEventListener('click', () => {
+            toggleAllTrails();
         });
     }
 }

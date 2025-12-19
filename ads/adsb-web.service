@@ -5,18 +5,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-Group=pi
-WorkingDirectory=/home/pi/adsb-web
+User=jdoe
+Group=jdoe
+WorkingDirectory=/home/jdoe/adsb-receiver/group_19_project/ads
 
 # Load environment variables from .env file (for DATABASE_URL)
-EnvironmentFile=/home/pi/adsb-web/.env
+EnvironmentFile=/home/jdoe/adsb-receiver/group_19_project/ads/.env
 
 # Set Node environment to production
 Environment="NODE_ENV=production"
 
 # Run the Node.js server
-ExecStart=/usr/bin/node /home/pi/adsb-web/server.js
+ExecStart=/usr/bin/node /home/jdoe/adsb-receiver/group_19_project/ads/server.js
 
 # Restart on failure
 Restart=always

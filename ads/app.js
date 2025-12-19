@@ -15,6 +15,7 @@ let showAirports = false;
 // Trail settings
 const aircraftTrails = new Map(); // Store trail polylines: hex -> polyline
 const trailData = new Map(); // Store trail position data: hex -> positions array
+const failedTrailFetches = new Set(); // Track aircraft with no trail data to avoid repeated requests
 let trailRefreshInterval = null;
 let showAllTrails = false; // Global toggle for all trails
 
@@ -501,17 +502,23 @@ window.toggleAircraftTrail = async function(hex) {
  * @param {string} hex - Aircraft ICAO hex code
  */
 async function fetchAndDisplayTrail(hex) {
+    // Skip if we already know this aircraft has no trail data
+    if (failedTrailFetches.has(hex)) {
+        return;
+    }
+
     try {
         const response = await fetch(`/api/aircraft/${hex}/trail?minutes=120&limit=500`);
         if (!response.ok) {
-            console.error(`Failed to fetch trail for ${hex}`);
+            failedTrailFetches.add(hex);
             return;
         }
 
         const data = await response.json();
 
         if (!data.trail || data.trail.length === 0) {
-            console.log(`No trail data for ${hex}`);
+            // Mark as failed to avoid repeated requests
+            failedTrailFetches.add(hex);
             return;
         }
 
@@ -563,6 +570,7 @@ function clearAllTrails() {
     });
     aircraftTrails.clear();
     trailData.clear();
+    failedTrailFetches.clear(); // Reset failed fetches cache
 
     if (trailRefreshInterval) {
         clearInterval(trailRefreshInterval);

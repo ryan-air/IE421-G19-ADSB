@@ -1119,13 +1119,76 @@ function toggleAirports() {
     document.getElementById('toggle-airports').classList.toggle('active', showAirports);
 }
 
-// Toggle trails
-function toggleTrails() {
+// Toggle trails - now fetches historical data like 2D view
+async function toggleTrails() {
     showTrails = !showTrails;
+
     if (!showTrails) {
         clearTrails();
+    } else {
+        // Fetch historical trails for all current aircraft
+        const promises = currentAircraftData.map(aircraft =>
+            fetchAndDisplayHistoricalTrail(aircraft.hex)
+        );
+        await Promise.all(promises);
     }
+
     document.getElementById('toggle-trails').classList.toggle('active', showTrails);
+}
+
+/**
+ * Fetch and display historical trail for a specific aircraft in 3D
+ * @param {string} hex - Aircraft ICAO hex code
+ */
+async function fetchAndDisplayHistoricalTrail(hex) {
+    try {
+        const response = await fetch(`/api/aircraft/${hex}/trail?minutes=120&limit=500`);
+        if (!response.ok) {
+            return;
+        }
+
+        const data = await response.json();
+
+        if (!data.trail || data.trail.length === 0) {
+            return;
+        }
+
+        // Convert trail to Cesium positions (ECEF coordinates with altitude in meters)
+        const positions = data.trail.map(point =>
+            Cesium.Cartesian3.fromDegrees(
+                point.lon,
+                point.lat,
+                point.altitude * 0.3048 // Convert feet to meters
+            )
+        );
+
+        // Remove existing trail if present
+        if (aircraftTrails.has(hex)) {
+            viewer.entities.remove(aircraftTrails.get(hex));
+        }
+
+        // Check if this is a helicopter
+        const aircraft = currentAircraftData.find(ac => ac.hex === hex);
+        const isHeli = aircraft && aircraft.type === 6;
+
+        // Create polyline for historical trail
+        const trail = viewer.entities.add({
+            polyline: {
+                positions: positions,
+                width: 3,
+                material: new Cesium.PolylineGlowMaterialProperty({
+                    glowPower: 0.3,
+                    color: isHeli ? Cesium.Color.YELLOW.withAlpha(0.7) : Cesium.Color.CYAN.withAlpha(0.7)
+                }),
+                clampToGround: false
+            }
+        });
+
+        aircraftTrails.set(hex, trail);
+
+    } catch (error) {
+        console.error(`Error fetching historical trail for ${hex}:`, error);
+    }
 }
 
 // Toggle terrain (now toggles imagery instead since we have no auth for terrain)

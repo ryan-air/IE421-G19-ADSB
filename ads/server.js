@@ -228,11 +228,11 @@ app.get('/api/aircraft/:hex/trail', async (req, res) => {
                 altitude,
                 speed,
                 track,
-                EXTRACT(EPOCH FROM recorded_at)::bigint as timestamp
-            FROM aircraft_history_real
+                EXTRACT(EPOCH FROM timestamp)::bigint as ts
+            FROM aircraft_position_history
             WHERE hex = $1
-            AND recorded_at >= NOW() - INTERVAL '${minutes} minutes'
-            ORDER BY recorded_at ASC
+            AND timestamp >= NOW() - INTERVAL '${minutes} minutes'
+            ORDER BY timestamp ASC
             LIMIT $2
         `, [hex.toUpperCase(), limit]);
 
@@ -244,7 +244,7 @@ app.get('/api/aircraft/:hex/trail', async (req, res) => {
                 altitude: row.altitude,
                 speed: row.speed,
                 track: row.track,
-                timestamp: parseInt(row.timestamp)
+                seen: parseInt(row.ts) // Use 'seen' to match frontend expectation
             })),
             count: result.rows.length
         });

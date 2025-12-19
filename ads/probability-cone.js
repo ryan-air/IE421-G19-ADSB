@@ -5,7 +5,7 @@
  * Uses Kalman filter to predict position with uncertainty that grows over time
  */
 
-import math from 'mathjs';
+import * as math from 'mathjs';
 import { KalmanFilter, latLonAltToECEF, ecefToLatLonAlt, distance3D } from './kalman-filter.js';
 
 /**
@@ -204,9 +204,10 @@ export class ProbabilityCone {
  * Check if two probability cones intersect
  * @param {ProbabilityCone} cone1
  * @param {ProbabilityCone} cone2
+ * @param {number} minVerticalSeparation - Minimum vertical separation in feet (default 1000)
  * @returns {Object|null} Collision info or null if no intersection
  */
-export function checkConeIntersection(cone1, cone2) {
+export function checkConeIntersection(cone1, cone2, minVerticalSeparation = 1000) {
     const predictions1 = cone1.predictions;
     const predictions2 = cone2.predictions;
 
@@ -214,6 +215,19 @@ export function checkConeIntersection(cone1, cone2) {
     for (let i = 0; i < Math.min(predictions1.length, predictions2.length); i++) {
         const p1 = predictions1[i];
         const p2 = predictions2[i];
+
+        // Check vertical separation first (altitude filtering)
+        const altitudeDiff = Math.abs(p1.latLonAlt.alt - p2.latLonAlt.alt);
+
+        // Calculate vertical separation requirement based on altitude
+        // Above 29,000 ft: use 2000 ft separation, below: use 1000 ft
+        const maxAlt = Math.max(p1.latLonAlt.alt, p2.latLonAlt.alt);
+        const requiredVerticalSep = maxAlt > 29000 ? 2000 : minVerticalSeparation;
+
+        // If aircraft are vertically separated beyond the threshold, skip this pair
+        if (altitudeDiff > requiredVerticalSep) {
+            continue; // Safely separated vertically, check next time step
+        }
 
         // Calculate distance between predicted positions
         const dist = distance3D(p1.position, p2.position);
@@ -237,6 +251,7 @@ export function checkConeIntersection(cone1, cone2) {
                 distance: dist, // meters
                 position1: p1.latLonAlt,
                 position2: p2.latLonAlt,
+                verticalSeparation: altitudeDiff, // feet
                 uncertainty1: radius1,
                 uncertainty2: radius2,
                 aircraft1: cone1.aircraft.hex,
@@ -302,6 +317,7 @@ export function formatCollision(collision) {
         timeToCollision: Math.round(collision.time),
         probability: (collision.probability * 100).toFixed(1) + '%',
         distance: Math.round(collision.distance),
+        verticalSeparation: Math.round(collision.verticalSeparation),
         position1: {
             lat: collision.position1.lat.toFixed(4),
             lon: collision.position1.lon.toFixed(4),

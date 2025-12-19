@@ -375,21 +375,22 @@ app.get('/api/collisions/kalman', async (req, res) => {
         // Get all active aircraft with current positions
         const aircraftResult = await db.query(`
             SELECT
-                hex,
-                flight,
-                lat,
-                lon,
-                altitude,
-                speed,
-                track,
-                vertical_rate,
-                last_seen
-            FROM aircraft_sessions_real
-            WHERE ended_at IS NULL
-              AND lat IS NOT NULL
-              AND lon IS NOT NULL
-              AND altitude IS NOT NULL
-              AND last_seen > NOW() - INTERVAL '2 minutes'
+                a.hex,
+                a.flight,
+                a.lat,
+                a.lon,
+                a.altitude,
+                a.speed,
+                a.track,
+                a.vertical_rate,
+                s.last_seen
+            FROM aircraft_real a
+            INNER JOIN aircraft_sessions_real s ON a.hex = s.hex
+            WHERE s.ended_at IS NULL
+              AND a.lat IS NOT NULL
+              AND a.lon IS NOT NULL
+              AND a.altitude IS NOT NULL
+              AND s.last_seen > NOW() - INTERVAL '2 minutes'
         `);
 
         const aircraft = aircraftResult.rows;
@@ -430,8 +431,33 @@ app.get('/api/collisions/kalman', async (req, res) => {
         // Detect collisions using Kalman filter probability cones
         const collisions = detectCollisions(validAircraft, timeHorizon, confidence);
 
-        // Format collisions for response
-        const formattedCollisions = collisions.map(formatCollision);
+        // Format collisions for response and add current aircraft positions
+        const formattedCollisions = collisions.map(collision => {
+            const formatted = formatCollision(collision);
+
+            // Find current positions of both aircraft
+            const ac1 = validAircraft.find(ac => ac.hex === collision.aircraft1);
+            const ac2 = validAircraft.find(ac => ac.hex === collision.aircraft2);
+
+            // Add current positions
+            formatted.currentPosition1 = ac1 ? {
+                lat: parseFloat(ac1.lat).toFixed(4),
+                lon: parseFloat(ac1.lon).toFixed(4),
+                alt: Math.round(ac1.altitude)
+            } : null;
+
+            formatted.currentPosition2 = ac2 ? {
+                lat: parseFloat(ac2.lat).toFixed(4),
+                lon: parseFloat(ac2.lon).toFixed(4),
+                alt: Math.round(ac2.altitude)
+            } : null;
+
+            // Add flight callsigns for easier identification
+            formatted.flight1 = ac1?.flight || null;
+            formatted.flight2 = ac2?.flight || null;
+
+            return formatted;
+        });
 
         res.json({
             collisions: formattedCollisions,

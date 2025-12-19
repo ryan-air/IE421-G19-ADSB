@@ -22,7 +22,7 @@ function initializeMap() {
     map = L.map('map', {
         zoomControl: true,
         attributionControl: true
-    }).setView([40.11, -88.24], 10); // Default: Champaign, IL
+    }).setView([41.88, -87.63], 9); // Default: Chicago, IL (receiver location)
 
     // Add dark CartoDB tiles for ATC/radar look
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {

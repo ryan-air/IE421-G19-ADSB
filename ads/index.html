@@ -66,7 +66,34 @@
         </div>
     </div>
 
+    <!-- Mobile menu toggle -->
+    <button class="mobile-menu-toggle" id="mobile-menu-toggle" onclick="toggleMobileMenu()">☰</button>
+
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="app.js"></script>
+    <script>
+        // Mobile menu toggle
+        function toggleMobileMenu() {
+            const sidebar = document.querySelector('.controls-overlay');
+            const toggle = document.getElementById('mobile-menu-toggle');
+            sidebar.classList.toggle('mobile-open');
+            toggle.classList.toggle('active');
+            toggle.textContent = sidebar.classList.contains('mobile-open') ? '✕' : '☰';
+        }
+
+        // Close mobile menu when clicking outside
+        document.addEventListener('click', (e) => {
+            const sidebar = document.querySelector('.controls-overlay');
+            const toggle = document.getElementById('mobile-menu-toggle');
+            if (window.innerWidth <= 768 && 
+                sidebar.classList.contains('mobile-open') && 
+                !sidebar.contains(e.target) && 
+                !toggle.contains(e.target)) {
+                sidebar.classList.remove('mobile-open');
+                toggle.classList.remove('active');
+                toggle.textContent = '☰';
+            }
+        });
+    </script>
 </body>
 </html>

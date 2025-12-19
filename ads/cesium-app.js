@@ -35,19 +35,41 @@ viewer.scene.globe.depthTestAgainstTerrain = true;
     }
 })();
 
-// Optimized camera controls for Mac trackpad
+// Camera controller setup
 const controller = viewer.scene.screenSpaceCameraController;
 
-// Zoom: Two-finger scroll on trackpad
+// Detect if mobile device
+const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || 
+                 (window.matchMedia && window.matchMedia('(max-width: 768px)').matches);
+
+if (isMobile) {
+    // Mobile-optimized touch controls
+    // One finger drag = rotate/orbit
+    controller.rotateEventTypes = Cesium.CameraEventType.LEFT_DRAG;
+    
+    // Two finger pinch = zoom
+    controller.zoomEventTypes = Cesium.CameraEventType.PINCH;
+    
+    // Two finger drag = tilt
+    controller.tiltEventTypes = Cesium.CameraEventType.PINCH_MOVE;
+    
+    // Slower zoom for better control on mobile
+    controller.zoomFactor = 5.0;
+    
+    // Higher inertia for smoother feel on touch
+    controller.inertiaSpin = 0.95;
+    controller.inertiaTranslate = 0.95;
+    controller.inertiaZoom = 0.95;
+    
+    // Show mobile tip banner
+    showMobileTip();
+} else {
+    // Desktop/trackpad controls
 controller.zoomEventTypes = [
     Cesium.CameraEventType.WHEEL,
     Cesium.CameraEventType.PINCH
 ];
-
-// Rotate: One-finger drag (left click + drag)
 controller.rotateEventTypes = Cesium.CameraEventType.LEFT_DRAG;
-
-// Tilt: Two-finger drag (right click + drag) or Shift + drag
 controller.tiltEventTypes = [
     Cesium.CameraEventType.RIGHT_DRAG,
     Cesium.CameraEventType.MIDDLE_DRAG,
@@ -56,40 +78,187 @@ controller.tiltEventTypes = [
         modifier: Cesium.KeyboardEventModifier.SHIFT
     }
 ];
-
-// Look: Ctrl/Cmd + Left drag
 controller.lookEventTypes = {
     eventType: Cesium.CameraEventType.LEFT_DRAG,
     modifier: Cesium.KeyboardEventModifier.CTRL
 };
-
-// Pan: Cmd/Ctrl + Shift + drag (useful for fine adjustments)
 controller.translateEventTypes = {
     eventType: Cesium.CameraEventType.LEFT_DRAG,
     modifier: Cesium.KeyboardEventModifier.SHIFT | Cesium.KeyboardEventModifier.CTRL
 };
-
-// Fine-tune sensitivity for Mac trackpad
-controller.zoomFactor = 3.0; // Slower zoom for better control
-controller.rotateEventTypes = Cesium.CameraEventType.LEFT_DRAG;
-controller.minimumZoomDistance = 100; // Allow closer zoom to see buildings
-controller.maximumZoomDistance = 40000000;
-
-// Smooth inertia for natural feel
+    controller.zoomFactor = 3.0;
 controller.inertiaSpin = 0.9;
 controller.inertiaTranslate = 0.9;
 controller.inertiaZoom = 0.9;
+}
 
-// Prevent camera from going below ground
+// Common settings
+controller.minimumZoomDistance = 100;
+controller.maximumZoomDistance = 40000000;
 controller.enableCollisionDetection = true;
+
+// Mobile tip banner function
+function showMobileTip() {
+    const banner = document.createElement('div');
+    banner.id = 'mobile-tip-banner';
+    banner.innerHTML = `
+        <div class="mobile-tip-content">
+            <span>📱 Use the controls on the right to tilt and rotate</span>
+            <a href="index.html" class="mobile-tip-link">Switch to 2D</a>
+            <button class="mobile-tip-close" onclick="this.parentElement.parentElement.remove()">✕</button>
+        </div>
+    `;
+    document.body.appendChild(banner);
+    
+    // Auto-dismiss after 8 seconds
+    setTimeout(() => {
+        if (banner.parentElement) {
+            banner.style.opacity = '0';
+            setTimeout(() => banner.remove(), 300);
+        }
+    }, 8000);
+}
+
+// Mobile camera control functions
+function setupMobileControls() {
+    const tiltUp = document.getElementById('tilt-up');
+    const tiltDown = document.getElementById('tilt-down');
+    const rotateLeft = document.getElementById('rotate-left');
+    const rotateRight = document.getElementById('rotate-right');
+    const viewTop = document.getElementById('view-top');
+    const viewAngle = document.getElementById('view-angle');
+    const viewHorizon = document.getElementById('view-horizon');
+    
+    if (!tiltUp) return; // Controls not in DOM
+    
+    const TILT_STEP = 10; // degrees
+    const ROTATE_STEP = 15; // degrees
+    
+    // Helper to adjust camera pitch (tilt)
+    function adjustPitch(deltaDegrees) {
+        const camera = viewer.camera;
+        const currentPitch = Cesium.Math.toDegrees(camera.pitch);
+        let newPitch = currentPitch + deltaDegrees;
+        // Clamp pitch between -90 (straight down) and 0 (horizon)
+        newPitch = Math.max(-90, Math.min(0, newPitch));
+        
+        camera.setView({
+            destination: camera.position,
+            orientation: {
+                heading: camera.heading,
+                pitch: Cesium.Math.toRadians(newPitch),
+                roll: camera.roll
+            }
+        });
+    }
+    
+    // Helper to adjust camera heading (rotate)
+    function adjustHeading(deltaDegrees) {
+        const camera = viewer.camera;
+        const newHeading = camera.heading + Cesium.Math.toRadians(deltaDegrees);
+        
+        camera.setView({
+            destination: camera.position,
+            orientation: {
+                heading: newHeading,
+                pitch: camera.pitch,
+                roll: camera.roll
+            }
+        });
+    }
+    
+    // Helper to set preset view
+    function setPresetView(pitchDegrees) {
+        const camera = viewer.camera;
+        camera.setView({
+            destination: camera.position,
+            orientation: {
+                heading: camera.heading,
+                pitch: Cesium.Math.toRadians(pitchDegrees),
+                roll: 0
+            }
+        });
+    }
+    
+    // Tilt controls
+    tiltUp.addEventListener('click', () => adjustPitch(TILT_STEP));
+    tiltDown.addEventListener('click', () => adjustPitch(-TILT_STEP));
+    
+    // For continuous press on tilt
+    let tiltInterval = null;
+    
+    function startContinuousTilt(direction) {
+        if (tiltInterval) return;
+        adjustPitch(direction * TILT_STEP);
+        tiltInterval = setInterval(() => adjustPitch(direction * TILT_STEP * 0.5), 100);
+    }
+    
+    function stopContinuousTilt() {
+        if (tiltInterval) {
+            clearInterval(tiltInterval);
+            tiltInterval = null;
+        }
+    }
+    
+    // Long press for continuous tilt
+    tiltUp.addEventListener('touchstart', (e) => { e.preventDefault(); startContinuousTilt(1); });
+    tiltUp.addEventListener('touchend', stopContinuousTilt);
+    tiltUp.addEventListener('touchcancel', stopContinuousTilt);
+    
+    tiltDown.addEventListener('touchstart', (e) => { e.preventDefault(); startContinuousTilt(-1); });
+    tiltDown.addEventListener('touchend', stopContinuousTilt);
+    tiltDown.addEventListener('touchcancel', stopContinuousTilt);
+    
+    // Rotate controls
+    rotateLeft.addEventListener('click', () => adjustHeading(-ROTATE_STEP));
+    rotateRight.addEventListener('click', () => adjustHeading(ROTATE_STEP));
+    
+    // Continuous rotate on long press
+    let rotateInterval = null;
+    
+    function startContinuousRotate(direction) {
+        if (rotateInterval) return;
+        adjustHeading(direction * ROTATE_STEP);
+        rotateInterval = setInterval(() => adjustHeading(direction * ROTATE_STEP * 0.5), 100);
+    }
+    
+    function stopContinuousRotate() {
+        if (rotateInterval) {
+            clearInterval(rotateInterval);
+            rotateInterval = null;
+        }
+    }
+    
+    rotateLeft.addEventListener('touchstart', (e) => { e.preventDefault(); startContinuousRotate(-1); });
+    rotateLeft.addEventListener('touchend', stopContinuousRotate);
+    rotateLeft.addEventListener('touchcancel', stopContinuousRotate);
+    
+    rotateRight.addEventListener('touchstart', (e) => { e.preventDefault(); startContinuousRotate(1); });
+    rotateRight.addEventListener('touchend', stopContinuousRotate);
+    rotateRight.addEventListener('touchcancel', stopContinuousRotate);
+    
+    // Preset view buttons
+    viewTop.addEventListener('click', () => setPresetView(-90)); // Straight down
+    viewAngle.addEventListener('click', () => setPresetView(-45)); // 45 degree angle
+    viewHorizon.addEventListener('click', () => setPresetView(-15)); // Near horizon
+    
+    console.log('Mobile controls initialized');
+}
+
+// Initialize mobile controls when DOM is ready
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupMobileControls);
+} else {
+    setupMobileControls();
+}
 
 // Initial camera configuration
 const INITIAL_CAMERA_CONFIG = {
     longitude: -87.6298,  // Chicago longitude
-    latitude: 41.8781,    // Chicago latitude
-    altitude: 500000,     // 500km above ground
+    latitude: 36.0,       // Further south to see Chicago area with tilt
+    altitude: 550000,     // 550km above ground
     heading: 0,           // Degrees (0 = North)
-    pitch: -100,           // Degrees (negative = looking down)
+    pitch: -45,           // Degrees (-45 = nice tilted view, -90 = straight down)
     roll: 0               // Degrees
 };
 
@@ -293,14 +462,21 @@ function updateAircraftOn3DGlobe(aircraftData) {
 
         seenAircraftIds.add(aircraft.hex);
 
+        let entity;
         if (aircraftEntities.has(aircraft.hex)) {
             // Update existing aircraft
-            const entity = aircraftEntities.get(aircraft.hex);
+            entity = aircraftEntities.get(aircraft.hex);
             updateAircraftEntity(entity, aircraft);
         } else {
             // Create new aircraft
-            const entity = createAircraftEntity(aircraft);
+            entity = createAircraftEntity(aircraft);
             aircraftEntities.set(aircraft.hex, entity);
+        }
+        
+        // Apply grounded filter
+        if (hideGroundedPlanes) {
+            const altitude = aircraft.altitude || 0;
+            entity.show = altitude >= 100; // Hide if below 100 feet
         }
     });
 
@@ -359,6 +535,7 @@ function updateAircraftOn3DGlobe(aircraftData) {
 let collisionLines = [];
 let probabilityCones = [];
 let showProbabilityCones = false;
+let hideGroundedPlanes = false;
 let collisionInterval;
 
 // Fetch and display collisions with probability cones
@@ -703,7 +880,29 @@ function toggleProbabilityCones() {
 
     const button = document.getElementById('toggle-probability-cones');
     if (button) {
-        button.textContent = showProbabilityCones ? '🔵 Hide Prediction Cones' : '⚪ Show Prediction Cones';
+        button.textContent = showProbabilityCones ? '🔵 Prediction Cones' : '⚪ Prediction Cones';
+    }
+}
+
+// Toggle hide grounded planes
+function toggleHideGroundedPlanes() {
+    hideGroundedPlanes = !hideGroundedPlanes;
+    
+    // Update visibility of existing aircraft
+    aircraftEntities.forEach((entity, hex) => {
+        const altitude = entity.properties.altitude?.valueOf() || 0;
+        const isGrounded = altitude < 100; // Less than 100 feet = grounded
+        
+        if (hideGroundedPlanes && isGrounded) {
+            entity.show = false;
+        } else {
+            entity.show = true;
+        }
+    });
+    
+    const button = document.getElementById('toggle-grounded');
+    if (button) {
+        button.textContent = hideGroundedPlanes ? '🔵 Grounded Hidden' : '⚪ Hide Grounded';
     }
 }
 
@@ -754,23 +953,25 @@ async function loadAirports() {
                 billboard: {
                     image: createAirportIcon(isLarge),
                     width: isLarge ? 24 : 16,
-                    height: isLarge ? 24 : 16,
+                    height: isLarge ? 16 : 12,
                     verticalOrigin: Cesium.VerticalOrigin.CENTER,
                     horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
-                    disableDepthTestDistance: Number.POSITIVE_INFINITY, // Always visible
+                    // Only disable depth test when close - allows Earth to occlude distant airports
+                    disableDepthTestDistance: isLarge ? 500000 : 200000,
                     heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND
                 },
                 label: {
-                    text: props.iata || props.icao || props.name?.substring(0, 10) || '',
-                    font: isLarge ? 'bold 12px Courier New' : '10px Courier New',
+                    text: props.iata || props.icao || '',
+                    font: isLarge ? 'bold 11px Courier New' : '9px Courier New',
                     fillColor: color,
                     outlineColor: Cesium.Color.BLACK,
                     outlineWidth: 2,
                     style: Cesium.LabelStyle.FILL_AND_OUTLINE,
                     verticalOrigin: Cesium.VerticalOrigin.TOP,
-                    pixelOffset: new Cesium.Cartesian2(0, 14),
-                    disableDepthTestDistance: Number.POSITIVE_INFINITY, // Always visible
-                    show: true // Always show labels
+                    pixelOffset: new Cesium.Cartesian2(0, 12),
+                    // Only disable depth test when close
+                    disableDepthTestDistance: isLarge ? 500000 : 200000,
+                    show: true
                 },
                 show: false // Hidden by default until toggled
             });
@@ -889,32 +1090,32 @@ viewer.selectedEntityChanged.addEventListener((selectedEntity) => {
             selectedAircraft = null;
         } else {
             // Show aircraft info
-            const hex = selectedEntity.properties.hex?.valueOf() || selectedEntity.id;
-            const flight = selectedEntity.properties.flight?.valueOf();
-            const altitude = selectedEntity.properties.altitude?.valueOf();
-            const speed = selectedEntity.properties.speed?.valueOf();
-            const track = selectedEntity.properties.track?.valueOf();
+        const hex = selectedEntity.properties.hex?.valueOf() || selectedEntity.id;
+        const flight = selectedEntity.properties.flight?.valueOf();
+        const altitude = selectedEntity.properties.altitude?.valueOf();
+        const speed = selectedEntity.properties.speed?.valueOf();
+        const track = selectedEntity.properties.track?.valueOf();
 
-            // Store the selected aircraft hex code
-            selectedAircraft = hex;
-            console.log(`Selected aircraft: ${flight || hex} (hex: ${hex})`);
+        // Store the selected aircraft hex code
+        selectedAircraft = hex;
+        console.log(`Selected aircraft: ${flight || hex} (hex: ${hex})`);
 
-            const isFollowing = followMode && followedAircraft === hex;
+        const isFollowing = followMode && followedAircraft === hex;
 
             infoTitle.textContent = 'Aircraft Information';
             infoTitle.style.color = '#7a9a7a';
             infoPanel.classList.remove('collision-info');
             infoPanel.style.borderColor = '#7a9a7a';
 
-            infoContent.innerHTML = `
-                <strong>Flight:</strong> ${flight || 'N/A'}<br>
-                <strong>ICAO:</strong> ${hex}<br>
-                <strong>Altitude:</strong> ${altitude || 'N/A'} ft<br>
-                <strong>Speed:</strong> ${speed || 'N/A'} kt<br>
-                <strong>Heading:</strong> ${track || 'N/A'}°
+        infoContent.innerHTML = `
+            <strong>Flight:</strong> ${flight || 'N/A'}<br>
+            <strong>ICAO:</strong> ${hex}<br>
+            <strong>Altitude:</strong> ${altitude || 'N/A'} ft<br>
+            <strong>Speed:</strong> ${speed || 'N/A'} kt<br>
+            <strong>Heading:</strong> ${track || 'N/A'}°
                 ${isFollowing ? '<br><em style="color: #9aba9a;">Following this aircraft</em>' : '<br><em style="color: #8aaa8a;">Click "Follow" to track</em>'}
-            `;
-            infoPanel.style.display = 'block';
+        `;
+        infoPanel.style.display = 'block';
         }
     } else {
         selectedAircraft = null;

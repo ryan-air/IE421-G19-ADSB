@@ -269,6 +269,349 @@
             background: rgba(122, 154, 122, 0.4);
             border-color: #8aaa8a;
         }
+
+        /* Mobile responsive styles */
+        @media (max-width: 768px) {
+            .top-header {
+                padding: 8px 12px;
+                flex-wrap: wrap;
+                gap: 6px;
+            }
+
+            .top-header h1 {
+                font-size: 14px;
+                letter-spacing: 1px;
+                width: 100%;
+                text-align: center;
+            }
+
+            .header-controls {
+                width: 100%;
+                justify-content: center;
+                gap: 10px;
+                flex-wrap: wrap;
+            }
+
+            .stat-inline {
+                gap: 4px;
+            }
+
+            .stat-label {
+                font-size: 10px;
+            }
+
+            .stat-value {
+                font-size: 12px;
+            }
+
+            .nav-link {
+                top: auto;
+                bottom: 20px;
+                left: 10px;
+            }
+
+            .nav-link {
+                display: none;
+            }
+
+            /* Controls panel as horizontal toolbar at top */
+            .controls-overlay {
+                top: 65px;
+                bottom: auto;
+                left: 10px;
+                right: 10px;
+                min-width: unset;
+                max-height: none;
+                padding: 10px 12px;
+                border-radius: 10px;
+            }
+
+            .controls-header {
+                display: none;
+            }
+
+            .controls-content {
+                display: flex;
+                flex-direction: row;
+                flex-wrap: wrap;
+                gap: 8px;
+                justify-content: center;
+                align-items: center;
+            }
+
+            .view-modes {
+                display: flex;
+                gap: 4px;
+                margin-bottom: 0;
+            }
+
+            .view-mode-btn {
+                font-size: 10px;
+                padding: 8px 12px;
+                border-radius: 6px;
+            }
+
+            .control-button {
+                padding: 8px 12px;
+                font-size: 10px;
+                margin: 0;
+                width: auto;
+                border-radius: 6px;
+            }
+
+            .info-panel {
+                bottom: 10px;
+                left: 10px;
+                max-width: 200px;
+                max-height: 150px;
+                padding: 10px;
+            }
+
+            .info-panel h3 {
+                font-size: 11px;
+            }
+
+            .info-panel .info-content {
+                font-size: 10px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .top-header h1 {
+                font-size: 11px;
+            }
+
+            .stat-label {
+                font-size: 8px;
+            }
+
+            .stat-value {
+                font-size: 10px;
+            }
+
+            .header-controls {
+                gap: 4px;
+            }
+
+            .controls-overlay {
+                top: 58px;
+                padding: 8px 10px;
+            }
+
+            .controls-content {
+                gap: 5px;
+            }
+
+            .view-mode-btn {
+                font-size: 9px;
+                padding: 6px 10px;
+            }
+
+            .control-button {
+                padding: 6px 10px;
+                font-size: 9px;
+            }
+
+            .info-panel {
+                max-width: 160px;
+                max-height: 120px;
+                padding: 8px;
+            }
+        }
+
+        /* Mobile tip banner */
+        #mobile-tip-banner {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 9999;
+            transition: opacity 0.3s ease;
+        }
+
+        .mobile-tip-content {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: rgba(26, 36, 26, 0.95);
+            border: 2px solid #ff9900;
+            border-radius: 12px;
+            padding: 12px 16px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            color: #ddd;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+
+        .mobile-tip-link {
+            color: #00ffff;
+            text-decoration: none;
+            background: rgba(0, 255, 255, 0.15);
+            padding: 6px 12px;
+            border-radius: 6px;
+            border: 1px solid #00ffff;
+            white-space: nowrap;
+            transition: all 0.2s;
+        }
+
+        .mobile-tip-link:hover, .mobile-tip-link:active {
+            background: rgba(0, 255, 255, 0.3);
+        }
+
+        .mobile-tip-close {
+            background: none;
+            border: none;
+            color: #999;
+            font-size: 16px;
+            cursor: pointer;
+            padding: 4px;
+            line-height: 1;
+        }
+
+        .mobile-tip-close:hover {
+            color: #fff;
+        }
+
+        @media (max-width: 480px) {
+            #mobile-tip-banner {
+                bottom: 80px;
+                left: 10px;
+                right: 10px;
+                transform: none;
+            }
+
+            .mobile-tip-content {
+                flex-direction: column;
+                gap: 8px;
+                text-align: center;
+                font-size: 11px;
+            }
+
+            .mobile-tip-close {
+                position: absolute;
+                top: 4px;
+                right: 8px;
+            }
+        }
+
+        /* Mobile touch controls - hidden by default, shown on mobile */
+        .mobile-controls {
+            display: none;
+            position: fixed;
+            bottom: 20px;
+            right: 10px;
+            z-index: 1000;
+            flex-direction: column;
+            gap: 10px;
+            background: rgba(20, 30, 20, 0.95);
+            border: 2px solid #5a7a5a;
+            border-radius: 12px;
+            padding: 12px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+        }
+
+        .mobile-controls-section {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .mobile-section-label {
+            font-family: 'Courier New', monospace;
+            font-size: 9px;
+            color: #7a9a7a;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .mobile-btn-group {
+            display: flex;
+            gap: 4px;
+        }
+
+        .mobile-btn-group.vertical {
+            flex-direction: column;
+        }
+
+        .mobile-btn-group.horizontal {
+            flex-direction: row;
+        }
+
+        .mobile-ctrl-btn {
+            width: 44px;
+            height: 44px;
+            background: rgba(122, 154, 122, 0.3);
+            border: 2px solid #5a7a5a;
+            border-radius: 8px;
+            color: #9aba9a;
+            font-size: 18px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+            transition: all 0.15s;
+        }
+
+        .mobile-ctrl-btn:active {
+            background: rgba(122, 154, 122, 0.6);
+            border-color: #8aaa8a;
+            transform: scale(0.95);
+        }
+
+        .mobile-view-btn {
+            width: 36px;
+            height: 36px;
+            background: rgba(0, 200, 200, 0.2);
+            border: 2px solid #00aaaa;
+            border-radius: 6px;
+            color: #00ffff;
+            font-size: 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+            transition: all 0.15s;
+        }
+
+        .mobile-view-btn:active {
+            background: rgba(0, 200, 200, 0.5);
+            transform: scale(0.95);
+        }
+
+        /* Show mobile controls on touch devices */
+        @media (max-width: 768px), (pointer: coarse) {
+            .mobile-controls {
+                display: flex;
+                bottom: 20px;
+                right: 10px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .mobile-controls {
+                bottom: 15px;
+                right: 8px;
+                padding: 10px;
+                gap: 8px;
+            }
+
+            .mobile-ctrl-btn {
+                width: 38px;
+                height: 38px;
+                font-size: 15px;
+            }
+
+            .mobile-view-btn {
+                width: 30px;
+                height: 30px;
+                font-size: 11px;
+            }
+        }
     </style>
 </head>
 <body>
@@ -313,7 +656,8 @@
             <button id="toggle-airports" class="control-button">Airports</button>
             <button id="toggle-trails" class="control-button">Trails</button>
             <button id="toggle-terrain" class="control-button">Terrain</button>
-            <button id="toggle-probability-cones" class="control-button" onclick="toggleProbabilityCones()">Prediction Cones</button>
+            <button id="toggle-probability-cones" class="control-button" onclick="toggleProbabilityCones()">⚪ Prediction Cones</button>
+            <button id="toggle-grounded" class="control-button" onclick="toggleHideGroundedPlanes()">⚪ Hide Grounded</button>
             <button id="reset-view" class="control-button">Reset View</button>
         </div>
     </div>
@@ -329,6 +673,32 @@
         <div style="color: #7a9a7a; font-family: 'Courier New', monospace; font-size: 16px;">
             <strong>Follow Mode Active</strong><br>
             <span style="font-size: 12px; color: #8aaa8a;">Click on any aircraft to follow it</span>
+        </div>
+    </div>
+
+    <!-- Mobile touch controls -->
+    <div id="mobile-controls" class="mobile-controls">
+        <div class="mobile-controls-section">
+            <span class="mobile-section-label">Tilt</span>
+            <div class="mobile-btn-group vertical">
+                <button class="mobile-ctrl-btn" id="tilt-up" title="Tilt Up">▲</button>
+                <button class="mobile-ctrl-btn" id="tilt-down" title="Tilt Down">▼</button>
+            </div>
+        </div>
+        <div class="mobile-controls-section">
+            <span class="mobile-section-label">Rotate</span>
+            <div class="mobile-btn-group horizontal">
+                <button class="mobile-ctrl-btn" id="rotate-left" title="Rotate Left">◀</button>
+                <button class="mobile-ctrl-btn" id="rotate-right" title="Rotate Right">▶</button>
+            </div>
+        </div>
+        <div class="mobile-controls-section">
+            <span class="mobile-section-label">Views</span>
+            <div class="mobile-btn-group horizontal">
+                <button class="mobile-view-btn" id="view-top" title="Top Down">⬇</button>
+                <button class="mobile-view-btn" id="view-angle" title="Angled">◢</button>
+                <button class="mobile-view-btn" id="view-horizon" title="Horizon">━</button>
+            </div>
         </div>
     </div>
 

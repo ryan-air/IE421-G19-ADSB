@@ -51,9 +51,9 @@ const db = new Pool({
     ssl: {
         rejectUnauthorized: false  // Supabase requires SSL
     },
-    // Connection pool settings optimized for Supabase
-    max: 10, // Maximum number of clients in the pool
-    idleTimeoutMillis: 20000, // Close idle clients after 20 seconds (Supabase pooler timeout is ~60s)
+    // Connection pool settings optimized for Supabase Session Pooler
+    max: 3, // Keep low - Supabase Session Pooler has strict limits (~15-20 connections)
+    idleTimeoutMillis: 10000, // Close idle clients quickly to free up pooler connections
     connectionTimeoutMillis: 10000, // Return an error after 10 seconds if connection could not be established
     allowExitOnIdle: false, // Keep pool alive even when all clients are idle
 });
@@ -247,80 +247,94 @@ app.get('/api/statistics', async (req, res) => {
 
         // Build WHERE clause based on time window
         const timeFilter = timeWindow > 0
-            ? `WHERE seen_at >= NOW() - INTERVAL '${timeWindow} seconds'`
-            : 'WHERE 1=1'; // No time filter for window=0
-
-        // Get overall statistics
-        const statsResult = await db.query(`
-            SELECT
-                COUNT(DISTINCT hex) as total_flights,
-                ROUND(AVG(speed)::numeric, 1) as avg_speed,
-                ROUND(AVG(altitude)::numeric, 0) as avg_altitude,
-                MIN(altitude) as min_altitude,
-                MAX(altitude) as max_altitude,
-                MIN(speed) as min_speed,
-                MAX(speed) as max_speed
-            FROM aircraft_real
-            ${timeFilter}
-            AND lat IS NOT NULL
-            AND lon IS NOT NULL
-        `);
-
-        // Get altitude distribution (buckets: 0-10k, 10-20k, 20-30k, 30-40k, 40k+)
-        const altitudeDistResult = await db.query(`
-            SELECT
-                CASE
-                    WHEN altitude < 10000 THEN '0-10k'
-                    WHEN altitude < 20000 THEN '10-20k'
-                    WHEN altitude < 30000 THEN '20-30k'
-                    WHEN altitude < 40000 THEN '30-40k'
-                    ELSE '40k+'
-                END as altitude_range,
-                COUNT(DISTINCT hex) as count
-            FROM aircraft_real
-            ${timeFilter}
-            AND altitude IS NOT NULL
-            GROUP BY altitude_range
-            ORDER BY MIN(altitude)
-        `);
-
-        // Build time filter for sessions (same logic)
+            ? `seen_at >= NOW() - INTERVAL '${timeWindow} seconds'`
+            : '1=1'; // No time filter for window=0
+        
         const sessionTimeFilter = timeWindow > 0
             ? `AND a.seen_at >= NOW() - INTERVAL '${timeWindow} seconds'`
             : ''; // No time filter for window=0
 
-        // Get flight durations for active aircraft
-        const durationsResult = await db.query(`
-            SELECT
-                s.hex,
-                s.flight,
-                EXTRACT(EPOCH FROM (s.last_seen - s.first_seen))::integer as duration_seconds,
-                EXTRACT(EPOCH FROM s.first_seen)::bigint as first_seen,
-                EXTRACT(EPOCH FROM s.last_seen)::bigint as last_seen
-            FROM aircraft_sessions_real s
-            INNER JOIN aircraft_real a ON s.hex = a.hex
-            WHERE s.ended_at IS NULL
-            ${sessionTimeFilter}
-            ORDER BY duration_seconds DESC
+        // Combined query using CTEs - single database round trip
+        const result = await db.query(`
+            WITH filtered_aircraft AS (
+                SELECT * FROM aircraft_real
+                WHERE ${timeFilter}
+                AND lat IS NOT NULL
+                AND lon IS NOT NULL
+            ),
+            stats AS (
+                SELECT
+                    COUNT(DISTINCT hex) as total_flights,
+                    ROUND(AVG(speed)::numeric, 1) as avg_speed,
+                    ROUND(AVG(altitude)::numeric, 0) as avg_altitude,
+                    MIN(altitude) as min_altitude,
+                    MAX(altitude) as max_altitude,
+                    MIN(speed) as min_speed,
+                    MAX(speed) as max_speed
+                FROM filtered_aircraft
+            ),
+            altitude_dist AS (
+                SELECT
+                    CASE
+                        WHEN altitude < 10000 THEN '0-10k'
+                        WHEN altitude < 20000 THEN '10-20k'
+                        WHEN altitude < 30000 THEN '20-30k'
+                        WHEN altitude < 40000 THEN '30-40k'
+                        ELSE '40k+'
+                    END as altitude_range,
+                    COUNT(DISTINCT hex) as count,
+                    MIN(altitude) as sort_order
+                FROM aircraft_real
+                WHERE ${timeFilter}
+                AND altitude IS NOT NULL
+                GROUP BY altitude_range
+            ),
+            durations AS (
+                SELECT
+                    s.hex,
+                    s.flight,
+                    EXTRACT(EPOCH FROM (s.last_seen - s.first_seen))::integer as duration_seconds,
+                    EXTRACT(EPOCH FROM s.first_seen)::bigint as first_seen,
+                    EXTRACT(EPOCH FROM s.last_seen)::bigint as last_seen
+                FROM aircraft_sessions_real s
+                INNER JOIN aircraft_real a ON s.hex = a.hex
+                WHERE s.ended_at IS NULL
+                ${sessionTimeFilter}
+                ORDER BY duration_seconds DESC
+            )
+            SELECT 
+                'stats' as query_type,
+                to_jsonb((SELECT row_to_json(stats) FROM stats)) as data
+            UNION ALL
+            SELECT 
+                'altitude_dist' as query_type,
+                to_jsonb((SELECT json_agg(row_to_json(altitude_dist) ORDER BY sort_order) FROM altitude_dist)) as data
+            UNION ALL
+            SELECT 
+                'durations' as query_type,
+                to_jsonb((SELECT json_agg(row_to_json(durations)) FROM durations)) as data
         `);
 
-        const stats = statsResult.rows[0];
+        // Parse combined results
+        const statsData = result.rows.find(r => r.query_type === 'stats')?.data || {};
+        const altitudeDistData = result.rows.find(r => r.query_type === 'altitude_dist')?.data || [];
+        const durationsData = result.rows.find(r => r.query_type === 'durations')?.data || [];
 
         res.json({
             summary: {
-                total_flights: parseInt(stats.total_flights) || 0,
-                avg_speed: parseFloat(stats.avg_speed) || 0,
-                avg_altitude: parseInt(stats.avg_altitude) || 0,
-                min_altitude: stats.min_altitude || 0,
-                max_altitude: stats.max_altitude || 0,
-                min_speed: stats.min_speed || 0,
-                max_speed: stats.max_speed || 0
+                total_flights: parseInt(statsData.total_flights) || 0,
+                avg_speed: parseFloat(statsData.avg_speed) || 0,
+                avg_altitude: parseInt(statsData.avg_altitude) || 0,
+                min_altitude: statsData.min_altitude || 0,
+                max_altitude: statsData.max_altitude || 0,
+                min_speed: statsData.min_speed || 0,
+                max_speed: statsData.max_speed || 0
             },
-            altitude_distribution: altitudeDistResult.rows.map(row => ({
+            altitude_distribution: (altitudeDistData || []).map(row => ({
                 range: row.altitude_range,
                 count: parseInt(row.count)
             })),
-            flight_durations: durationsResult.rows.map(row => ({
+            flight_durations: (durationsData || []).map(row => ({
                 hex: row.hex,
                 flight: row.flight,
                 duration_seconds: row.duration_seconds,
@@ -395,23 +409,35 @@ app.get('/api/collisions/kalman', async (req, res) => {
 
         const aircraft = aircraftResult.rows;
 
-        // Get position history for each aircraft (last 10 minutes)
-        const aircraftWithHistory = await Promise.all(
-            aircraft.map(async (ac) => {
-                const historyResult = await db.query(`
-                    SELECT lat, lon, altitude, speed, track, vertical_rate, timestamp
-                    FROM aircraft_position_history
-                    WHERE hex = $1
-                      AND timestamp > NOW() - INTERVAL '10 minutes'
-                    ORDER BY timestamp ASC
-                `, [ac.hex]);
+        // Get position history for ALL aircraft in a single query (much more efficient)
+        const hexCodes = aircraft.map(ac => ac.hex);
+        
+        let aircraftWithHistory = aircraft.map(ac => ({ ...ac, positionHistory: [] }));
+        
+        if (hexCodes.length > 0) {
+            const historyResult = await db.query(`
+                SELECT hex, lat, lon, altitude, speed, track, vertical_rate, timestamp
+                FROM aircraft_position_history
+                WHERE hex = ANY($1)
+                  AND timestamp > NOW() - INTERVAL '10 minutes'
+                ORDER BY hex, timestamp ASC
+            `, [hexCodes]);
 
-                return {
-                    ...ac,
-                    positionHistory: historyResult.rows
-                };
-            })
-        );
+            // Group history by aircraft hex
+            const historyByHex = new Map();
+            historyResult.rows.forEach(row => {
+                if (!historyByHex.has(row.hex)) {
+                    historyByHex.set(row.hex, []);
+                }
+                historyByHex.get(row.hex).push(row);
+            });
+
+            // Attach history to each aircraft
+            aircraftWithHistory = aircraft.map(ac => ({
+                ...ac,
+                positionHistory: historyByHex.get(ac.hex) || []
+            }));
+        }
 
         // Only use aircraft with sufficient history (at least 2 data points)
         const validAircraft = aircraftWithHistory.filter(

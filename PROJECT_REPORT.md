@@ -1316,75 +1316,7 @@ Implemented two-level caching and query batching:
 - Database connection usage: 5 concurrent → 1 concurrent
 - Eliminated connection pool exhaustion
 
-### Challenge 3: Database Connection Pooling Limits
-
-**Problem:**
-Supabase free tier uses Session Pooler mode with strict connection limits (~15-20 total connections). Our system has two connection sources:
-- ADS-B Streamer (Raspberry Pi): Needs persistent connection for bulk inserts
-- Web Server (Railway): Needs connection pool for API queries
-
-Initial configuration used 10 connections per service = 20 total, exceeding Supabase limits. This caused intermittent "too many connections" errors and service disruptions.
-
-**Root Cause:**
-Supabase Session Pooler shares connections across all clients using PgBouncer. Unlike Direct Connection mode (which provides dedicated connections), Session Pooler has hard limits enforced at infrastructure level.
-
-**Solution:**
-Conservative connection pool sizing:
-- **ADS-B Streamer**: 1-5 connections
-  - Rationale: Single-threaded Python service only needs 1 connection at a time
-  - Configured pool_size=3 for redundancy (retry on connection failure)
-- **Web Server**: Max 3 connections
-  - Rationale: Low-traffic application (< 10 concurrent users)
-  - Most requests served from cache (don't need database connection)
-  - Pool configured: `max: 3, idleTimeoutMillis: 20000`
-
-Total: 3 + 3 = 6 connections, well under 15-20 limit with headroom for spikes.
-
-**Alternative Considered:**
-Direct Connection mode (via IPv6) provides unlimited connections but:
-- Requires IPv6 networking (not available on all Raspberry Pi setups)
-- Higher latency (~50ms vs. ~10ms for Session Pooler)
-- Supabase recommends Session Pooler for most applications
-
-**Result:**
-- Eliminated connection errors
-- System runs reliably for days/weeks without restart
-- 40% pool utilization under normal load (2/6 connections active)
-
-### Challenge 4: Smooth Real-Time Visualization
-
-**Problem:**
-Initial 2D map implementation used Leaflet's default `setLatLng()` to update aircraft positions every 2 seconds. This caused:
-- Aircraft icons "jumping" instantly to new positions (jarring, unrealistic)
-- Heading changes snapping abruptly (especially at 0/360° wrap-around)
-- Difficulty tracking individual aircraft during rapid position updates
-
-**Root Cause:**
-Discrete position updates at 2-second intervals with instant rendering created stroboscopic effect rather than smooth motion.
-
-**Solution:**
-Implemented custom animation system:
-
-1. **Frame-Based Interpolation:**
-   - Use `requestAnimationFrame` for 60 FPS rendering
-   - Interpolate position between old and new coordinates over 2-second duration
-   - Cubic easing function (`easeOut`) for natural deceleration
-
-2. **Heading Wrap-Around Handling:**
-   - Special logic for 359° → 1° transitions (should rotate +2°, not -358°)
-   - Calculate shortest angular distance: `min(abs(new - old), 360 - abs(new - old))`
-
-3. **Synchronized Updates:**
-   - Store target position/heading with timestamp
-   - Animation completes just as next update arrives
-   - Seamless transitions without gaps or overlaps
-
-**Result:**
-- Smooth, realistic aircraft movement matching real-world flight
-- Users can easily follow individual aircraft trajectories
-- 60 FPS animation with <5% CPU usage (GPU-accelerated CSS transforms)
-
-### Challenge 5: ADS-B Data Integrity and Validation
+### Challenge 3: ADS-B Data Integrity and Validation
 
 **Problem:**
 ADS-B is an unencrypted, unauthenticated broadcast protocol. Received data can contain:
@@ -1429,7 +1361,7 @@ Multi-layer validation in Python streamer:
 - Cleaner database with only valid position data
 - Error rate < 0.1% (typically malformed messages from weak signals)
 
-### Challenge 6: 3D Visualization Performance
+### Challenge 4: 3D Visualization Performance
 
 **Problem:**
 Initial Cesium 3D globe implementation rendered all trails and probability cones for all aircraft simultaneously. With 50+ aircraft, this created:

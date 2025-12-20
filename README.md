@@ -83,7 +83,7 @@ A real-time aircraft tracking system that captures ADS-B (Automatic Dependent Su
 └─────────────────────┘
 ```
 
-## 🔧 Prerequisites
+## Prerequisites
 
 ### For Raspberry Pi (ADS-B Streamer)
 - Raspberry Pi 3/4/5 with Raspberry Pi OS
@@ -101,7 +101,7 @@ A real-time aircraft tracking system that captures ADS-B (Automatic Dependent Su
 - Railway.app account (or Render.com, Vercel, etc.)
 - Domain name (optional)
 
-## 🚀 Installation
+## Installation
 
 ### 1. Database Setup (Supabase)
 
@@ -288,7 +288,7 @@ sudo systemctl start adsb-web.service
 sudo systemctl status adsb-web.service
 ```
 
-## 🌐 Deployment
+## Deployment
 
 ### Deploy to Railway.app (Recommended)
 

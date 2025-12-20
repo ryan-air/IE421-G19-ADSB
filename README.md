@@ -42,7 +42,7 @@ A real-time aircraft tracking system that captures ADS-B (Automatic Dependent Su
   - Toggle trails and collision detection
   - Switch between 2d and 3d views
 
-## 🏗️ System Architecture
+## System Architecture
 
 ```
 ┌─────────────────┐

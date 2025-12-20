@@ -7,23 +7,8 @@ A real-time aircraft tracking system that captures ADS-B (Automatic Dependent Su
 ![Python](https://img.shields.io/badge/Python-3.9+-blue)
 ![PostgreSQL](https://img.shields.io/badge/Database-PostgreSQL-blue)
 
-## 📋 Table of Contents
 
-- [Features](#features)
-- [System Architecture](#system-architecture)
-- [Project Structure](#project-structure)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [Deployment](#deployment)
-- [Performance Optimization](#performance-optimization)
-- [API Documentation](#api-documentation)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License](#license)
-
-## ✨ Features
+## Features
 
 ### Real-Time Aircraft Tracking
 - **Live ADS-B Data Streaming**: Receives aircraft position data from dump1090 via SBS-1 BaseStation format
@@ -54,10 +39,8 @@ A real-time aircraft tracking system that captures ADS-B (Automatic Dependent Su
 - **Airport Overlays**: Shows nearby airports with runway information
 - **Search & Filter**: Find specific aircraft by callsign or hex code
 - **Control Panel**:
-  - Start/stop data generation
-  - Adjust aircraft count
   - Toggle trails and collision detection
-  - Time window selection
+  - Switch between 2d and 3d views
 
 ## 🏗️ System Architecture
 
@@ -98,40 +81,6 @@ A real-time aircraft tracking system that captures ADS-B (Automatic Dependent Su
 │                     │  • 3D Cesium globe
 │                     │  • Statistics dashboard
 └─────────────────────┘
-```
-
-## 📁 Project Structure
-
-```
-group_19_project/
-├── ads/                          # Web Application
-│   ├── server.js                 # Express backend API
-│   ├── app.js                    # Frontend JavaScript (2D map)
-│   ├── cesium-app.js             # Frontend JavaScript (3D globe)
-│   ├── index.html                # Main 2D map page
-│   ├── 3d.html                   # 3D globe view page
-│   ├── styles.css                # UI styles
-│   ├── airports.json             # Airport database
-│   ├── package.json              # Node.js dependencies
-│   ├── adsb-web.service          # Systemd service file
-│   └── nginx-adsb.conf           # Nginx reverse proxy config
-│
-├── ads-b-receiver/               # ADS-B Data Streamer
-│   ├── adsb_streamer_optimized.py        # Optimized Python streamer (CSV COPY)
-│   ├── adsb_streamer.py                  # Original Python streamer
-│   ├── schema.sql                        # Database schema
-│   ├── adsb-streamer-optimized.service   # Systemd service file
-│   ├── .env                              # Environment variables (DATABASE_URL)
-│   └── requirements.txt                  # Python dependencies
-│
-├── data-generator/               # Mock Data Generator (for testing)
-│   ├── generate.js               # Simulates aircraft for testing
-│   ├── package.json
-│   └── .env
-│
-├── DEPLOYMENT.md                 # Detailed deployment guide
-├── deploy-to-pi.sh              # Automated deployment script
-└── README.md                    # This file
 ```
 
 ## 🔧 Prerequisites
@@ -399,29 +348,7 @@ Or in dashboard: **Settings** → **Generate Domain**
 
 Your app will be live at: `https://your-app-name.up.railway.app`
 
-### Alternative: Deploy to Render.com
-
-Render has native GitLab support and a truly free tier.
-
-1. Go to [render.com](https://render.com)
-2. Create **New Web Service**
-3. Connect your GitLab/GitHub repo
-4. Settings:
-   - **Build Command**: `npm install`
-   - **Start Command**: `node server.js`
-   - **Environment**: Add `DATABASE_URL`
-5. Deploy
-
-### Alternative: Deploy to Vercel
-
-```bash
-npm install -g vercel
-cd ~/group_19_project/ads
-vercel --prod
-vercel env add DATABASE_URL
-```
-
-## ⚡ Performance Optimization
+## Performance Optimization
 
 ### Database Write Performance Comparison
 
@@ -447,7 +374,7 @@ The optimized streamer uses **CSV COPY by default** for 100-1000x performance im
 4. **Use Nginx** for serving static files in production
 5. **Enable gzip compression** in Nginx config
 
-## 📡 API Documentation
+## API Documentation
 
 Base URL: `https://your-domain.com` or `http://localhost:3000`
 
@@ -553,7 +480,7 @@ GET /api/health
 }
 ```
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### ADS-B Streamer Issues
 
@@ -626,28 +553,7 @@ app.use(cors());
 - Check Supabase connection pooler is used (not direct connection)
 - Verify SSL settings in database connection
 
-## 🤝 Contributing
-
-Contributions are welcome! Please follow these guidelines:
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/your-feature`
-3. Commit your changes: `git commit -m 'Add some feature'`
-4. Push to the branch: `git push origin feature/your-feature`
-5. Open a Pull Request
-
-### Code Style
-
-- **Python**: Follow PEP 8
-- **JavaScript**: Use ESLint with default config
-- **Comments**: Document complex logic
-- **Commits**: Use clear, descriptive messages
-
-## 📝 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - **dump1090**: ADS-B decoder by antirez and FlightAware
 - **Leaflet**: Interactive maps library
@@ -656,7 +562,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - **Railway**: Cloud deployment platform
 - **OpenStreetMap**: Map data contributors
 
-## 👥 Team
+## Team
 
 <div align="center">
 
@@ -684,7 +590,7 @@ Apoorv is a Master's student in Computer Science at the University of Illinois U
 
 *Advised by Professor David Lariviere*
 
-## 🗺️ Roadmap
+## Roadmap
 
 - [ ] WebSocket support for true real-time updates
 - [ ] Historical flight playback

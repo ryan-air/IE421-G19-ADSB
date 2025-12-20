@@ -1514,7 +1514,6 @@ This project successfully demonstrates that sophisticated aircraft tracking and 
 The project required solving several non-trivial engineering challenges:
 - Database write bottlenecks (solved with CSV COPY)
 - API response latency (solved with two-level caching and query batching)
-- Supabase connection limits (solved with conservative pooling)
 - Jerky visualizations (solved with custom animation interpolation)
 - Data integrity issues (solved with multi-layer validation)
 - WebGL performance limits (solved with LOD and selective rendering)

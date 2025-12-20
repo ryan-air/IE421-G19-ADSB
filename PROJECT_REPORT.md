@@ -1,22 +1,6 @@
 # ADS-B Aircraft Tracking System - Technical Project Report
 
-## Table of Contents
-
-1. [Executive Summary](#executive-summary)
-2. [ADS-B Protocol Overview](#ads-b-protocol-overview)
-3. [System Architecture](#system-architecture)
-4. [Data Reception and Processing Pipeline](#data-reception-and-processing-pipeline)
-5. [Database Design and Schema](#database-design-and-schema)
-6. [Backend API Implementation](#backend-api-implementation)
-7. [Frontend Visualization](#frontend-visualization)
-8. [Kalman Filter and Collision Detection](#kalman-filter-and-collision-detection)
-9. [Performance Optimizations](#performance-optimizations)
-10. [Deployment and Operations](#deployment-and-operations)
-11. [Limitations and Future Work](#limitations-and-future-work)
-
----
-
-## Executive Summary
+## Summary
 
 This project implements a real-time aircraft tracking system using Automatic Dependent Surveillance-Broadcast (ADS-B) signals. Aircraft equipped with ADS-B transponders broadcast their position, altitude, velocity, and identification data on 1090 MHz. The system receives these signals via an RTL-SDR software-defined radio, processes the data through a Python streaming service, stores it in a PostgreSQL database, and provides interactive 2D and 3D web-based visualizations. Advanced features include Kalman filter-based trajectory prediction and probabilistic collision detection.
 

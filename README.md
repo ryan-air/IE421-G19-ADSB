@@ -656,6 +656,34 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - **Railway**: Cloud deployment platform
 - **OpenStreetMap**: Map data contributors
 
+## 👥 Team
+
+<div align="center">
+
+### Saksham Gupta
+<img src="saksham.png" width="150" height="150" style="border-radius: 50%;">
+
+Saksham is a Master's student in Computer Science at the University of Illinois Urbana-Champaign, expected to graduate in May 2025. He is currently open to full-time new graduate roles.
+
+**Email:** sgupta99@illinois.edu
+**LinkedIn:** https://www.linkedin.com/in/saksham-gupta1/
+
+---
+
+### Apoorv Lathey
+<img src="apoorv.png" width="150" height="150" style="border-radius: 50%;">
+
+Apoorv is a Master's student in Computer Science at the University of Illinois Urbana-Champaign, expected to graduate in May 2025. He is currently open to full-time new graduate roles.
+
+**Email:** alathey2@illinois.edu
+**LinkedIn:** https://www.linkedin.com/in/apoorv-lathey/
+
+</div>
+
+---
+
+*Advised by Professor David Lariviere*
+
 ## 📧 Support
 
 For issues, questions, or contributions:

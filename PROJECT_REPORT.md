@@ -317,100 +317,47 @@ MSG,4,111,11111,A12345,111111,2025/12/20,19:40:04.789,2025/12/20,19:40:04.789,,,
 
 ### Stage 1: SBS-1 Message Reception
 
-**File:** `ads-b-receiver/adsb_streamer_optimized.py` (lines 599-756)
+The Python ADS-B streamer establishes a TCP connection to dump1090 on port 30003 to receive SBS-1 formatted messages. The connection handler implements:
 
-**Connection Establishment:**
-```python
-def connect_to_dump1090(host='localhost', port=30003):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((host, port))
-    sock.settimeout(10)
-    return sock
-```
+**Connection Management:**
+- TCP socket connection with 10-second timeout
+- Automatic reconnection with exponential backoff on connection loss
+- UTF-8 decoding with error tolerance for malformed characters
 
-**Message Reading Loop:**
-```python
-def read_sbs1_messages(sock):
-    buffer = ""
-    while True:
-        data = sock.recv(4096).decode('utf-8', errors='ignore')
-        buffer += data
-
-        while '\n' in buffer:
-            line, buffer = buffer.split('\n', 1)
-            yield line.strip()
-```
+**Message Buffering:**
+- Receives data in 4096-byte chunks
+- Maintains a line buffer to handle partial messages
+- Yields complete newline-delimited messages to the parser
 
 **Error Handling:**
-- Socket timeout: 10-second timeout, reconnects on failure
-- Decode errors: Ignores invalid UTF-8 characters
-- Connection loss: Automatic reconnection with exponential backoff
+- Gracefully handles socket timeouts and reconnects
+- Ignores invalid UTF-8 sequences without crashing
+- Logs connection status and error rates for monitoring
 
 ### Stage 2: SBS-1 Protocol Parsing
 
-**File:** `ads-b-receiver/adsb_streamer_optimized.py` (lines 54-155)
+The SBS-1 parser extracts structured aircraft data from comma-separated message lines. The parser implements comprehensive validation and type-safe field extraction.
 
-**Parser Class:**
-```python
-class SBS1Parser:
-    def parse(self, line):
-        if not line.startswith('MSG,'):
-            return None
+**Message Type Filtering:**
+- Processes only message types 1 (identification), 3 (position), and 4 (velocity)
+- Rejects malformed messages with fewer than 22 fields
+- Discards messages missing required fields (hex code, latitude, longitude)
 
-        parts = line.split(',')
-        if len(parts) < 22:
-            return None  # Malformed message
-
-        msg_type = int(parts[1])
-
-        # MSG,1 = Aircraft ID, MSG,3 = Position, MSG,4 = Velocity
-        if msg_type not in [1, 3, 4]:
-            return None
-
-        # Extract fields
-        hex_ident = parts[4].strip()
-        callsign = parts[10].strip() if len(parts[10].strip()) >= 2 else None
-        altitude = safe_int(parts[11])
-        speed = safe_int(parts[12])
-        track = safe_int(parts[13])
-        lat = safe_float(parts[14])
-        lon = safe_float(parts[15])
-        vertical_rate = safe_int(parts[16])
-        squawk = parts[17].strip() if len(parts) > 17 else None
-
-        # Validation
-        if not self.is_valid_hex(hex_ident):
-            return None
-
-        if lat is None or lon is None:
-            return None  # Position required
-
-        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-            return None  # Invalid coordinates
-
-        # Timestamp processing
-        date_str = parts[6]  # YYYY/MM/DD
-        time_str = parts[7]  # HH:MM:SS.sss
-        timestamp = self.parse_timestamp(date_str, time_str)
-
-        return AircraftPosition(
-            hex=hex_ident,
-            flight=callsign,
-            lat=lat,
-            lon=lon,
-            altitude=altitude,
-            speed=speed,
-            track=track,
-            vertical_rate=vertical_rate,
-            squawk=squawk,
-            timestamp=timestamp,
-            receiver_id=self.receiver_id
-        )
-```
+**Field Extraction:**
+The parser extracts and validates the following fields:
+- **Hex identifier**: 6-character ICAO code (e.g., "A12345")
+- **Callsign**: Optional flight identifier (minimum 2 characters)
+- **Position**: Latitude/longitude with coordinate range validation
+- **Altitude**: Pressure altitude in feet
+- **Speed**: Ground speed in knots
+- **Track**: Direction of travel (0-359 degrees)
+- **Vertical rate**: Climb/descent rate in feet per minute
+- **Squawk**: Transponder code
+- **Timestamp**: Date and time from message fields, converted to UTC
 
 **Validation Rules:**
 - Hex code: Exactly 6 alphanumeric characters [0-9A-F]
-- Callsign: At least 2 characters, alphanumeric only
+- Callsign: At least 2 characters when present
 - Latitude: -90 to +90 degrees
 - Longitude: -180 to +180 degrees
 - Altitude: -1,000 to 100,000 feet (sanity check)
@@ -418,225 +365,77 @@ class SBS1Parser:
 - Track: 0 to 359 degrees
 
 **Type Conversion Safety:**
-```python
-def safe_int(value):
-    try:
-        return int(value) if value and value.strip() else None
-    except ValueError:
-        return None
+All numeric field conversions use exception-safe wrappers that return None for invalid values rather than throwing errors. This ensures robustness against malformed data from the radio stream.
 
-def safe_float(value):
-    try:
-        return float(value) if value and value.strip() else None
-    except ValueError:
-        return None
-```
-
-**Timestamp Handling:**
-```python
-def parse_timestamp(self, date_str, time_str):
-    # Input: "2025/12/20", "19:40:05.123"
-    # Output: datetime object in UTC
-
-    dt_str = f"{date_str} {time_str}"
-    dt_local = datetime.strptime(dt_str, "%Y/%m/%d %H:%M:%S.%f")
-    dt_utc = dt_local.replace(tzinfo=timezone.utc)
-    return dt_utc
-```
+**Timestamp Processing:**
+SBS-1 timestamps are provided in two fields (date: "YYYY/MM/DD", time: "HH:MM:SS.sss") which are combined and converted to UTC datetime objects for database storage.
 
 ### Stage 3: Batch Buffering and Rate Limiting
 
-**File:** `ads-b-receiver/adsb_streamer_optimized.py` (lines 157-598)
+The AircraftDataManager class implements intelligent buffering and rate limiting to optimize database performance while preventing data loss.
 
-**AircraftDataManager Class:**
-```python
-class AircraftDataManager:
-    def __init__(self, db_pool, batch_size=100, flush_interval=1.0, receiver_id="default"):
-        self.aircraft_buffer = {}         # hex → AircraftPosition
-        self.session_buffer = {}          # hex → SessionData
-        self.last_update_time = {}        # hex → timestamp
-        self.batch_size = batch_size
-        self.flush_interval = flush_interval
-        self.last_flush_time = time.time()
-        self.receiver_id = receiver_id
-```
+**Buffer Architecture:**
+The manager maintains three in-memory buffers:
+- **Aircraft buffer**: Maps hex codes to latest position data (one entry per aircraft)
+- **Session buffer**: Tracks first/last seen timestamps for flight duration calculation
+- **Rate limit tracker**: Records last update time per aircraft
 
-**Rate Limiting (Per-Aircraft):**
-```python
-def should_update(self, hex_ident):
-    now = time.time()
-    last_update = self.last_update_time.get(hex_ident, 0)
+**Rate Limiting Strategy:**
+To prevent duplicate database writes for the same aircraft receiving multiple messages per second:
+- Minimum 1-second interval between updates for each aircraft
+- Newer messages overwrite buffered data if within rate limit window
+- Ensures database isn't overwhelmed while keeping positions current
 
-    # Minimum 1 second between updates for same aircraft
-    if now - last_update < 1.0:
-        return False
+**Buffer Flush Triggers:**
+The system flushes buffered data to the database when either condition is met:
+1. **Size-based**: Buffer reaches configured batch size (default: 100 aircraft)
+2. **Time-based**: Flush interval elapses (default: 1.0 seconds)
 
-    self.last_update_time[hex_ident] = now
-    return True
-```
+This dual-trigger approach balances write throughput (larger batches are faster) with data freshness (time limit ensures timely updates during low traffic).
 
-**Buffer Management:**
-```python
-def add_position(self, position):
-    hex_ident = position.hex
-
-    # Rate limit check
-    if not self.should_update(hex_ident):
-        return
-
-    # Add to aircraft buffer (overwrites previous if exists)
-    self.aircraft_buffer[hex_ident] = position
-
-    # Update session tracking
-    if hex_ident not in self.session_buffer:
-        self.session_buffer[hex_ident] = SessionData(
-            hex=hex_ident,
-            flight=position.flight,
-            first_seen=position.timestamp,
-            last_seen=position.timestamp,
-            receiver_id=self.receiver_id
-        )
-    else:
-        session = self.session_buffer[hex_ident]
-        session.last_seen = position.timestamp
-        if position.flight:
-            session.flight = position.flight
-
-    # Auto-flush if buffer full
-    if len(self.aircraft_buffer) >= self.batch_size:
-        self.flush()
-```
-
-**Time-Based Flush:**
-```python
-def check_auto_flush(self):
-    now = time.time()
-    if now - self.last_flush_time >= self.flush_interval:
-        if len(self.aircraft_buffer) > 0:
-            self.flush()
-        self.last_flush_time = now
-```
+**Session Tracking:**
+In parallel with position buffering, the manager maintains session records:
+- Records first detection time when aircraft appears
+- Updates last seen time on each buffered update
+- Preserves callsign from any message that includes it
+- Enables flight duration calculation in statistics
 
 ### Stage 4: High-Performance Database Insertion
 
-**Method: CSV COPY (100-1000x faster than individual INSERTs)**
+The system uses PostgreSQL's CSV COPY method for bulk data insertion, achieving 100-1000x performance improvement over individual INSERT statements.
 
 **Why CSV COPY is Fast:**
 1. **Single Transaction:** All records committed atomically
-2. **No SQL Parsing:** Binary protocol bypass
-3. **Bulk Loading:** PostgreSQL's fastest import method
-4. **No Round Trips:** One network call instead of N
+2. **No SQL Parsing Overhead:** Binary protocol bypasses query parsing
+3. **Bulk Loading:** PostgreSQL's fastest import method (designed for data warehousing)
+4. **Minimal Network Round Trips:** One network call instead of N individual queries
 
-**Implementation:**
-```python
-def flush(self):
-    if len(self.aircraft_buffer) == 0:
-        return
+**Temporary Table Strategy:**
+To support UPSERT semantics (insert new, update existing) with CSV COPY:
+1. Create temporary table with same schema as target (auto-dropped after transaction)
+2. Use CSV COPY to bulk load all buffered records into temp table
+3. Execute INSERT ... SELECT with ON CONFLICT clause to merge temp → main table
+4. All three tables (aircraft_real, position_history, sessions) updated in single transaction
 
-    conn = self.db_pool.getconn()
-    try:
-        cursor = conn.cursor()
+**Three-Table Update Process:**
 
-        # STEP 1: Create temporary table (in-memory)
-        cursor.execute("""
-            CREATE TEMP TABLE temp_aircraft_real (LIKE aircraft_real)
-            ON COMMIT DROP
-        """)
+**1. Aircraft Current State (aircraft_real):**
+- UPSERT operation: new aircraft inserted, existing updated
+- COALESCE used to preserve non-null values (e.g., keep callsign if new message lacks it)
+- Updates lat/lon/altitude/speed/track/seen_at with latest values
+- Maintains one row per aircraft (primary key: hex code)
 
-        # STEP 2: Prepare CSV data in StringIO buffer
-        aircraft_csv = StringIO()
-        for position in self.aircraft_buffer.values():
-            # Tab-separated values (CSV COPY format)
-            aircraft_csv.write(
-                f"{position.hex}\t"
-                f"{position.flight or ''}\t"
-                f"{position.lat}\t"
-                f"{position.lon}\t"
-                f"{position.altitude or ''}\t"
-                f"{position.speed or ''}\t"
-                f"{position.track or ''}\t"
-                f"{position.vertical_rate or ''}\t"
-                f"{position.squawk or ''}\t"
-                f"{position.receiver_id}\t"
-                f"{position.timestamp.isoformat()}\t"
-                f"{position.timestamp.isoformat()}\n"
-            )
-        aircraft_csv.seek(0)
+**2. Position History (aircraft_position_history):**
+- Append-only INSERT (no conflicts, no updates)
+- Every buffered position creates a new history record
+- Provides trail data for visualization and Kalman filter training
+- Retention policy automatically cleans old records (configurable, default 2 hours)
 
-        # STEP 3: Bulk COPY into temporary table
-        cursor.copy_from(
-            aircraft_csv,
-            'temp_aircraft_real',
-            columns=('hex', 'flight', 'lat', 'lon', 'altitude', 'speed',
-                     'track', 'vertical_rate', 'squawk', 'receiver_id',
-                     'seen_at', 'created_at'),
-            null=''  # Empty string = NULL
-        )
-
-        # STEP 4: UPSERT from temp to main table
-        cursor.execute("""
-            INSERT INTO aircraft_real
-            SELECT * FROM temp_aircraft_real
-            ON CONFLICT (hex) DO UPDATE SET
-                flight = COALESCE(EXCLUDED.flight, aircraft_real.flight),
-                lat = EXCLUDED.lat,
-                lon = EXCLUDED.lon,
-                altitude = COALESCE(EXCLUDED.altitude, aircraft_real.altitude),
-                speed = COALESCE(EXCLUDED.speed, aircraft_real.speed),
-                track = COALESCE(EXCLUDED.track, aircraft_real.track),
-                vertical_rate = COALESCE(EXCLUDED.vertical_rate, aircraft_real.vertical_rate),
-                squawk = COALESCE(EXCLUDED.squawk, aircraft_real.squawk),
-                receiver_id = EXCLUDED.receiver_id,
-                seen_at = EXCLUDED.seen_at
-        """)
-
-        # STEP 5: Insert into position history (for trails/Kalman filter)
-        history_csv = StringIO()
-        for position in self.aircraft_buffer.values():
-            history_csv.write(
-                f"{position.hex}\t{position.lat}\t{position.lon}\t"
-                f"{position.altitude or ''}\t{position.speed or ''}\t"
-                f"{position.track or ''}\t{position.vertical_rate or ''}\t"
-                f"{position.timestamp.isoformat()}\n"
-            )
-        history_csv.seek(0)
-
-        cursor.execute("CREATE TEMP TABLE temp_history (LIKE aircraft_position_history) ON COMMIT DROP")
-        cursor.copy_from(history_csv, 'temp_history',
-                        columns=('hex', 'lat', 'lon', 'altitude', 'speed',
-                                'track', 'vertical_rate', 'timestamp'), null='')
-        cursor.execute("INSERT INTO aircraft_position_history SELECT * FROM temp_history")
-
-        # STEP 6: Update sessions
-        session_csv = StringIO()
-        for session in self.session_buffer.values():
-            session_csv.write(
-                f"{session.hex}\t{session.flight or ''}\t{session.receiver_id}\t"
-                f"{session.first_seen.isoformat()}\t{session.last_seen.isoformat()}\n"
-            )
-        session_csv.seek(0)
-
-        cursor.execute("CREATE TEMP TABLE temp_sessions (LIKE aircraft_sessions_real) ON COMMIT DROP")
-        cursor.copy_from(session_csv, 'temp_sessions',
-                        columns=('hex', 'flight', 'receiver_id', 'first_seen', 'last_seen'), null='')
-        cursor.execute("""
-            INSERT INTO aircraft_sessions_real SELECT * FROM temp_sessions
-            ON CONFLICT (hex) DO UPDATE SET
-                flight = COALESCE(EXCLUDED.flight, aircraft_sessions_real.flight),
-                last_seen = EXCLUDED.last_seen,
-                receiver_id = EXCLUDED.receiver_id
-        """)
-
-        conn.commit()
-        logger.info(f"Flushed {len(self.aircraft_buffer)} aircraft to database")
-
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Database flush error: {e}")
-    finally:
-        self.db_pool.putconn(conn)
-        self.aircraft_buffer.clear()
-```
+**3. Session Tracking (aircraft_sessions_real):**
+- UPSERT: Creates session on first appearance, updates last_seen on subsequent messages
+- Tracks first_seen (immutable) and last_seen (updated each flush)
+- Preserves callsign if available
+- Enables flight duration calculation (last_seen - first_seen)
 
 **Performance Comparison:**
 
@@ -646,54 +445,34 @@ def flush(self):
 | 100 | 2000ms | 250ms | 20ms |
 | 1000 | 20000ms | 2000ms | 150ms |
 
+At typical load (50-100 aircraft), CSV COPY achieves 5000+ operations/second versus 50/second with individual INSERTs.
+
 ### Stage 5: Automatic Cleanup
 
+The system implements automatic cleanup to prevent database bloat and remove stale aircraft that have moved out of range or landed.
+
 **Stale Aircraft Removal:**
-```python
-def cleanup_stale_aircraft(self):
-    conn = self.db_pool.getconn()
-    try:
-        cursor = conn.cursor()
+Every 2 minutes, the cleanup process:
+- Deletes aircraft from `aircraft_real` table not seen in last 5 minutes
+- Marks corresponding sessions in `aircraft_sessions_real` as ended (sets `ended_at` timestamp)
+- Prevents accumulation of outdated position data
 
-        # Remove aircraft not seen in 5 minutes
-        cursor.execute("""
-            DELETE FROM aircraft_real
-            WHERE seen_at < NOW() - INTERVAL '5 minutes'
-        """)
-
-        # Mark sessions as ended
-        cursor.execute("""
-            UPDATE aircraft_sessions_real
-            SET ended_at = last_seen
-            WHERE ended_at IS NULL
-              AND last_seen < NOW() - INTERVAL '5 minutes'
-        """)
-
-        conn.commit()
-        logger.info(f"Cleanup: removed {cursor.rowcount} stale aircraft")
-    finally:
-        self.db_pool.putconn(conn)
-```
+This ensures the current state table only contains actively tracked aircraft, improving query performance and keeping the web interface showing only relevant traffic.
 
 **Position History Cleanup (Optional):**
-```python
-def cleanup_old_history(self, hours=2):
-    conn = self.db_pool.getconn()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            DELETE FROM aircraft_position_history
-            WHERE timestamp < NOW() - INTERVAL '%s hours'
-        """, (hours,))
-        conn.commit()
-        logger.info(f"Cleanup: removed {cursor.rowcount} old position records")
-    finally:
-        self.db_pool.putconn(conn)
-```
+Configurable via `--history-cleanup` parameter:
+- Deletes position history records older than specified hours (default: disabled)
+- Typical configuration: 2 hours (sufficient for trail visualization and Kalman filter)
+- Balances storage constraints with historical data needs
+- Runs on same 2-minute interval as stale aircraft cleanup
 
-**Cleanup Schedule:**
-- Stale aircraft: Every 2 minutes
-- Position history: Every 2 hours (configurable via `--history-cleanup`)
+**Rationale:**
+Without cleanup, the database would accumulate:
+- Hundreds of thousands of position history records per day
+- Ghost aircraft that have landed or left coverage area
+- Growing query times as table sizes increase
+
+Cleanup maintains system performance and data relevance for real-time tracking use case.
 
 ---
 
@@ -952,45 +731,6 @@ WHERE ended_at IS NULL
 ORDER BY last_seen DESC;
 ```
 
-### Database Connection Configuration
-
-**ADS-B Streamer (Python):**
-```python
-import psycopg2.pool
-
-db_pool = psycopg2.pool.ThreadedConnectionPool(
-    minconn=1,
-    maxconn=5,
-    dsn=DATABASE_URL,
-    connect_timeout=10
-)
-```
-
-**Web Server (Node.js):**
-```javascript
-import { Pool } from 'pg';
-
-const db = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-    max: 3,                        // Max connections
-    idleTimeoutMillis: 10000,      // Close idle after 10s
-    connectionTimeoutMillis: 10000,
-    allowExitOnIdle: false
-});
-```
-
-**Connection String Format (Supabase):**
-```
-postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres
-```
-
-**Key Points:**
-- Use Session Pooler (port 6543), not Direct Connection (port 5432)
-- Keep connection pool small (Supabase limit ~15-20 total connections)
-- Enable SSL with rejectUnauthorized: false (Supabase requires SSL)
-- Set timeouts to prevent hanging connections
-
 ---
 
 ## Backend API Implementation
@@ -1012,142 +752,41 @@ The Node.js/Express backend provides 8 primary endpoints:
 
 ### Endpoint: GET /api/aircraft
 
-**File:** `ads/server.js` (lines 231-249)
-
 **Purpose:** Fetch basic aircraft data with optional time window filtering.
 
 **Parameters:**
 - `window` (optional): Time window in seconds
-  - `0`: All active aircraft (default in current implementation)
+  - `0`: All active aircraft
   - `300`: Last 5 minutes
   - `3600`: Last 1 hour
   - `21600`: Last 6 hours
 
-**Implementation:**
-```javascript
-app.get('/api/aircraft', async (req, res) => {
-    try {
-        const timeWindow = req.query.window ? parseInt(req.query.window) : 30;
-        const aircraft = await fetchAircraftFromDB(timeWindow);
-
-        res.json({
-            now: Date.now(),
-            aircraft: aircraft,
-            timeWindow: timeWindow
-        });
-    } catch (error) {
-        console.error('Error fetching aircraft data:', error);
-        res.status(500).json({
-            error: 'Failed to fetch aircraft data',
-            message: error.message
-        });
-    }
-});
-```
-
-**Database Query:**
-```javascript
-async function fetchAircraftFromDB(timeWindow = 0) {
-    let query = `
-        SELECT DISTINCT ON (a.hex)
-            a.hex,
-            a.flight,
-            a.lat,
-            a.lon,
-            a.altitude,
-            a.speed,
-            a.track,
-            a.vertical_rate,
-            a.squawk,
-            a.receiver_id,
-            EXTRACT(EPOCH FROM a.seen_at)::bigint as seen,
-            EXTRACT(EPOCH FROM a.created_at)::bigint as created
-        FROM aircraft_real a
-        WHERE a.lat IS NOT NULL
-          AND a.lon IS NOT NULL
-    `;
-
-    if (timeWindow > 0) {
-        query += ` AND a.seen_at > NOW() - INTERVAL '${timeWindow} seconds'`;
-    }
-
-    query += ` ORDER BY a.hex, a.seen_at DESC`;
-
-    const result = await db.query(query);
-
-    // Enrich with aircraft type
-    const enriched = result.rows.map(aircraft => ({
-        ...aircraft,
-        type: aircraftTypes[aircraft.hex] || null
-    }));
-
-    return enriched;
-}
-```
+**Functionality:**
+The endpoint queries the `aircraft_real` table using `DISTINCT ON (hex)` to ensure one record per aircraft. The query:
+- Filters aircraft with valid lat/lon coordinates
+- Applies time window filter if specified (using PostgreSQL INTERVAL)
+- Orders by hex and seen_at to get latest position for each aircraft
+- Converts timestamps to Unix epoch (seconds since 1970) for JavaScript compatibility
 
 **Aircraft Type Enrichment:**
-```javascript
-// Load aircraft types on server startup
-let aircraftTypes = {};
-try {
-    const typesData = fs.readFileSync('./aircraft-types-by-hex.json', 'utf8');
-    aircraftTypes = JSON.parse(typesData);
-    console.log(`Loaded ${Object.keys(aircraftTypes).length} aircraft types`);
-} catch (error) {
-    console.warn('Could not load aircraft types:', error.message);
-}
-```
+On server startup, the system loads an aircraft type lookup table from `aircraft-types-by-hex.json` (generated from FAA registry data). Each aircraft record is enriched with:
+- `type: null` - Unknown aircraft type
+- `type: 6` - Helicopter (from FAA category)
+- Other numeric values - Various aircraft categories
 
-**Response Format:**
-```json
-{
-  "now": 1703105523456,
-  "aircraft": [
-    {
-      "hex": "A12345",
-      "flight": "UAL123",
-      "lat": 41.8781,
-      "lon": -87.6298,
-      "altitude": 35000,
-      "speed": 450,
-      "track": 180,
-      "vertical_rate": 0,
-      "squawk": "1234",
-      "receiver_id": "raspberrypi",
-      "seen": 1703105520,
-      "created": 1703105000,
-      "type": null
-    },
-    {
-      "hex": "A67890",
-      "flight": null,
-      "lat": 41.9500,
-      "lon": -87.7000,
-      "altitude": 2500,
-      "speed": 120,
-      "track": 090,
-      "vertical_rate": -500,
-      "squawk": "1200",
-      "receiver_id": "raspberrypi",
-      "seen": 1703105518,
-      "created": 1703104800,
-      "type": 6
-    }
-  ],
-  "timeWindow": 0
-}
-```
+This allows the frontend to render different icons (e.g., helicopter vs. airplane symbols) and apply type-specific visualizations.
 
-**Type Field Explanation:**
-- `null`: Unknown aircraft type
-- `6`: Helicopter (from FAA aircraft registry)
-- Other values: Various aircraft categories
+**Response Structure:**
+Returns JSON object containing:
+- `now`: Current server timestamp (milliseconds)
+- `aircraft`: Array of aircraft objects with position, velocity, and metadata
+- `timeWindow`: Applied time filter in seconds
+
+Each aircraft object includes hex code, callsign, position (lat/lon), altitude, speed, track, vertical rate, squawk code, receiver ID, and timestamps.
 
 ### Endpoint: GET /api/aircraft/enriched
 
-**File:** `ads/server.js` (lines 253-387)
-
-**Purpose:** High-performance endpoint that returns aircraft with trails and pre-computed probability cones. Uses aggressive caching.
+**Purpose:** High-performance endpoint that returns aircraft with trails and pre-computed probability cones. Uses aggressive caching to minimize database load and computation overhead.
 
 **Parameters:**
 - `window`: Time window seconds (default: 30)
@@ -1156,369 +795,134 @@ try {
 - `prediction_time`: Prediction horizon seconds (default: 300)
 - `confidence`: Confidence level 0-1 (default: 0.95)
 
-**Implementation:**
-```javascript
-app.get('/api/aircraft/enriched', async (req, res) => {
-    try {
-        const timeWindow = req.query.window ? parseInt(req.query.window) : 30;
-        const includeTrails = req.query.trails !== 'false';
-        const includeCones = req.query.cones !== 'false';
-        const predictionTime = parseInt(req.query.prediction_time) || 300;
-        const confidenceLevel = parseFloat(req.query.confidence) || 0.95;
+**Functionality:**
 
-        // Check cache first
-        const cacheKey = `enriched:${timeWindow}:${includeTrails}:${includeCones}:${predictionTime}:${confidenceLevel}`;
-        const cached = cache.get(cacheKey);
+**Step 1: Cache Check**
+The endpoint first checks an in-memory cache using a composite key based on all query parameters. If cached data exists and is fresh (within 2-second TTL), it immediately returns the cached response. This achieves ~75% hit rate in practice, reducing response time from 800ms to 50ms.
 
-        if (cached) {
-            console.log('Cache HIT for enriched data');
-            return res.json({
-                ...cached,
-                cached: true,
-                cacheStats: cache.getStats()
-            });
-        }
+**Step 2: Batch Trail Fetch**
+If cache miss, the endpoint fetches basic aircraft data, then executes a single optimized query to retrieve trails for all aircraft:
+- Uses `hex = ANY($1)` PostgreSQL array operator for batch query
+- Fetches last 120 minutes of position history per aircraft
+- Groups results by hex code for easy lookup
+- Eliminates N individual queries (one per aircraft)
 
-        console.log('Cache MISS - computing enriched data...');
+**Step 3: Server-Side Probability Cone Computation**
+For each aircraft, the server computes Kalman filter-based probability cones:
+- Uses position history (if available) or current speed/track as initialization
+- Generates 20 prediction points over 5-minute horizon
+- Each point includes predicted position, altitude, and uncertainty radius
+- Individual cone results cached separately with 3-second TTL
+- Computation shared across all connected clients (eliminates redundant client-side calculation)
 
-        // Fetch basic aircraft data
-        const aircraft = await fetchAircraftFromDB(timeWindow);
-        const hexCodes = aircraft.map(ac => ac.hex);
-
-        // Batch fetch trails if requested
-        let trailsByHex = new Map();
-        if (includeTrails && hexCodes.length > 0) {
-            const trailResult = await db.query(`
-                SELECT
-                    hex,
-                    lat,
-                    lon,
-                    altitude,
-                    speed,
-                    track,
-                    EXTRACT(EPOCH FROM timestamp)::bigint as seen
-                FROM aircraft_position_history
-                WHERE hex = ANY($1)
-                AND timestamp >= NOW() - INTERVAL '120 minutes'
-                ORDER BY hex, timestamp ASC
-            `, [hexCodes]);
-
-            // Group trails by hex
-            trailResult.rows.forEach(row => {
-                if (!trailsByHex.has(row.hex)) {
-                    trailsByHex.set(row.hex, []);
-                }
-                trailsByHex.get(row.hex).push({
-                    lat: parseFloat(row.lat),
-                    lon: parseFloat(row.lon),
-                    altitude: row.altitude,
-                    speed: row.speed,
-                    track: row.track,
-                    timestamp: new Date(parseInt(row.seen) * 1000).toISOString()
-                });
-            });
-
-            console.log(`Fetched trails for ${trailsByHex.size} aircraft in single query`);
-        }
-
-        // Compute probability cones if requested
-        const enrichedAircraft = await Promise.all(aircraft.map(async (ac) => {
-            const enriched = { ...ac };
-
-            // Add trail data
-            if (includeTrails) {
-                enriched.trail = trailsByHex.get(ac.hex) || [];
-            }
-
-            // Compute probability cone (server-side, cached per aircraft)
-            if (includeCones) {
-                const coneCacheKey = `cone:${ac.hex}:${predictionTime}:${confidenceLevel}`;
-                let coneData = cache.get(coneCacheKey);
-
-                if (!coneData) {
-                    try {
-                        const positionHistory = trailsByHex.get(ac.hex) || [];
-
-                        // Only compute cone if we have sufficient data
-                        if (positionHistory.length >= 2 || (ac.speed && ac.track)) {
-                            const cone = new ProbabilityCone(
-                                ac,
-                                positionHistory,
-                                predictionTime,
-                                confidenceLevel
-                            );
-
-                            coneData = cone.getPredictionPoints();
-
-                            // Cache cone for 3 seconds
-                            cache.set(coneCacheKey, coneData, 3);
-                        }
-                    } catch (error) {
-                        console.error(`Error computing cone for ${ac.hex}:`, error.message);
-                        coneData = null;
-                    }
-                }
-
-                enriched.probabilityCone = coneData;
-            }
-
-            return enriched;
-        }));
-
-        const response = {
-            now: Date.now(),
-            aircraft: enrichedAircraft,
-            timeWindow: timeWindow,
-            cached: false,
-            stats: {
-                total: enrichedAircraft.length,
-                withTrails: enrichedAircraft.filter(ac => ac.trail && ac.trail.length > 0).length,
-                withCones: enrichedAircraft.filter(ac => ac.probabilityCone).length
-            },
-            cacheStats: cache.getStats()
-        };
-
-        // Cache the entire response for 2 seconds
-        cache.set(cacheKey, response, 2);
-
-        res.json(response);
-
-    } catch (error) {
-        console.error('Error fetching enriched aircraft data:', error);
-        res.status(500).json({
-            error: 'Failed to fetch enriched aircraft data',
-            message: error.message
-        });
-    }
-});
-```
+**Step 4: Response Assembly and Caching**
+The complete enriched response is assembled and cached for 2 seconds before returning to client. Response includes cache statistics for performance monitoring.
 
 **Performance Optimizations:**
 1. **Two-Level Caching:**
    - Full response cache: 2-second TTL
    - Individual cone cache: 3-second TTL per aircraft
-2. **Batch Trail Fetch:** Single query for all aircraft using `ANY($1)`
+2. **Batch Trail Fetch:** Single query for all aircraft using `ANY($1)` - reduces 25 queries to 1
 3. **Server-Side Computation:** Probability cones computed once, shared across all clients
-4. **Cache Statistics:** Exposed in response for monitoring
+4. **Cache Statistics:** Exposed in response for monitoring hit rates and performance tuning
 
-**Response Format:**
-```json
-{
-  "now": 1703105523456,
-  "aircraft": [
-    {
-      "hex": "A12345",
-      "flight": "UAL123",
-      "lat": 41.8781,
-      "lon": -87.6298,
-      "altitude": 35000,
-      "speed": 450,
-      "track": 180,
-      "trail": [
-        {"lat": 41.8700, "lon": -87.6200, "altitude": 34800, "timestamp": "2025-12-20T19:35:00.000Z"},
-        {"lat": 41.8740, "lon": -87.6250, "altitude": 34900, "timestamp": "2025-12-20T19:36:00.000Z"}
-      ],
-      "probabilityCone": [
-        {"time": 15, "lat": 41.8800, "lon": -87.6320, "altitude": 35050, "radius": 150},
-        {"time": 30, "lat": 41.8820, "lon": -87.6340, "altitude": 35100, "radius": 250}
-      ]
-    }
-  ],
-  "cached": false,
-  "stats": {
-    "total": 25,
-    "withTrails": 20,
-    "withCones": 18
-  },
-  "cacheStats": {
-    "hits": 150,
-    "misses": 50,
-    "hitRate": "75.0%",
-    "size": 12
-  }
-}
-```
+**Response Structure:**
+Each aircraft object includes:
+- Basic position data (from `/api/aircraft`)
+- `trail`: Array of historical positions with timestamps
+- `probabilityCone`: Array of predicted future positions with uncertainty radii
+- Metadata: Total counts, cache hit statistics
 
 ### Endpoint: GET /api/statistics
 
-**File:** `ads/server.js` (lines 434-543)
+**Purpose:** Provide aggregated dashboard statistics including summary metrics, altitude distribution, and flight durations.
 
-**Purpose:** Provide dashboard statistics including altitude distribution and flight durations.
+**Parameters:**
+- `window`: Optional time window filter in seconds (default: all active sessions)
 
-**Implementation:**
-```javascript
-app.get('/api/statistics', async (req, res) => {
-    try {
-        const timeWindow = req.query.window ? parseInt(req.query.window) : 0;
+**Functionality:**
 
-        const sessionTimeFilter = timeWindow > 0
-            ? `AND s.last_seen > NOW() - INTERVAL '${timeWindow} seconds'`
-            : '';
+The statistics endpoint efficiently computes three categories of analytics in a single database query using Common Table Expressions (CTEs):
 
-        // Single query with CTEs for efficiency
-        const result = await db.query(`
-            WITH
-            -- Summary statistics
-            summary AS (
-                SELECT
-                    COUNT(DISTINCT a.hex) as total_flights,
-                    COALESCE(AVG(a.speed), 0)::numeric(10,2) as avg_speed,
-                    COALESCE(AVG(a.altitude), 0)::numeric(10,2) as avg_altitude,
-                    COALESCE(MIN(a.altitude), 0) as min_altitude,
-                    COALESCE(MAX(a.altitude), 0) as max_altitude,
-                    COALESCE(MIN(a.speed), 0) as min_speed,
-                    COALESCE(MAX(a.speed), 0) as max_speed
-                FROM aircraft_real a
-                INNER JOIN aircraft_sessions_real s ON a.hex = s.hex
-                WHERE s.ended_at IS NULL
-                ${sessionTimeFilter}
-            ),
-            -- Altitude distribution
-            altitude_dist AS (
-                SELECT
-                    CASE
-                        WHEN a.altitude < 10000 THEN '0-10k'
-                        WHEN a.altitude < 20000 THEN '10-20k'
-                        WHEN a.altitude < 30000 THEN '20-30k'
-                        WHEN a.altitude < 40000 THEN '30-40k'
-                        ELSE '40k+'
-                    END as range,
-                    COUNT(*) as count
-                FROM aircraft_real a
-                INNER JOIN aircraft_sessions_real s ON a.hex = s.hex
-                WHERE s.ended_at IS NULL
-                  AND a.altitude IS NOT NULL
-                ${sessionTimeFilter}
-                GROUP BY range
-            ),
-            -- Flight durations
-            durations AS (
-                SELECT
-                    s.hex,
-                    s.flight,
-                    EXTRACT(EPOCH FROM (s.last_seen - s.first_seen))::integer as duration_seconds,
-                    EXTRACT(EPOCH FROM s.first_seen)::bigint as first_seen,
-                    EXTRACT(EPOCH FROM s.last_seen)::bigint as last_seen
-                FROM aircraft_sessions_real s
-                INNER JOIN aircraft_real a ON s.hex = a.hex
-                WHERE s.ended_at IS NULL
-                ${sessionTimeFilter}
-                ORDER BY duration_seconds DESC
-            )
-            SELECT
-                'summary' as type,
-                to_jsonb(summary.*) as data
-            FROM summary
-            UNION ALL
-            SELECT
-                'altitude_dist' as type,
-                jsonb_agg(to_jsonb(altitude_dist.*)) as data
-            FROM altitude_dist
-            UNION ALL
-            SELECT
-                'durations' as type,
-                jsonb_agg(to_jsonb(durations.*)) as data
-            FROM durations
-        `);
+**1. Summary Statistics CTE:**
+Joins `aircraft_real` with `aircraft_sessions_real` (only active sessions where `ended_at IS NULL`) to compute:
+- Total number of tracked flights
+- Average, minimum, and maximum speed
+- Average, minimum, and maximum altitude
 
-        // Parse results
-        const stats = {
-            summary: {},
-            altitude_distribution: [],
-            flight_durations: []
-        };
+Uses `COALESCE` to handle NULL values gracefully and ensure numeric results even with empty data.
 
-        result.rows.forEach(row => {
-            if (row.type === 'summary') {
-                stats.summary = row.data;
-            } else if (row.type === 'altitude_dist') {
-                stats.altitude_distribution = row.data || [];
-            } else if (row.type === 'durations') {
-                stats.flight_durations = row.data || [];
-            }
-        });
+**2. Altitude Distribution CTE:**
+Buckets aircraft into altitude ranges:
+- 0-10,000 ft (low altitude, likely approaching/departing)
+- 10,000-20,000 ft (climbing/descending)
+- 20,000-30,000 ft (cruise)
+- 30,000-40,000 ft (high cruise)
+- 40,000+ ft (high-altitude jets)
 
-        res.json({
-            ...stats,
-            timestamp: Date.now()
-        });
+Provides count per range for dashboard histogram visualization.
 
-    } catch (error) {
-        console.error('Error fetching statistics:', error);
-        res.status(500).json({
-            error: 'Failed to fetch statistics',
-            message: error.message
-        });
-    }
-});
-```
+**3. Flight Durations CTE:**
+Calculates time each aircraft has been tracked by computing `last_seen - first_seen`:
+- Extracts duration in seconds for easy formatting
+- Includes hex code and callsign for identification
+- Orders by duration descending (longest flights first)
+- Only includes active sessions
 
-**Optimization:** Uses CTEs to execute 3 aggregations in a single database round trip instead of 3 separate queries.
+**Query Optimization:**
+The use of CTEs (Common Table Expressions) with UNION ALL allows PostgreSQL to execute all three aggregations in a single database round trip instead of three separate queries. This reduces network latency and transaction overhead by 3x.
 
-**Response Format:**
-```json
-{
-  "summary": {
-    "total_flights": 25,
-    "avg_speed": 425.50,
-    "avg_altitude": 32500.00,
-    "min_altitude": 1500,
-    "max_altitude": 41000,
-    "min_speed": 120,
-    "max_speed": 550
-  },
-  "altitude_distribution": [
-    {"range": "0-10k", "count": 5},
-    {"range": "10-20k", "count": 3},
-    {"range": "20-30k", "count": 15},
-    {"range": "30-40k", "count": 2},
-    {"range": "40k+", "count": 0}
-  ],
-  "flight_durations": [
-    {"hex": "A12345", "flight": "UAL123", "duration_seconds": 3600, "first_seen": 1703101920, "last_seen": 1703105520},
-    {"hex": "A67890", "flight": "DAL456", "duration_seconds": 2400, "first_seen": 1703103120, "last_seen": 1703105520}
-  ],
-  "timestamp": 1703105523456
-}
-```
+**Response Structure:**
+- `summary`: Aggregate metrics object
+- `altitude_distribution`: Array of range/count pairs
+- `flight_durations`: Array of all active flights sorted by duration
+- `timestamp`: Server response time for client synchronization
 
 ### Endpoint: GET /api/collisions/kalman
 
-**File:** `ads/server.js` (lines 571-693)
-
-**Purpose:** Detect potential collisions using Kalman filter-based trajectory prediction.
+**Purpose:** Detect potential collisions using Kalman filter-based trajectory prediction and probability cone intersection analysis.
 
 **Parameters:**
-- `time_horizon`: Prediction time in seconds (default: 300)
-- `confidence`: Confidence level 0-1 (default: 0.95)
+- `time_horizon`: Prediction time in seconds (default: 300 / 5 minutes)
+- `confidence`: Confidence level 0-1 (default: 0.95 / 95%)
 
-**Implementation:** (Detailed in Kalman Filter section)
+**Functionality:**
 
-**Response Format:**
-```json
-{
-  "collisions": [
-    {
-      "aircraft1": "A12345",
-      "aircraft2": "A67890",
-      "flight1": "UAL123",
-      "flight2": "DAL456",
-      "timeToCollision": 180,
-      "probability": "12.5%",
-      "distance": 1500,
-      "verticalSeparation": 800,
-      "position1": {"lat": "41.8781", "lon": "-87.6298", "alt": 35000},
-      "position2": {"lat": "41.8800", "lon": "-87.6300", "alt": 35800},
-      "currentPosition1": {"lat": "41.8700", "lon": "-87.6200", "alt": 34500},
-      "currentPosition2": {"lat": "41.8720", "lon": "-87.6220", "alt": 34900}
-    }
-  ],
-  "aircraft_count": 25,
-  "time_horizon": 300,
-  "confidence_level": 0.95,
-  "timestamp": 1703105523456
-}
-```
+The collision detection endpoint performs the following steps:
+
+**Step 1: Fetch Active Aircraft**
+Retrieves all aircraft currently being tracked along with their position history from the database.
+
+**Step 2: Generate Probability Cones**
+For each aircraft, creates a Kalman filter-based probability cone:
+- Initializes state vector from position history or current speed/track
+- Predicts trajectory over the time horizon
+- Calculates uncertainty growth using covariance matrices
+- Generates 20 prediction points with position and radius
+
+**Step 3: Pairwise Collision Detection**
+Compares all pairs of aircraft (N choose 2 combinations):
+- Checks vertical separation at each time step (minimum 1000 ft for collision alert)
+- Calculates 3D distance between predicted positions
+- Determines if probability cones intersect (distance < sum of radii)
+- Computes collision probability based on overlap percentage
+
+**Step 4: Format and Return Alerts**
+Returns detected collisions sorted by time to collision (soonest first), including:
+- Aircraft hex codes and callsigns for both involved aircraft
+- Time until predicted closest approach (seconds)
+- Estimated collision probability percentage
+- Predicted and current positions for both aircraft
+- Horizontal distance (meters) and vertical separation (feet)
+
+The detailed Kalman filter mathematics and collision detection algorithm are described in the Kalman Filter section of this report.
+
+**Response Structure:**
+- `collisions`: Array of collision alert objects (empty if none detected)
+- `aircraft_count`: Number of aircraft analyzed
+- `time_horizon`: Prediction window used (seconds)
+- `confidence_level`: Statistical confidence level applied
+- `timestamp`: Server response time
 
 ---
 
@@ -1526,519 +930,129 @@ app.get('/api/statistics', async (req, res) => {
 
 ### 2D Map Implementation (Leaflet.js)
 
-**File:** `ads/app.js` (1289 lines)
+The 2D map visualization uses Leaflet.js, a lightweight open-source JavaScript library for interactive maps. The implementation provides real-time aircraft tracking with smooth animations and visual flight trails.
 
 **Map Initialization:**
-```javascript
-// Initialize Leaflet map
-const map = L.map('map', {
-    zoomControl: true,
-    attributionControl: true
-}).setView([41.88, -87.63], 9);  // Chicago area
+The map is centered on the Chicago area (coordinates 41.88°N, 87.63°W) with zoom level 9, providing coverage of ~200 nautical miles. The base layer uses CartoDB's dark theme tile set from OpenStreetMap data, which provides good contrast for bright aircraft icons and reduces eye strain during extended monitoring.
 
-// Dark CartoDB tile layer
-L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    attribution: '© OpenStreetMap contributors © CARTO',
-    maxZoom: 19,
-    subdomains: 'abcd'
-}).addTo(map);
-```
+**Aircraft Icon Rendering:**
+Aircraft are displayed using dynamically generated SVG icons that differentiate between aircraft types:
+- **Airplanes**: Cyan (#00ffff) icon with fuselage, wings, and tail
+- **Helicopters**: Yellow (#ffff00) icon with rotor disc, body, and tail rotor
 
-**Aircraft Marker Creation:**
-```javascript
-function createAircraftIcon(aircraft) {
-    const isHelicopter = aircraft.type === 6;
-    const rotation = aircraft.track || 0;
-
-    // SVG icon with rotation
-    const iconSVG = isHelicopter
-        ? createHelicopterSVG(rotation)
-        : createAirplaneSVG(rotation);
-
-    const iconHTML = `
-        <div style="transform: rotate(${rotation}deg); transform-origin: center;">
-            ${iconSVG}
-        </div>
-        <div style="font-size: 10px; color: #00ffff; text-align: center; margin-top: 2px;">
-            ${aircraft.flight || aircraft.hex}
-        </div>
-    `;
-
-    return L.divIcon({
-        html: iconHTML,
-        className: 'aircraft-icon',
-        iconSize: [30, 30],
-        iconAnchor: [15, 15]
-    });
-}
-
-function createAirplaneSVG(rotation) {
-    return `
-        <svg width="30" height="30" viewBox="0 0 30 30">
-            <g transform="rotate(${rotation} 15 15)">
-                <!-- Fuselage -->
-                <rect x="13" y="5" width="4" height="20" fill="#00ffff"/>
-                <!-- Wings -->
-                <rect x="5" y="13" width="20" height="4" fill="#00ffff"/>
-                <!-- Tail -->
-                <polygon points="13,5 17,5 15,0" fill="#00ffff"/>
-            </g>
-        </svg>
-    `;
-}
-
-function createHelicopterSVG(rotation) {
-    return `
-        <svg width="30" height="30" viewBox="0 0 30 30">
-            <g transform="rotate(${rotation} 15 15)">
-                <!-- Rotor -->
-                <rect x="5" y="14" width="20" height="2" fill="#ffff00"/>
-                <!-- Body -->
-                <ellipse cx="15" cy="18" rx="4" ry="6" fill="#ffff00"/>
-                <!-- Tail -->
-                <rect x="14" y="22" width="2" height="8" fill="#ffff00"/>
-                <!-- Tail rotor -->
-                <circle cx="15" cy="30" r="2" fill="#ffff00"/>
-            </g>
-        </svg>
-    `;
-}
-```
+Each icon rotates to match the aircraft's track (heading) using CSS transforms, providing immediate visual indication of flight direction. The callsign or hex code is displayed below the icon for identification.
 
 **Smooth Marker Animation:**
-```javascript
-function smoothMoveMarker(marker, targetLat, targetLon, targetHeading, duration = 2000) {
-    const startLat = marker.getLatLng().lat;
-    const startLon = marker.getLatLng().lng;
-    const startHeading = marker.currentHeading || targetHeading;
+Rather than jumping aircraft icons instantly to new positions (which would appear jerky), the system implements smooth 2-second animation between updates:
+- Uses requestAnimationFrame for 60 FPS rendering
+- Cubic easing function (easeOut) for natural deceleration
+- Handles heading wrap-around at 0/360 degree transition
+- Interpolates both position and rotation simultaneously
 
-    // Handle heading wrap-around (0/360 transition)
-    let headingDelta = targetHeading - startHeading;
-    if (headingDelta > 180) headingDelta -= 360;
-    if (headingDelta < -180) headingDelta += 360;
+This creates fluid, realistic movement that closely mirrors actual aircraft motion.
 
-    const startTime = Date.now();
+**Flight Trail Visualization:**
+Users can toggle flight trails to see historical paths:
+- Fetches last 120 minutes of position history via API
+- Renders as Leaflet polyline connecting sequential positions
+- Color-coded by aircraft type (cyan for planes, yellow for helicopters)
+- Semi-transparent (60% opacity) to avoid cluttering the map
 
-    function animate() {
-        const now = Date.now();
-        const elapsed = now - startTime;
-        const progress = Math.min(elapsed / duration, 1);
-
-        // Cubic easing: easeOut
-        const eased = 1 - Math.pow(1 - progress, 3);
-
-        // Interpolate position
-        const lat = startLat + (targetLat - startLat) * eased;
-        const lon = startLon + (targetLon - startLon) * eased;
-        const heading = startHeading + headingDelta * eased;
-
-        // Update marker
-        marker.setLatLng([lat, lon]);
-        marker.currentHeading = heading;
-        updateMarkerRotation(marker, heading);
-
-        // Continue animation
-        if (progress < 1) {
-            requestAnimationFrame(animate);
-        }
-    }
-
-    requestAnimationFrame(animate);
-}
-```
-
-**Trail Visualization:**
-```javascript
-async function displayTrailForAircraft(hex) {
-    try {
-        const response = await fetch(`/api/aircraft/${hex}/trail?minutes=120&limit=100`);
-        const data = await response.json();
-
-        if (data.trail && data.trail.length > 1) {
-            const points = data.trail.map(p => [p.lat, p.lon]);
-
-            const aircraft = aircraftData.find(ac => ac.hex === hex);
-            const color = aircraft && aircraft.type === 6 ? '#ffff00' : '#00ffff';
-
-            const trail = L.polyline(points, {
-                color: color,
-                weight: 2,
-                opacity: 0.6
-            }).addTo(map);
-
-            trails.set(hex, trail);
-        }
-    } catch (error) {
-        console.error(`Error fetching trail for ${hex}:`, error);
-    }
-}
-```
-
-**Prediction Wedges (2D Projection):**
-```javascript
-function displayPredictionWedge(aircraft) {
-    if (!aircraft.probabilityCone || aircraft.probabilityCone.length === 0) return;
-
-    const lastPrediction = aircraft.probabilityCone[aircraft.probabilityCone.length - 1];
-    const spreadAngle = 12;  // degrees on each side
-
-    // Calculate wedge vertices
-    const distance = 5 * 1852;  // 5 nautical miles in meters
-    const bearing = aircraft.track || 0;
-
-    const leftBearing = (bearing - spreadAngle + 360) % 360;
-    const rightBearing = (bearing + spreadAngle) % 360;
-
-    const leftPoint = destinationPoint(aircraft.lat, aircraft.lon, distance, leftBearing);
-    const rightPoint = destinationPoint(aircraft.lat, aircraft.lon, distance, rightBearing);
-
-    const wedgePoints = [
-        [aircraft.lat, aircraft.lon],
-        [leftPoint.lat, leftPoint.lon],
-        [rightPoint.lat, rightPoint.lon],
-        [aircraft.lat, aircraft.lon]
-    ];
-
-    // Color by altitude
-    let color;
-    if (aircraft.altitude < 10000) color = '#00ff00';
-    else if (aircraft.altitude < 25000) color = '#ffff00';
-    else color = '#ff8800';
-
-    const wedge = L.polygon(wedgePoints, {
-        color: color,
-        fillColor: color,
-        fillOpacity: 0.2,
-        weight: 1
-    }).addTo(map);
-
-    predictionWedges.set(aircraft.hex, wedge);
-}
-```
+**Prediction Wedge Display:**
+The 2D map visualizes probability cones as wedges (simplified 2D projection):
+- 12-degree spread angle on each side of track heading
+- Extends 5 nautical miles ahead of aircraft
+- Color-coded by altitude:
+  - Green: <10,000 ft (low altitude)
+  - Yellow: 10,000-25,000 ft (medium altitude)
+  - Orange: >25,000 ft (cruise altitude)
+- Semi-transparent fill (20% opacity) with stroke outline
 
 ### 3D Globe Implementation (Cesium.js)
 
-**File:** `ads/cesium-app.js` (1776 lines)
+The 3D visualization uses Cesium.js, an open-source JavaScript library for creating 3D globes and maps with WebGL. This provides an immersive perspective view of aircraft in flight.
 
-**Viewer Initialization:**
-```javascript
-const viewer = new Cesium.Viewer('cesiumContainer', {
-    baseLayerPicker: false,
-    animation: false,
-    timeline: false,
-    fullscreenButton: false,
-    vrButton: false,
-    homeButton: false,
-    sceneModePicker: false,
-    navigationHelpButton: false,
-    geocoder: false,
-    selectionIndicator: true,
-    infoBox: true,
-    terrain: Cesium.Terrain.fromWorldTerrain(),
-    imageryProvider: new Cesium.OpenStreetMapImageryProvider({
-        url: 'https://a.tile.openstreetmap.org/'
-    })
-});
+**Globe Initialization:**
+The Cesium viewer is configured with a minimal UI (no timeline, animation controls, or extra buttons) to maximize screen space for visualization. Key features enabled:
+- **World Terrain**: High-resolution global elevation data showing mountains, valleys
+- **OSM Imagery**: OpenStreetMap satellite/street tiles for base layer
+- **OSM Buildings**: 3D building geometries in major cities
+- **Globe Lighting**: Realistic sun position and shadows based on time of day
+- **Depth Testing**: Aircraft correctly occluded by terrain when behind mountains
 
-// Enable globe lighting
-viewer.scene.globe.enableLighting = true;
-viewer.scene.globe.depthTestAgainstTerrain = true;
+The camera initializes above Chicago at 550km altitude with 45-degree pitch (angled view).
 
-// Add OSM buildings
-const osmBuildings = await Cesium.createOsmBuildingsAsync();
-viewer.scene.primitives.add(osmBuildings);
+**3D Aircraft Representation:**
+Each aircraft is rendered as a Cesium entity with:
+- **Position**: Cartesian3 coordinates converted from WGS84 lat/lon/altitude (feet→meters)
+- **3D Model**: GLB format helicopter model for type 6, airplane model for others
+- **Label**: Callsign or hex code displayed below aircraft with black outline for readability
+- **Properties**: Metadata attached for info panel display on click
 
-// Initial camera position (Chicago)
-viewer.camera.setView({
-    destination: Cesium.Cartesian3.fromDegrees(-87.6298, 41.8781, 550000),
-    orientation: {
-        heading: 0.0,
-        pitch: Cesium.Math.toRadians(-45),
-        roll: 0.0
-    }
-});
-```
-
-**3D Aircraft Entity:**
-```javascript
-function createAircraftEntity(aircraft) {
-    const position = Cesium.Cartesian3.fromDegrees(
-        aircraft.lon,
-        aircraft.lat,
-        (aircraft.altitude || 10000) * 0.3048  // feet to meters
-    );
-
-    const entity = viewer.entities.add({
-        id: aircraft.hex,
-        position: position,
-
-        // 3D Model (for helicopters)
-        model: aircraft.type === 6 ? {
-            uri: '/helicopter.glb',
-            minimumPixelSize: 64,
-            maximumScale: 500
-        } : {
-            uri: 'path/to/airplane.glb',
-            minimumPixelSize: 64,
-            maximumScale: 500
-        },
-
-        // Label
-        label: {
-            text: aircraft.flight || aircraft.hex,
-            font: '14px monospace',
-            fillColor: Cesium.Color.CYAN,
-            outlineColor: Cesium.Color.BLACK,
-            outlineWidth: 2,
-            style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-            verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-            pixelOffset: new Cesium.Cartesian2(0, -20)
-        },
-
-        // Properties
-        properties: {
-            hex: aircraft.hex,
-            flight: aircraft.flight,
-            altitude: aircraft.altitude,
-            speed: aircraft.speed,
-            track: aircraft.track
-        }
-    });
-
-    return entity;
-}
-```
+The 3D models are scaled based on zoom level (minimum 64 pixels, max scale 500x) to remain visible at all distances.
 
 **3D Trail Rendering:**
-```javascript
-function displayTrailIn3D(aircraft) {
-    if (!aircraft.trail || aircraft.trail.length < 2) return;
+Historical flight paths are rendered as 3D polylines:
+- Converts all trail positions from WGS84 to Cartesian3 coordinates
+- Uses PolylineGlowMaterial for attractive glowing effect
+- Color-coded by type (yellow for helicopters, cyan for airplanes)
+- Semi-transparent (60% alpha) to avoid visual clutter
+- Follows terrain elevation + aircraft altitude for true 3D path
 
-    const positions = aircraft.trail.map(point =>
-        Cesium.Cartesian3.fromDegrees(
-            point.lon,
-            point.lat,
-            (point.altitude || 0) * 0.3048
-        )
-    );
-
-    viewer.entities.add({
-        id: `trail-${aircraft.hex}`,
-        polyline: {
-            positions: positions,
-            width: 2,
-            material: new Cesium.PolylineGlowMaterialProperty({
-                glowPower: 0.2,
-                color: aircraft.type === 6
-                    ? Cesium.Color.YELLOW.withAlpha(0.6)
-                    : Cesium.Color.CYAN.withAlpha(0.6)
-            })
-        }
-    });
-}
-```
-
-**Probability Cone Rendering (3D):**
-```javascript
-function displayProbabilityConeIn3D(aircraft) {
-    if (!aircraft.probabilityCone || aircraft.probabilityCone.length === 0) return;
-
-    const points = aircraft.probabilityCone.map(prediction => ({
-        position: Cesium.Cartesian3.fromDegrees(
-            prediction.lon,
-            prediction.lat,
-            prediction.altitude * 0.3048
-        ),
-        radius: prediction.radius
-    }));
-
-    // Create cone as series of connected circles
-    for (let i = 0; i < points.length - 1; i++) {
-        const frustum = new Cesium.FrustumGeometry({
-            origin: points[i].position,
-            orientation: Cesium.Quaternion.IDENTITY,
-            verticalLength: Cesium.Cartesian3.distance(points[i].position, points[i+1].position),
-            _fovy: Math.atan2(points[i].radius, 1000),
-            _xOffset: 0,
-            _yOffset: 0
-        });
-
-        viewer.scene.primitives.add(new Cesium.Primitive({
-            geometryInstances: new Cesium.GeometryInstance({
-                geometry: frustum,
-                attributes: {
-                    color: Cesium.ColorGeometryInstanceAttribute.fromColor(
-                        Cesium.Color.ORANGE.withAlpha(0.3)
-                    )
-                }
-            }),
-            appearance: new Cesium.PerInstanceColorAppearance({
-                translucent: true
-            })
-        }));
-    }
-}
-```
+**Probability Cone Visualization:**
+In 3D, probability cones are rendered as frustum geometries (truncated pyramids):
+- Each prediction point pair creates a cone segment
+- Radius grows with uncertainty over time
+- Semi-transparent orange material (30% alpha)
+- WebGL primitives for efficient rendering
+- Shows expanding uncertainty volume in 3D space
 
 **Mobile Touch Controls:**
-```javascript
-// Configure touch-friendly camera controls
-const controller = viewer.scene.screenSpaceCameraController;
-controller.enableRotate = true;
-controller.enableTranslate = true;
-controller.enableZoom = true;
-controller.enableTilt = true;
-controller.enableLook = true;
+The 3D view includes comprehensive touch support for tablets and smartphones:
 
-// Increase zoom sensitivity for touch
-controller.zoomEventTypes = [
-    Cesium.CameraEventType.PINCH,
-    Cesium.CameraEventType.WHEEL,
-    Cesium.CameraEventType.RIGHT_DRAG
-];
-controller.zoomFactor = 5.0;
+**Gesture Controls:**
+- **Pan**: Single-finger drag to rotate globe
+- **Pinch**: Two-finger pinch/spread to zoom in/out
+- **Two-finger drag**: Tilt camera pitch
+- **Inertia**: Smooth deceleration after gesture release (95% retention)
+- **Zoom limits**: 100m minimum (close to aircraft), 40,000km maximum (full Earth view)
 
-// Smooth inertia for touch gestures
-controller.inertiaSpin = 0.95;
-controller.inertiaTranslate = 0.95;
-controller.inertiaZoom = 0.9;
-
-// Min/max zoom distances
-controller.minimumZoomDistance = 100;      // 100 meters
-controller.maximumZoomDistance = 40000000; // 40,000 km
-```
-
-**On-Screen Mobile Controls:**
-```javascript
-// Tilt buttons
-document.getElementById('tilt-up').addEventListener('click', () => {
-    viewer.camera.lookUp(Cesium.Math.toRadians(10));
-});
-
-document.getElementById('tilt-down').addEventListener('click', () => {
-    viewer.camera.lookDown(Cesium.Math.toRadians(10));
-});
-
-// Rotate buttons
-document.getElementById('rotate-left').addEventListener('click', () => {
-    viewer.camera.rotateLeft(Cesium.Math.toRadians(15));
-});
-
-document.getElementById('rotate-right').addEventListener('click', () => {
-    viewer.camera.rotateRight(Cesium.Math.toRadians(15));
-});
-
-// Preset view buttons
-document.getElementById('view-top').addEventListener('click', () => {
-    viewer.camera.setView({
-        orientation: {
-            heading: viewer.camera.heading,
-            pitch: Cesium.Math.toRadians(-90),  // Top-down
-            roll: 0.0
-        }
-    });
-});
-
-document.getElementById('view-angle').addEventListener('click', () => {
-    viewer.camera.setView({
-        orientation: {
-            heading: viewer.camera.heading,
-            pitch: Cesium.Math.toRadians(-45),  // 45-degree angle
-            roll: 0.0
-        }
-    });
-});
-
-document.getElementById('view-horizon').addEventListener('click', () => {
-    viewer.camera.setView({
-        orientation: {
-            heading: viewer.camera.heading,
-            pitch: Cesium.Math.toRadians(0),  // Horizon
-            roll: 0.0
-        }
-    });
-});
-```
+**On-Screen Buttons:**
+For devices where gestures are difficult:
+- **Tilt up/down**: Adjust camera pitch by 10° increments
+- **Rotate left/right**: Rotate view heading by 15° increments
+- **Preset views**:
+  - Top-down (90° pitch): Overhead map-like view
+  - Angled (45° pitch): Default perspective view
+  - Horizon (0° pitch): Ground-level view
 
 ### Statistics Dashboard
 
-**File:** `ads/cesium-app.js` (lines 1180-1250)
+The statistics dashboard provides real-time analytics about tracked aircraft, displayed in a collapsible side panel available in both 2D and 3D views.
 
-**Update Function:**
-```javascript
-function updateStatisticsDashboard(data) {
-    const dashboardElement = document.getElementById('statistics-content');
-    if (!dashboardElement) return;
+**Dashboard Components:**
 
-    const { summary, altitude_distribution, flight_durations } = data;
+**1. Summary Cards:**
+Three key metrics displayed as prominent cards:
+- **Total Flights**: Count of all currently active aircraft sessions
+- **Average Speed**: Mean ground speed across all aircraft (knots)
+- **Average Altitude**: Mean altitude across all aircraft (displayed in thousands of feet, e.g., "32.5k")
 
-    // Build altitude distribution bars
-    const altitudeHTML = altitude_distribution.map(item => {
-        const maxCount = Math.max(10, ...altitude_distribution.map(i => i.count));
-        const barWidth = Math.min((item.count / maxCount) * 100, 100);
-        return `
-            <div class="stat-bar-container-3d">
-                <span class="stat-bar-label-3d">${item.range}</span>
-                <div class="stat-bar-bg-3d">
-                    <div class="stat-bar-3d" style="width: ${barWidth}%"></div>
-                </div>
-                <span class="stat-bar-value-3d">${item.count}</span>
-            </div>
-        `;
-    }).join('');
+**2. Altitude Distribution Histogram:**
+Horizontal bar chart showing aircraft count per altitude range:
+- Bar width scaled proportionally to count (normalized to maximum)
+- Displays range labels (0-10k, 10-20k, etc.) and counts
+- Provides quick visual understanding of traffic distribution (e.g., many aircraft descending vs. cruise)
 
-    // Build flight durations list (all active flights)
-    const allFlights = flight_durations;
-    const durationsHTML = allFlights.map(item => {
-        return `
-            <div class="duration-item-3d">
-                <span class="duration-flight-3d">${item.flight || item.hex}</span>
-                <span class="duration-time-3d">${formatDuration(item.duration_seconds)}</span>
-            </div>
-        `;
-    }).join('') || '<div style="color: #7a9a7a; font-size: 10px;">No active flights</div>';
+**3. Flight Durations List:**
+Scrollable list of all active flights with tracking time:
+- Displays callsign or hex code for each flight
+- Shows duration formatted as "Xh Ym" (hours and minutes) or "Ym" (minutes only)
+- Allows users to see which aircraft have been in range longest
+- Empty state message when no active flights
 
-    dashboardElement.innerHTML = `
-        <div class="stats-summary-3d">
-            <div class="stat-card-3d">
-                <div class="stat-card-label-3d">Flights</div>
-                <div class="stat-card-value-3d">${summary.total_flights}</div>
-            </div>
-            <div class="stat-card-3d">
-                <div class="stat-card-label-3d">Avg Speed</div>
-                <div class="stat-card-value-3d">${summary.avg_speed.toFixed(0)}</div>
-            </div>
-            <div class="stat-card-3d">
-                <div class="stat-card-label-3d">Avg Alt</div>
-                <div class="stat-card-value-3d">${(summary.avg_altitude / 1000).toFixed(1)}k</div>
-            </div>
-        </div>
-
-        <div class="stats-section-3d">
-            <h4>Altitude Distribution</h4>
-            ${altitudeHTML || '<div style="color: #7a9a7a; font-size: 10px;">No data</div>'}
-        </div>
-
-        <div class="stats-section-3d">
-            <h4>Flight Durations (All Active)</h4>
-            <div class="durations-list-3d">
-                ${durationsHTML}
-            </div>
-        </div>
-    `;
-}
-
-function formatDuration(seconds) {
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-
-    if (hours > 0) {
-        return `${hours}h ${minutes}m`;
-    } else {
-        return `${minutes}m`;
-    }
-}
-```
+**Dashboard Update Mechanism:**
+The dashboard polls the `/api/statistics` endpoint every 5 seconds and dynamically rebuilds the HTML content with new data. This provides near-real-time visibility into traffic patterns without requiring page refresh.
 
 ---
 

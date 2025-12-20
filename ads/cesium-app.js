@@ -1,3 +1,6 @@
+// Probability cones are now computed server-side for performance
+// No need to import ProbabilityCone module client-side anymore
+
 // Set your Cesium Ion access token
 Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI5MDdjYmVjNC05NjZiLTQxZDMtYjA1YS00ZmI3ZjA2ZjRiYjQiLCJpZCI6MzY5MDk5LCJpYXQiOjE3NjU1MjUxMDZ9.vixLzkzcNmRUX1wvntDVQ9If5gVlx5ufYNo4Fytsh8A';
 
@@ -334,7 +337,7 @@ function createAircraftEntity(aircraft) {
         orientation: Cesium.Transforms.headingPitchRollQuaternion(
             positionMeters,
             new Cesium.HeadingPitchRoll(
-                // Cesium Air model needs -90 degree offset, helicopter model may need different offset
+                // Cesium Air model needs -90 degree offset to align nose with track direction
                 Cesium.Math.toRadians((aircraft.track || 0) - 90),
                 Cesium.Math.toRadians(0),
                 0
@@ -447,9 +450,11 @@ function clearTrails() {
 }
 
 // Fetch and update aircraft data
+// NEW: Use enriched endpoint with server-computed probability cones
 async function fetchAircraftData() {
     try {
-        const response = await fetch('/api/aircraft?window=0');
+        // Use enriched endpoint that includes trails and pre-computed probability cones
+        const response = await fetch('/api/aircraft/enriched?window=0&trails=true&cones=true');
         if (!response.ok) {
             throw new Error('Failed to fetch aircraft data');
         }
@@ -459,6 +464,16 @@ async function fetchAircraftData() {
         document.getElementById('aircraft-count').textContent = data.aircraft?.length || 0;
 
         currentAircraftData = data.aircraft || []; // Store for collision line updates
+
+        // Log cache performance
+        if (data.cacheStats) {
+            console.log(`📦 Cache: ${data.cacheStats.hitRate} hit rate, ${data.cacheStats.size} entries`);
+        }
+
+        // Log enriched data stats
+        if (data.stats) {
+            console.log(`📊 Enriched data: ${data.stats.total} aircraft, ${data.stats.withTrails} with trails, ${data.stats.withCones} with cones`);
+        }
 
         // Debug: Log vertical rate statistics
         const vrStats = currentAircraftData.reduce((acc, ac) => {
@@ -481,6 +496,12 @@ async function fetchAircraftData() {
         }
 
         updateAircraftOn3DGlobe(currentAircraftData);
+
+        // Update aircraft list if it's open
+        const listPanel = document.getElementById('aircraft-list-panel');
+        if (listPanel && listPanel.classList.contains('open')) {
+            updateAircraftList();
+        }
     } catch (error) {
         console.error('Error fetching aircraft data:', error);
         updateStatus(false, 'Connection Error');
@@ -568,11 +589,14 @@ function updateAircraftOn3DGlobe(aircraftData) {
 // Kalman filter-based collision detection and probability cone visualization
 let collisionLines = [];
 let probabilityCones = [];
+let probabilityConesByHex = new Map(); // Track cones by aircraft hex for efficient updates
 let showProbabilityCones = false;
 let hideGroundedPlanes = false;
 let showStatistics = false;
 let collisionInterval;
 let statisticsInterval;
+let isUpdatingCones = false; // Prevent concurrent cone updates
+let lastConeUpdateTimestamp = 0; // Track when we last updated cones to prevent unnecessary refreshes
 
 // Fetch and display collisions with probability cones
 async function fetchCollisions() {
@@ -654,29 +678,33 @@ function displayCollisions3D(collisions) {
         }
 
         // Draw trajectory line for aircraft 1: current position → collision point
+        const dashMaterial1 = new Cesium.PolylineDashMaterialProperty({
+            color: color,
+            dashLength: 12.0
+        });
         const trajectory1 = viewer.entities.add({
             name: `${collision.aircraft1} trajectory`,
             polyline: {
                 positions: [currentPos1, collisionPointPos],
                 width: 3,
-                material: new Cesium.PolylineDashMaterialProperty({
-                    color: color,
-                    dashLength: 12.0
-                })
+                material: dashMaterial1,
+                depthFailMaterial: dashMaterial1  // Show even when behind terrain
             }
         });
         collisionLines.push(trajectory1);
 
         // Draw trajectory line for aircraft 2: current position → collision point
+        const dashMaterial2 = new Cesium.PolylineDashMaterialProperty({
+            color: color,
+            dashLength: 12.0
+        });
         const trajectory2 = viewer.entities.add({
             name: `${collision.aircraft2} trajectory`,
             polyline: {
                 positions: [currentPos2, collisionPointPos],
                 width: 3,
-                material: new Cesium.PolylineDashMaterialProperty({
-                    color: color,
-                    dashLength: 12.0
-                })
+                material: dashMaterial2,
+                depthFailMaterial: dashMaterial2  // Show even when behind terrain
             }
         });
         collisionLines.push(trajectory2);
@@ -692,7 +720,8 @@ function displayCollisions3D(collisions) {
                 pixelSize: 15,
                 color: color,
                 outlineColor: Cesium.Color.WHITE,
-                outlineWidth: 2
+                outlineWidth: 2,
+                disableDepthTestDistance: Number.POSITIVE_INFINITY
             },
             properties: {
                 isCollision: true,
@@ -720,186 +749,322 @@ function displayCollisions3D(collisions) {
 }
 
 // Fetch and display probability cones for all aircraft
+// NEW: Simplified - uses server-computed cones from enriched endpoint
 async function fetchAndDisplayProbabilityCones() {
     if (!showProbabilityCones) {
         return;
     }
 
-    try {
-        // Get all active aircraft
-        const response = await fetch('/api/aircraft');
-        const data = await response.json();
-
-        // Extract aircraft array from response
-        const aircraft = Array.isArray(data) ? data : (data.aircraft || []);
-
-        // Fetch position history and generate cones for each aircraft
-        displayProbabilityCones(aircraft);
-    } catch (error) {
-        console.error('Error fetching probability cones:', error);
-    }
+    // Use currentAircraftData which now includes pre-computed probability cones
+    // No need to fetch separately - cones are already computed server-side
+    displayProbabilityCones(currentAircraftData);
 }
 
-// Display probability cones in front of each aircraft
-function displayProbabilityCones(aircraft) {
-    // Remove old cones
-    probabilityCones.forEach(entity => viewer.entities.remove(entity));
-    probabilityCones = [];
-
+// NEW: Display probability cones using server-computed predictions
+async function displayProbabilityCones(aircraft) {
+    // Check if we should show cones BEFORE doing anything
     if (!showProbabilityCones || !aircraft || aircraft.length === 0) {
         return;
     }
 
-    // Prediction time horizon in seconds (5 minutes)
-    const predictionTime = 300;
-    // Cone spread angle in degrees (how wide the cone fans out)
-    const coneSpreadAngle = 12;
-    const numSegments = 16; // Number of segments around the cone edge
+    // Prevent concurrent updates
+    if (isUpdatingCones) {
+        console.log('⏭️  Skipping cone update - already in progress');
+        return;
+    }
 
-    let conesCreated = 0;
+    // Use the server's 'now' timestamp to detect when data actually changes
+    // This prevents unnecessary updates while still allowing smooth refreshes
+    const dataTimestamp = Date.now();
+    const timeSinceLastUpdate = dataTimestamp - lastConeUpdateTimestamp;
 
-    // For each aircraft, create a cone showing predicted trajectory with uncertainty
-    aircraft.forEach(ac => {
-        // Only require position and altitude - use defaults for speed/track if missing
-        if (!ac.lat || !ac.lon) return;
+    // Only update if enough time has passed (2 seconds) OR if we have no cones yet
+    // This matches the server cache TTL and prevents flickering
+    if (timeSinceLastUpdate < 2000 && probabilityCones.length > 0) {
+        // Too soon since last update, skip to prevent flickering
+        return;
+    }
 
-        const altitude = ac.altitude || 10000; // Default 10,000 ft if missing
-        const speed = (ac.speed || 250) * 0.514444; // knots to m/s, default 250 kt
-        const trackDeg = ac.track || 0; // heading in degrees (0 = North, clockwise)
-        const altitudeMeters = altitude * 0.3048;
+    isUpdatingCones = true;
 
-        // Calculate the distance the aircraft will travel
-        const distance = speed * predictionTime;
+    try {
+        let conesCreated = 0;
+        let conesUpdated = 0;
+        let conesReused = 0;
+        const numSegments = 16; // Number of segments around the cone edge
+        const newCones = []; // Build new cones in temporary array
+        const processedHexCodes = new Set(); // Track which aircraft we've processed
 
-        // Skip if distance is too small (stationary aircraft)
-        if (distance < 1000) return;
-
-        // Apex position (current aircraft position)
-        const apexPosition = Cesium.Cartesian3.fromDegrees(ac.lon, ac.lat, altitudeMeters);
-
-        // Use raw track for cone direction (no offset needed - cones follow actual heading)
-        const trackRad = (trackDeg * Math.PI) / 180;
-        
-        // Distance in degrees (approximate for short distances)
-        const metersPerDegreeLat = 111320;
-        const metersPerDegreeLon = 111320 * Math.cos(ac.lat * Math.PI / 180);
-        
-        // Calculate offset: sin(track) for East-West, cos(track) for North-South
-        const deltaLat = (distance * Math.cos(trackRad)) / metersPerDegreeLat;
-        const deltaLon = (distance * Math.sin(trackRad)) / metersPerDegreeLon;
-
-        const futureLatDeg = ac.lat + deltaLat;
-        const futureLonDeg = ac.lon + deltaLon;
-
-        // Calculate future altitude
-        const futureAlt = Math.max(0, altitude + (ac.vertical_rate || 0) * (predictionTime / 60));
-        const futureAltMeters = futureAlt * 0.3048;
-
-        // Future center position
-        const futurePosition = Cesium.Cartesian3.fromDegrees(futureLonDeg, futureLatDeg, futureAltMeters);
-
-        // Calculate cone radius at the far end
-        const coneRadius = distance * Math.tan((coneSpreadAngle * Math.PI) / 180);
-
-        // Calculate the direction vector from apex to future position
-        const direction = Cesium.Cartesian3.subtract(futurePosition, apexPosition, new Cesium.Cartesian3());
-        Cesium.Cartesian3.normalize(direction, direction);
-
-        // Get a perpendicular vector (use cross product with up vector)
-        const up = Cesium.Cartesian3.normalize(apexPosition, new Cesium.Cartesian3());
-        let perpendicular = Cesium.Cartesian3.cross(direction, up, new Cesium.Cartesian3());
-
-        // Handle case where direction is parallel to up
-        if (Cesium.Cartesian3.magnitude(perpendicular) < 0.001) {
-            perpendicular = new Cesium.Cartesian3(1, 0, 0);
-        }
-        Cesium.Cartesian3.normalize(perpendicular, perpendicular);
-
-        // Get second perpendicular vector
-        const perpendicular2 = Cesium.Cartesian3.cross(direction, perpendicular, new Cesium.Cartesian3());
-        Cesium.Cartesian3.normalize(perpendicular2, perpendicular2);
-
-        // Generate edge positions around the cone base (proper circle in 3D)
-        const edgePositions = [];
-        for (let i = 0; i <= numSegments; i++) {
-            const angle = (i / numSegments) * 2 * Math.PI;
-
-            // Calculate offset using the two perpendicular vectors
-            const offset = new Cesium.Cartesian3();
-            Cesium.Cartesian3.multiplyByScalar(perpendicular, coneRadius * Math.cos(angle), offset);
-            const offset2 = new Cesium.Cartesian3();
-            Cesium.Cartesian3.multiplyByScalar(perpendicular2, coneRadius * Math.sin(angle), offset2);
-            Cesium.Cartesian3.add(offset, offset2, offset);
-
-            // Add offset to future position
-            const edgePoint = Cesium.Cartesian3.add(futurePosition, offset, new Cesium.Cartesian3());
-            edgePositions.push(edgePoint);
-        }
-
-        // Color based on altitude
-        let color;
-        if (altitude < 10000) {
-            color = Cesium.Color.LIME;
-        } else if (altitude < 25000) {
-            color = Cesium.Color.YELLOW;
-        } else {
-            color = Cesium.Color.ORANGE;
-        }
-
-        // Create the cone surface using triangular polygons
-        for (let i = 0; i < numSegments; i++) {
-            const coneSegment = viewer.entities.add({
-                name: `Cone: ${ac.flight || ac.hex}`,
-                polygon: {
-                    hierarchy: new Cesium.PolygonHierarchy([
-                        apexPosition,
-                        edgePositions[i],
-                        edgePositions[i + 1]
-                    ]),
-                    material: color.withAlpha(0.12),
-                    outline: false,
-                    perPositionHeight: true
-                }
-            });
-            probabilityCones.push(coneSegment);
-        }
-
-        // Center trajectory line
-        const centerLine = viewer.entities.add({
-            polyline: {
-                positions: [apexPosition, futurePosition],
-                width: 2,
-                material: color.withAlpha(0.8)
+        // Process each aircraft
+        for (const ac of aircraft) {
+            // Early exit if cones were toggled off during update
+            if (!showProbabilityCones) {
+                console.log('⏹️ Cones toggled off - stopping cone creation');
+                break;
             }
-        });
-        probabilityCones.push(centerLine);
 
-        // Cone base outline
-        const coneOutline = viewer.entities.add({
-            polyline: {
-                positions: edgePositions,
-                width: 1,
-                material: color.withAlpha(0.5)
-            }
-        });
-        probabilityCones.push(coneOutline);
+            if (!ac.lat || !ac.lon || !ac.hex) continue;
 
-        // Edge lines from apex to base (every 4th point for cleaner look)
-        for (let i = 0; i < numSegments; i += 4) {
-            const edgeLine = viewer.entities.add({
-                polyline: {
-                    positions: [apexPosition, edgePositions[i]],
-                    width: 1,
-                    material: color.withAlpha(0.3)
+            try {
+                // Use server-computed probability cone (no need to fetch or compute client-side!)
+                const predictions = ac.probabilityCone;
+
+                // Skip if no predictions available from server
+                if (!predictions || predictions.length === 0) continue;
+
+                // Track that we've processed this aircraft
+                processedHexCodes.add(ac.hex);
+
+                // Check if we already have cones for this aircraft
+                const existingConeData = probabilityConesByHex.get(ac.hex);
+
+                // If cones exist and predictions haven't changed significantly, reuse them
+                if (existingConeData && existingConeData.predictions) {
+                    const lastPred = existingConeData.predictions[existingConeData.predictions.length - 1];
+                    const currentLastPred = predictions[predictions.length - 1];
+
+                    // Check if predictions are similar (within 100m in lat/lon/alt)
+                    const latDiff = Math.abs(lastPred.lat - currentLastPred.lat);
+                    const lonDiff = Math.abs(lastPred.lon - currentLastPred.lon);
+                    const altDiff = Math.abs(lastPred.altitude - currentLastPred.altitude);
+
+                    // If predictions haven't changed much, reuse existing cones
+                    if (latDiff < 0.001 && lonDiff < 0.001 && altDiff < 100) {
+                        // Reuse existing cone entities
+                        conesReused++;
+                        continue;
+                    } else {
+                        // Predictions changed - remove old cones for this aircraft
+                        if (existingConeData.entities) {
+                            existingConeData.entities.forEach(entity => viewer.entities.remove(entity));
+                        }
+                        conesUpdated++;
+                    }
                 }
-            });
-            probabilityCones.push(edgeLine);
+
+                // Create new cone entities for this aircraft
+                const aircraftConeEntities = [];
+
+                const altitude = ac.altitude || 10000;
+                const altitudeMeters = altitude * 0.3048;
+
+                // Color based on altitude
+                let color;
+                if (altitude < 10000) {
+                    color = Cesium.Color.LIME;
+                } else if (altitude < 25000) {
+                    color = Cesium.Color.YELLOW;
+                } else {
+                    color = Cesium.Color.ORANGE;
+                }
+
+                // Validate prediction data before creating cone
+                if (!predictions || predictions.length < 2) {
+                    console.warn(`Not enough predictions for ${ac.hex}`);
+                    continue;
+                }
+
+                // Apex position (current aircraft position)
+                if (!ac.lon || !ac.lat || !ac.altitude) {
+                    console.warn(`Invalid aircraft position for ${ac.hex}`);
+                    continue;
+                }
+                const apexPosition = Cesium.Cartesian3.fromDegrees(ac.lon, ac.lat, altitudeMeters);
+
+                // Use current position and a future prediction point to get trajectory direction
+                // Use a point further out (e.g., index 5) for better direction calculation
+                const futureIndex = Math.min(5, predictions.length - 1);
+                const futurePrediction = predictions[futureIndex];
+
+                // Validate prediction coordinates
+                if (!futurePrediction.lat || !futurePrediction.lon || !futurePrediction.altitude) {
+                    console.warn(`Invalid prediction coordinates for ${ac.hex}`);
+                    continue;
+                }
+
+                // Calculate direction from current position to future prediction
+                const futurePredPos = Cesium.Cartesian3.fromDegrees(
+                    futurePrediction.lon,
+                    futurePrediction.lat,
+                    futurePrediction.altitude * 0.3048
+                );
+
+                const direction = Cesium.Cartesian3.subtract(futurePredPos, apexPosition, new Cesium.Cartesian3());
+
+                // Validate direction vector (use 100 meters minimum - about 5-10 seconds of flight)
+                const directionMagnitude = Cesium.Cartesian3.magnitude(direction);
+                if (directionMagnitude < 100) {
+                    // Aircraft hasn't moved enough to establish a clear direction
+                    continue;
+                }
+                Cesium.Cartesian3.normalize(direction, direction);
+
+                // Use the last prediction point for the cone endpoint
+                const lastPrediction = predictions[predictions.length - 1];
+
+                // Validate last prediction
+                if (!lastPrediction.lat || !lastPrediction.lon || !lastPrediction.altitude || !lastPrediction.radius) {
+                    console.warn(`Invalid last prediction for ${ac.hex}`);
+                    continue;
+                }
+
+                // The cone endpoint is the last prediction point
+                const futureAltMeters = lastPrediction.altitude * 0.3048;
+                const predictedPosition = Cesium.Cartesian3.fromDegrees(
+                    lastPrediction.lon,
+                    lastPrediction.lat,
+                    futureAltMeters
+                );
+
+                // Use the radius from Kalman filter uncertainty
+                const coneRadius = lastPrediction.radius;
+
+                // Server-computed predictions are already correct - use them directly!
+                // No need for mirror fix anymore since Kalman filter runs server-side
+                const futurePosition = predictedPosition;
+
+                // Direction from current position to future position
+                const actualDirection = Cesium.Cartesian3.subtract(futurePosition, apexPosition, new Cesium.Cartesian3());
+
+                // Debug: Log positions for one aircraft to check direction
+                if (conesCreated === 0) {
+                    console.log(`[${ac.hex}] Current: ${ac.lat.toFixed(4)}, ${ac.lon.toFixed(4)}, ${ac.altitude}ft`);
+                    console.log(`[${ac.hex}] Track: ${ac.track}°, Speed: ${ac.speed} kts`);
+                }
+
+                Cesium.Cartesian3.normalize(actualDirection, actualDirection);
+
+                // Get perpendicular vectors for creating the cone base circle
+                const up = Cesium.Cartesian3.normalize(apexPosition, new Cesium.Cartesian3());
+                let perpendicular = Cesium.Cartesian3.cross(actualDirection, up, new Cesium.Cartesian3());
+
+                if (Cesium.Cartesian3.magnitude(perpendicular) < 0.001) {
+                    perpendicular = new Cesium.Cartesian3(1, 0, 0);
+                }
+                Cesium.Cartesian3.normalize(perpendicular, perpendicular);
+
+                const perpendicular2 = Cesium.Cartesian3.cross(actualDirection, perpendicular, new Cesium.Cartesian3());
+                Cesium.Cartesian3.normalize(perpendicular2, perpendicular2);
+
+                // Generate edge positions around the cone base
+                const edgePositions = [];
+                for (let i = 0; i <= numSegments; i++) {
+                    const angle = (i / numSegments) * 2 * Math.PI;
+
+                    const offset = new Cesium.Cartesian3();
+                    Cesium.Cartesian3.multiplyByScalar(perpendicular, coneRadius * Math.cos(angle), offset);
+                    const offset2 = new Cesium.Cartesian3();
+                    Cesium.Cartesian3.multiplyByScalar(perpendicular2, coneRadius * Math.sin(angle), offset2);
+                    Cesium.Cartesian3.add(offset, offset2, offset);
+
+                    const edgePoint = Cesium.Cartesian3.add(futurePosition, offset, new Cesium.Cartesian3());
+                    edgePositions.push(edgePoint);
+                }
+
+                // Create the cone surface using triangular polygons
+                for (let i = 0; i < numSegments; i++) {
+                    const coneSegment = viewer.entities.add({
+                        name: `Cone: ${ac.flight || ac.hex}`,
+                        polygon: {
+                            hierarchy: new Cesium.PolygonHierarchy([
+                                apexPosition,
+                                edgePositions[i],
+                                edgePositions[i + 1]
+                            ]),
+                            material: color.withAlpha(0.12),
+                            outline: false,
+                            perPositionHeight: true
+                        }
+                    });
+                    aircraftConeEntities.push(coneSegment);
+                    newCones.push(coneSegment);
+                }
+
+                // Center trajectory line
+                const centerLine = viewer.entities.add({
+                    polyline: {
+                        positions: [apexPosition, futurePosition],
+                        width: 2,
+                        material: color.withAlpha(0.8)
+                    }
+                });
+                aircraftConeEntities.push(centerLine);
+                newCones.push(centerLine);
+
+                // Cone base outline
+                const coneOutline = viewer.entities.add({
+                    polyline: {
+                        positions: edgePositions,
+                        width: 1,
+                        material: color.withAlpha(0.5)
+                    }
+                });
+                aircraftConeEntities.push(coneOutline);
+                newCones.push(coneOutline);
+
+                // Edge lines from apex to base (every 4th point)
+                for (let i = 0; i < numSegments; i += 4) {
+                    const edgeLine = viewer.entities.add({
+                        polyline: {
+                            positions: [apexPosition, edgePositions[i]],
+                            width: 1,
+                            material: color.withAlpha(0.3)
+                        }
+                    });
+                    aircraftConeEntities.push(edgeLine);
+                    newCones.push(edgeLine);
+                }
+
+                // Store cone entities and predictions for this aircraft
+                probabilityConesByHex.set(ac.hex, {
+                    entities: aircraftConeEntities,
+                    predictions: predictions
+                });
+
+                conesCreated++;
+            } catch (error) {
+                console.error(`Error creating cone for ${ac.hex}:`, error);
+            }
         }
 
-        conesCreated++;
-    });
+        // Check again if cones should be shown (user may have toggled off during update)
+        if (!showProbabilityCones) {
+            // User toggled off - remove any new cones we created
+            newCones.forEach(entity => viewer.entities.remove(entity));
+            console.log('⏹️ Cones disabled during update - cleaned up');
+            return;
+        }
 
-    console.log(`📊 Displayed ${conesCreated} probability cones for ${aircraft.length} aircraft`);
+        // Remove cones for aircraft that are no longer present
+        let conesRemoved = 0;
+        for (const [hex, coneData] of probabilityConesByHex.entries()) {
+            if (!processedHexCodes.has(hex)) {
+                // Aircraft no longer exists - remove its cones
+                if (coneData.entities) {
+                    coneData.entities.forEach(entity => viewer.entities.remove(entity));
+                }
+                probabilityConesByHex.delete(hex);
+                conesRemoved++;
+            }
+        }
+
+        // Update the global array with all current cones
+        probabilityCones = newCones;
+
+        // Update timestamp to track this cone generation
+        lastConeUpdateTimestamp = dataTimestamp;
+
+        // Log update statistics
+        if (conesCreated > 0 || conesUpdated > 0 || conesRemoved > 0) {
+            console.log(`📊 Cones: ${conesCreated} created, ${conesUpdated} updated, ${conesReused} reused, ${conesRemoved} removed`);
+        } else if (conesReused > 0) {
+            console.log(`📊 Cones: ${conesReused} reused (no changes needed)`);
+        }
+
+    } finally {
+        // Reset the flag to allow next update
+        isUpdatingCones = false;
+    }
 }
 
 // Toggle probability cone visibility
@@ -909,9 +1074,35 @@ function toggleProbabilityCones() {
     if (showProbabilityCones) {
         fetchAndDisplayProbabilityCones();
     } else {
-        // Remove all cones
-        probabilityCones.forEach(entity => viewer.entities.remove(entity));
+        // Remove all cones from our tracking array
+        probabilityCones.forEach(entity => {
+            try { viewer.entities.remove(entity); } catch(e) {}
+        });
         probabilityCones = [];
+
+        // Clear the hex-based tracking map and remove all associated entities
+        for (const [hex, coneData] of probabilityConesByHex.entries()) {
+            if (coneData.entities) {
+                coneData.entities.forEach(entity => {
+                    try { viewer.entities.remove(entity); } catch(e) {}
+                });
+            }
+        }
+        probabilityConesByHex.clear();
+
+        // Also remove any cone entities that might have been added during an in-progress update
+        // by scanning all entities and removing ones with "Cone:" prefix
+        const entitiesToRemove = [];
+        viewer.entities.values.forEach(entity => {
+            if (entity.name && entity.name.startsWith('Cone:')) {
+                entitiesToRemove.push(entity);
+            }
+        });
+        entitiesToRemove.forEach(entity => {
+            try { viewer.entities.remove(entity); } catch(e) {}
+        });
+
+        console.log(`🗑️ Removed ${entitiesToRemove.length} cone entities`);
     }
 
     const button = document.getElementById('toggle-probability-cones');
@@ -949,14 +1140,18 @@ function toggleStatistics() {
     if (panel) {
         panel.classList.toggle('open', showStatistics);
     }
-    
+
     const button = document.getElementById('toggle-statistics');
     if (button) {
         button.textContent = showStatistics ? '📊 Stats ✓' : '📊 Stats';
     }
-    
-    // Fetch immediately when opening
+
+    // Close aircraft list panel if statistics is being opened (both on right side)
     if (showStatistics) {
+        const listPanel = document.getElementById('aircraft-list-panel');
+        if (listPanel && listPanel.classList.contains('open')) {
+            toggleAircraftList();
+        }
         fetchStatistics();
     }
 }
@@ -1013,9 +1208,9 @@ function updateStatisticsDashboard(data) {
         `;
     }).join('');
 
-    // Build flight durations list (top 10)
-    const topFlights = flight_durations.slice(0, 10);
-    const durationsHTML = topFlights.map(item => {
+    // Build flight durations list (all active flights)
+    const allFlights = flight_durations;
+    const durationsHTML = allFlights.map(item => {
         return `
             <div class="duration-item-3d">
                 <span class="duration-flight-3d">${item.flight || item.hex}</span>
@@ -1046,12 +1241,97 @@ function updateStatisticsDashboard(data) {
         </div>
 
         <div class="stats-section-3d">
-            <h4>Flight Durations (Top 10)</h4>
+            <h4>Flight Durations (All Active)</h4>
             <div class="durations-list-3d">
                 ${durationsHTML}
             </div>
         </div>
     `;
+}
+
+// Aircraft list functions
+function toggleAircraftList() {
+    const panel = document.getElementById('aircraft-list-panel');
+    if (!panel) return;
+
+    const isOpen = panel.classList.contains('open');
+    panel.classList.toggle('open', !isOpen);
+
+    const button = document.getElementById('toggle-list');
+    if (button) {
+        button.textContent = !isOpen ? '📋 Aircraft List ✓' : '📋 Aircraft List';
+    }
+
+    // Close statistics panel if aircraft list is being opened (both on right side)
+    if (!isOpen) {
+        const statsPanel = document.getElementById('statistics-panel');
+        if (statsPanel && statsPanel.classList.contains('open')) {
+            toggleStatistics();
+        }
+        updateAircraftList();
+    }
+}
+
+// Update aircraft list panel
+function updateAircraftList() {
+    const listElement = document.getElementById('aircraft-list');
+    if (!listElement) return;
+
+    if (!currentAircraftData || currentAircraftData.length === 0) {
+        listElement.innerHTML = '<div class="loading-state">No aircraft detected</div>';
+        return;
+    }
+
+    // Sort by altitude (descending)
+    const sortedAircraft = [...currentAircraftData].sort((a, b) => (b.altitude || 0) - (a.altitude || 0));
+
+    const html = sortedAircraft.map(ac => {
+        const callsign = ac.flight ? ac.flight.trim() : 'N/A';
+        const hex = ac.hex || 'Unknown';
+        const altitude = ac.altitude ? `${Math.round(ac.altitude)} ft` : 'N/A';
+        const speed = ac.speed ? `${Math.round(ac.speed)} kts` : 'N/A';
+        const heading = ac.track !== null && ac.track !== undefined ? `${Math.round(ac.track)}°` : 'N/A';
+        const vRate = ac.vertical_rate ? `${ac.vertical_rate > 0 ? '+' : ''}${ac.vertical_rate} fpm` : 'Level';
+
+        return `
+            <div class="aircraft-item-3d" onclick="focusOnAircraft('${hex}')">
+                <div class="aircraft-item-header-3d">
+                    <span class="aircraft-callsign-3d">${callsign}</span>
+                    <span class="aircraft-hex-3d">${hex}</span>
+                </div>
+                <div class="aircraft-details-3d">
+                    <div class="aircraft-detail-3d"><strong>Alt:</strong> ${altitude}</div>
+                    <div class="aircraft-detail-3d"><strong>Spd:</strong> ${speed}</div>
+                    <div class="aircraft-detail-3d"><strong>Hdg:</strong> ${heading}</div>
+                    <div class="aircraft-detail-3d"><strong>V/S:</strong> ${vRate}</div>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    listElement.innerHTML = html;
+}
+
+// Focus camera on specific aircraft
+function focusOnAircraft(hex) {
+    const aircraft = currentAircraftData.find(ac => ac.hex === hex);
+    if (!aircraft || !aircraft.lat || !aircraft.lon) return;
+
+    const altitude = (aircraft.altitude || 10000) * 0.3048; // Convert to meters
+    const position = Cesium.Cartesian3.fromDegrees(aircraft.lon, aircraft.lat, altitude);
+
+    // Fly to aircraft with nice animation - use lookAt for proper offset
+    const distance = 100000; // 100km distance
+    const pitch = Cesium.Math.toRadians(-30);
+    const heading = Cesium.Math.toRadians(aircraft.track || 0);
+
+    viewer.camera.flyToBoundingSphere(
+        new Cesium.BoundingSphere(position, 1),
+        {
+            duration: 2,
+            offset: new Cesium.HeadingPitchRange(heading, pitch, distance)
+        }
+    );
 }
 
 // Create airport icon as a data URL
@@ -1251,6 +1531,19 @@ function updateStatus(connected, text) {
     if (connected) {
         indicator.className = 'status-dot connected';
         statusText.textContent = text || 'Connected';
+
+        // Update last update timestamp
+        const now = new Date();
+        const timeString = now.toLocaleTimeString('en-US', {
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
+        const lastUpdateElement = document.getElementById('last-update');
+        if (lastUpdateElement) {
+            lastUpdateElement.textContent = timeString;
+        }
     } else {
         indicator.className = 'status-dot disconnected';
         statusText.textContent = text || 'Disconnected';
@@ -1467,6 +1760,13 @@ function stopPolling() {
         clearInterval(updateInterval);
     }
 }
+
+// Expose functions to global scope for HTML onclick handlers
+window.toggleProbabilityCones = toggleProbabilityCones;
+window.toggleHideGroundedPlanes = toggleHideGroundedPlanes;
+window.toggleStatistics = toggleStatistics;
+window.toggleAircraftList = toggleAircraftList;
+window.focusOnAircraft = focusOnAircraft;
 
 // Initialize
 updateStatus(false, 'Connecting...');

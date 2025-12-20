@@ -7,7 +7,8 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { Pool } from 'pg';
-import { detectCollisions, formatCollision } from './probability-cone.js';
+import { detectCollisions, formatCollision, ProbabilityCone } from './probability-cone.js';
+import cache from './cache.js';
 
 // ES module equivalent of __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -233,7 +234,7 @@ app.get('/api/aircraft', async (req, res) => {
         // Allow query parameter to control time window (0 = all data, default = 30 seconds)
         const timeWindow = req.query.window ? parseInt(req.query.window) : 30;
         const aircraft = await fetchAircraftFromDB(timeWindow);
-        
+
         res.json({
             now: Date.now(),
             aircraft: aircraft,
@@ -241,9 +242,147 @@ app.get('/api/aircraft', async (req, res) => {
         });
     } catch (error) {
         console.error('Error fetching aircraft data:', error);
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Failed to fetch aircraft data',
-            message: error.message 
+            message: error.message
+        });
+    }
+});
+
+// NEW: Enriched endpoint - aircraft + trails + probability cones (server-computed, cached)
+// This replaces the need for separate /api/aircraft/{hex}/trail calls
+app.get('/api/aircraft/enriched', async (req, res) => {
+    try {
+        const timeWindow = req.query.window ? parseInt(req.query.window) : 30;
+        const includeTrails = req.query.trails !== 'false'; // Default true
+        const includeCones = req.query.cones !== 'false'; // Default true
+        const predictionTime = parseInt(req.query.prediction_time) || 300; // 5 minutes default
+        const confidenceLevel = parseFloat(req.query.confidence) || 0.95;
+
+        // Check cache first
+        const cacheKey = `enriched:${timeWindow}:${includeTrails}:${includeCones}:${predictionTime}:${confidenceLevel}`;
+        const cached = cache.get(cacheKey);
+
+        if (cached) {
+            console.log('✅ Cache HIT for enriched data');
+            return res.json({
+                ...cached,
+                cached: true,
+                cacheStats: cache.getStats()
+            });
+        }
+
+        console.log('❌ Cache MISS - computing enriched data...');
+
+        // Fetch basic aircraft data
+        const aircraft = await fetchAircraftFromDB(timeWindow);
+
+        // Get hex codes for batch queries
+        const hexCodes = aircraft.map(ac => ac.hex);
+
+        // Batch fetch trails if requested
+        let trailsByHex = new Map();
+        if (includeTrails && hexCodes.length > 0) {
+            const trailResult = await db.query(`
+                SELECT
+                    hex,
+                    lat,
+                    lon,
+                    altitude,
+                    speed,
+                    track,
+                    EXTRACT(EPOCH FROM timestamp)::bigint as seen
+                FROM aircraft_position_history
+                WHERE hex = ANY($1)
+                AND timestamp >= NOW() - INTERVAL '120 minutes'
+                ORDER BY hex, timestamp ASC
+            `, [hexCodes]);
+
+            // Group trails by hex
+            trailResult.rows.forEach(row => {
+                if (!trailsByHex.has(row.hex)) {
+                    trailsByHex.set(row.hex, []);
+                }
+                trailsByHex.get(row.hex).push({
+                    lat: parseFloat(row.lat),
+                    lon: parseFloat(row.lon),
+                    altitude: row.altitude,
+                    speed: row.speed,
+                    track: row.track,
+                    timestamp: new Date(parseInt(row.seen) * 1000).toISOString()
+                });
+            });
+
+            console.log(`📊 Fetched trails for ${trailsByHex.size} aircraft in single query`);
+        }
+
+        // Compute probability cones if requested
+        const enrichedAircraft = await Promise.all(aircraft.map(async (ac) => {
+            const enriched = { ...ac };
+
+            // Add trail data
+            if (includeTrails) {
+                enriched.trail = trailsByHex.get(ac.hex) || [];
+            }
+
+            // Compute probability cone (server-side, cached per aircraft)
+            if (includeCones) {
+                const coneCacheKey = `cone:${ac.hex}:${predictionTime}:${confidenceLevel}`;
+                let coneData = cache.get(coneCacheKey);
+
+                if (!coneData) {
+                    try {
+                        const positionHistory = trailsByHex.get(ac.hex) || [];
+
+                        // Only compute cone if we have sufficient data
+                        if (positionHistory.length >= 2 || (ac.speed && ac.track)) {
+                            const cone = new ProbabilityCone(
+                                ac,
+                                positionHistory,
+                                predictionTime,
+                                confidenceLevel
+                            );
+
+                            coneData = cone.getPredictionPoints();
+
+                            // Cache cone for 3 seconds (aircraft positions change frequently)
+                            cache.set(coneCacheKey, coneData, 3);
+                        }
+                    } catch (error) {
+                        console.error(`Error computing cone for ${ac.hex}:`, error.message);
+                        coneData = null;
+                    }
+                }
+
+                enriched.probabilityCone = coneData;
+            }
+
+            return enriched;
+        }));
+
+        const response = {
+            now: Date.now(),
+            aircraft: enrichedAircraft,
+            timeWindow: timeWindow,
+            cached: false,
+            stats: {
+                total: enrichedAircraft.length,
+                withTrails: enrichedAircraft.filter(ac => ac.trail && ac.trail.length > 0).length,
+                withCones: enrichedAircraft.filter(ac => ac.probabilityCone).length
+            },
+            cacheStats: cache.getStats()
+        };
+
+        // Cache the entire response for 2 seconds (balance between freshness and performance)
+        cache.set(cacheKey, response, 2);
+
+        res.json(response);
+
+    } catch (error) {
+        console.error('Error fetching enriched aircraft data:', error);
+        res.status(500).json({
+            error: 'Failed to fetch enriched aircraft data',
+            message: error.message
         });
     }
 });

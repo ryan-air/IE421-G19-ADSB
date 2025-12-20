@@ -10,7 +10,7 @@ Current collision avoidance systems like TCAS (Traffic Collision Avoidance Syste
 
 ### Problem Statement
 
-This project addresses the need for an accessible, low-cost aircraft tracking and collision warning system that can operate independently of traditional ATC infrastructure. Using publicly available ADS-B signals that all modern aircraft broadcast, we demonstrate that sophisticated traffic monitoring and predictive collision detection can be achieved with commodity hardware (a $35 Raspberry Pi and $25 SDR radio) and open-source software.
+This project addresses the need for an accessible, low-cost aircraft tracking and collision warning system that can operate independently of traditional ATC infrastructure. Using publicly available ADS-B signals that all modern aircraft broadcast, we demonstrate that sophisticated traffic monitoring and predictive collision detection can be achieved with commodity hardware (a Raspberry Pi and a SDR radio) and open-source software.
 
 ### Use Cases
 
@@ -30,7 +30,7 @@ Our implementation achieves:
 - **Predictive collision warnings**: 5-minute advance alerts using Kalman filter trajectory prediction with 95% confidence intervals
 - **Dual visualization**: Interactive 2D maps and immersive 3D globe with smooth animations and flight trails
 - **Minimal infrastructure**: Operates on a single Raspberry Pi receiving ADS-B signals from 150-250 nautical miles
-- **Open and accessible**: Built entirely with free, open-source technologies; total hardware cost under $100
+- **Open and accessible**: Built entirely with free, open-source technologies;
 
 ## Summary
 
@@ -178,7 +178,6 @@ MSG,4,111,11111,A12345,111111,2025/12/20,19:40:04.789,2025/12/20,19:40:04.789,,,
 - Frequency range: 24-1766 MHz (covers 1090 MHz ADS-B)
 - Sample rate: Up to 3.2 MS/s
 - ADC resolution: 8 bits
-- Cost: $25-40 USD
 - Antenna: Quarter-wave monopole (6.9 cm) or 1090 MHz optimized antenna
 
 **dump1090:**
@@ -1498,7 +1497,7 @@ Implemented selective rendering and LOD (Level of Detail):
 
 ## Conclusion
 
-This project successfully demonstrates that sophisticated aircraft tracking and collision avoidance capabilities can be achieved using commodity hardware and open-source software. Starting with a $35 Raspberry Pi and $25 RTL-SDR dongle, we built a system that rivals commercial ADS-B tracking platforms in functionality while remaining accessible to general aviation, researchers, and aviation enthusiasts.
+This project successfully demonstrates that sophisticated aircraft tracking and collision avoidance capabilities can be achieved using commodity hardware and open-source software. Starting with Raspberry Pi and RTL-SDR dongle, we built a system that rivals commercial ADS-B tracking platforms in functionality while remaining accessible to general aviation, researchers, and aviation enthusiasts.
 
 ### Technical Achievements
 

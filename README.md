@@ -663,33 +663,26 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ### Saksham Gupta
 <img src="saksham.png" width="150" height="150" style="border-radius: 50%;">
 
-Saksham is a Master's student in Computer Science at the University of Illinois Urbana-Champaign, expected to graduate in May 2025. He is currently open to full-time new graduate roles.
+Saksham is a Master's student in Computer Science at the University of Illinois Urbana-Champaign, expected to graduate in May 2027. He is currently open to full-time new graduate roles.
 
-**Email:** sgupta99@illinois.edu
-**LinkedIn:** https://www.linkedin.com/in/saksham-gupta1/
+**Email:** saksham9@illinois.edu
+**LinkedIn:** https://www.linkedin.com/in/saksham---gupta/
 
 ---
 
-### Apoorv Lathey
+### Apoorv Sagar Pitta
 <img src="apoorv.png" width="150" height="150" style="border-radius: 50%;">
 
-Apoorv is a Master's student in Computer Science at the University of Illinois Urbana-Champaign, expected to graduate in May 2025. He is currently open to full-time new graduate roles.
+Apoorv is a Master's student in Computer Science at the University of Illinois Urbana-Champaign, expected to graduate in May 2027. He is currently open to full-time new graduate roles.
 
-**Email:** alathey2@illinois.edu
-**LinkedIn:** https://www.linkedin.com/in/apoorv-lathey/
+**Email:** apitt3@illinois.edu
+**LinkedIn:** https://www.linkedin.com/in/apoorv-sagar-pitta
 
 </div>
 
 ---
 
 *Advised by Professor David Lariviere*
-
-## 📧 Support
-
-For issues, questions, or contributions:
-- Open an issue on GitHub/GitLab
-- Check the [Troubleshooting](#troubleshooting) section
-- Review [DEPLOYMENT.md](DEPLOYMENT.md) for detailed setup instructions
 
 ## 🗺️ Roadmap
 
@@ -705,7 +698,3 @@ For issues, questions, or contributions:
 - [ ] Flight path prediction using ML
 
 ---
-
-**Built with ❤️ for aviation enthusiasts and ADS-B hobbyists**
-
-*Last updated: December 2025*

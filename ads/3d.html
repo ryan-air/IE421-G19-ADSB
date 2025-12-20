@@ -407,6 +407,113 @@
             border-color: #9aba9a;
         }
 
+        /* Aircraft list panel */
+        .aircraft-list-panel-3d {
+            position: fixed;
+            right: -320px;
+            top: 80px;
+            bottom: 20px;
+            width: 300px;
+            max-height: calc(100vh - 120px);
+            background: rgba(15, 20, 15, 0.95);
+            border: 2px solid #5a7a5a;
+            border-radius: 10px;
+            z-index: 1400;
+            transition: right 0.3s ease;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .aircraft-list-panel-3d.open {
+            right: 10px;
+        }
+
+        .aircraft-list-header-3d {
+            padding: 12px 15px;
+            border-bottom: 1px solid #5a7a5a;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(20, 30, 20, 0.9);
+        }
+
+        .aircraft-list-header-3d h3 {
+            color: #9aba9a;
+            font-size: 13px;
+            margin: 0;
+            font-family: 'Courier New', monospace;
+        }
+
+        .close-list-btn {
+            background: none;
+            border: none;
+            color: #7a9a7a;
+            font-size: 20px;
+            cursor: pointer;
+            padding: 0 5px;
+            line-height: 1;
+        }
+
+        .close-list-btn:hover {
+            color: #ff6666;
+        }
+
+        .aircraft-list-3d {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+
+        .aircraft-item-3d {
+            background: rgba(90, 122, 90, 0.15);
+            border: 1px solid #4a6a4a;
+            border-radius: 6px;
+            padding: 10px;
+            margin-bottom: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .aircraft-item-3d:hover {
+            background: rgba(122, 154, 122, 0.25);
+            border-color: #7a9a7a;
+            transform: translateX(4px);
+        }
+
+        .aircraft-item-header-3d {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+
+        .aircraft-callsign-3d {
+            color: #00ffff;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .aircraft-hex-3d {
+            color: #7a9a7a;
+            font-size: 9px;
+        }
+
+        .aircraft-details-3d {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+            font-size: 10px;
+        }
+
+        .aircraft-detail-3d {
+            color: #8aaa8a;
+        }
+
+        .aircraft-detail-3d strong {
+            color: #9aba9a;
+        }
+
         /* Mobile responsive styles */
         @media (max-width: 768px) {
             .top-header {
@@ -501,6 +608,21 @@
             .info-panel .info-content {
                 font-size: 10px;
             }
+
+            /* Adjust panels to avoid mobile controls overlap */
+            .statistics-panel-3d.open {
+                right: 10px;
+                top: 145px;
+                bottom: 200px;
+                max-height: calc(100vh - 365px);
+            }
+
+            .aircraft-list-panel-3d.open {
+                right: 10px;
+                top: 145px;
+                bottom: 200px;
+                max-height: calc(100vh - 365px);
+            }
         }
 
         @media (max-width: 480px) {
@@ -543,6 +665,23 @@
                 max-width: 160px;
                 max-height: 120px;
                 padding: 8px;
+            }
+
+            /* Further adjust panels for smaller screens */
+            .statistics-panel-3d.open {
+                top: 120px;
+                bottom: 180px;
+                max-height: calc(100vh - 320px);
+                width: calc(100vw - 20px);
+                right: 10px;
+            }
+
+            .aircraft-list-panel-3d.open {
+                top: 120px;
+                bottom: 180px;
+                max-height: calc(100vh - 320px);
+                width: calc(100vw - 20px);
+                right: 10px;
             }
         }
 
@@ -755,8 +894,12 @@
                 <span class="stat-value" id="aircraft-count">0</span>
             </div>
             <div class="stat-inline">
+                <span class="stat-label">Update:</span>
+                <span class="stat-value" id="last-update">--</span>
+            </div>
+            <div class="stat-inline">
                 <span class="stat-label">Collisions:</span>
-                <span class="stat-value" id="collision-count">0</span>
+                <span class="stat-value" id="collision-count" style="color: #ff8800;">0</span>
             </div>
         </div>
     </header>
@@ -780,6 +923,7 @@
             <button id="toggle-terrain" class="control-button">Terrain</button>
             <button id="toggle-probability-cones" class="control-button" onclick="toggleProbabilityCones()">⚪ Prediction Cones</button>
             <button id="toggle-grounded" class="control-button" onclick="toggleHideGroundedPlanes()">⚪ Hide Grounded</button>
+            <button id="toggle-list" class="control-button" onclick="toggleAircraftList()">📋 Aircraft List</button>
             <button id="toggle-statistics" class="control-button" onclick="toggleStatistics()">📊 Stats</button>
             <button id="reset-view" class="control-button">Reset View</button>
             <button class="control-button" onclick="window.location.href='index.html'" style="background: rgba(0, 180, 180, 0.2); border-color: #00aaaa; color: #00ffff;">← 2D View</button>
@@ -801,6 +945,15 @@
         <div id="statistics-content" class="statistics-content-3d">
             <div class="loading-state">Loading statistics...</div>
         </div>
+    </div>
+
+    <!-- Aircraft list panel -->
+    <div id="aircraft-list-panel" class="aircraft-list-panel-3d">
+        <div class="aircraft-list-header-3d">
+            <h3>📋 Aircraft List</h3>
+            <button class="close-list-btn" onclick="toggleAircraftList()">×</button>
+        </div>
+        <div id="aircraft-list" class="aircraft-list-3d"></div>
     </div>
 
     <!-- Follow mode hint -->

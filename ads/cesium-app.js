@@ -1,5 +1,5 @@
-// Import probability cone module
-import { ProbabilityCone } from './probability-cone.js';
+// Probability cones are now computed server-side for performance
+// No need to import ProbabilityCone module client-side anymore
 
 // Set your Cesium Ion access token
 Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI5MDdjYmVjNC05NjZiLTQxZDMtYjA1YS00ZmI3ZjA2ZjRiYjQiLCJpZCI6MzY5MDk5LCJpYXQiOjE3NjU1MjUxMDZ9.vixLzkzcNmRUX1wvntDVQ9If5gVlx5ufYNo4Fytsh8A';
@@ -450,9 +450,11 @@ function clearTrails() {
 }
 
 // Fetch and update aircraft data
+// NEW: Use enriched endpoint with server-computed probability cones
 async function fetchAircraftData() {
     try {
-        const response = await fetch('/api/aircraft?window=0');
+        // Use enriched endpoint that includes trails and pre-computed probability cones
+        const response = await fetch('/api/aircraft/enriched?window=0&trails=true&cones=true');
         if (!response.ok) {
             throw new Error('Failed to fetch aircraft data');
         }
@@ -462,6 +464,16 @@ async function fetchAircraftData() {
         document.getElementById('aircraft-count').textContent = data.aircraft?.length || 0;
 
         currentAircraftData = data.aircraft || []; // Store for collision line updates
+
+        // Log cache performance
+        if (data.cacheStats) {
+            console.log(`📦 Cache: ${data.cacheStats.hitRate} hit rate, ${data.cacheStats.size} entries`);
+        }
+
+        // Log enriched data stats
+        if (data.stats) {
+            console.log(`📊 Enriched data: ${data.stats.total} aircraft, ${data.stats.withTrails} with trails, ${data.stats.withCones} with cones`);
+        }
 
         // Debug: Log vertical rate statistics
         const vrStats = currentAircraftData.reduce((acc, ac) => {
@@ -484,6 +496,12 @@ async function fetchAircraftData() {
         }
 
         updateAircraftOn3DGlobe(currentAircraftData);
+
+        // Update aircraft list if it's open
+        const listPanel = document.getElementById('aircraft-list-panel');
+        if (listPanel && listPanel.classList.contains('open')) {
+            updateAircraftList();
+        }
     } catch (error) {
         console.error('Error fetching aircraft data:', error);
         updateStatus(false, 'Connection Error');
@@ -571,12 +589,14 @@ function updateAircraftOn3DGlobe(aircraftData) {
 // Kalman filter-based collision detection and probability cone visualization
 let collisionLines = [];
 let probabilityCones = [];
+let probabilityConesByHex = new Map(); // Track cones by aircraft hex for efficient updates
 let showProbabilityCones = false;
 let hideGroundedPlanes = false;
 let showStatistics = false;
 let collisionInterval;
 let statisticsInterval;
 let isUpdatingCones = false; // Prevent concurrent cone updates
+let lastConeUpdateTimestamp = 0; // Track when we last updated cones to prevent unnecessary refreshes
 
 // Fetch and display collisions with probability cones
 async function fetchCollisions() {
@@ -729,27 +749,18 @@ function displayCollisions3D(collisions) {
 }
 
 // Fetch and display probability cones for all aircraft
+// NEW: Simplified - uses server-computed cones from enriched endpoint
 async function fetchAndDisplayProbabilityCones() {
     if (!showProbabilityCones) {
         return;
     }
 
-    try {
-        // Get all active aircraft
-        const response = await fetch('/api/aircraft');
-        const data = await response.json();
-
-        // Extract aircraft array from response
-        const aircraft = Array.isArray(data) ? data : (data.aircraft || []);
-
-        // Fetch position history and generate cones for each aircraft
-        displayProbabilityCones(aircraft);
-    } catch (error) {
-        console.error('Error fetching probability cones:', error);
-    }
+    // Use currentAircraftData which now includes pre-computed probability cones
+    // No need to fetch separately - cones are already computed server-side
+    displayProbabilityCones(currentAircraftData);
 }
 
-// Display probability cones using Kalman filter predictions
+// NEW: Display probability cones using server-computed predictions
 async function displayProbabilityCones(aircraft) {
     // Check if we should show cones BEFORE doing anything
     if (!showProbabilityCones || !aircraft || aircraft.length === 0) {
@@ -762,13 +773,27 @@ async function displayProbabilityCones(aircraft) {
         return;
     }
 
+    // Use the server's 'now' timestamp to detect when data actually changes
+    // This prevents unnecessary updates while still allowing smooth refreshes
+    const dataTimestamp = Date.now();
+    const timeSinceLastUpdate = dataTimestamp - lastConeUpdateTimestamp;
+
+    // Only update if enough time has passed (2 seconds) OR if we have no cones yet
+    // This matches the server cache TTL and prevents flickering
+    if (timeSinceLastUpdate < 2000 && probabilityCones.length > 0) {
+        // Too soon since last update, skip to prevent flickering
+        return;
+    }
+
     isUpdatingCones = true;
 
     try {
         let conesCreated = 0;
-        const predictionTime = 300; // 5 minutes
+        let conesUpdated = 0;
+        let conesReused = 0;
         const numSegments = 16; // Number of segments around the cone edge
         const newCones = []; // Build new cones in temporary array
+        const processedHexCodes = new Set(); // Track which aircraft we've processed
 
         // Process each aircraft
         for (const ac of aircraft) {
@@ -777,31 +802,48 @@ async function displayProbabilityCones(aircraft) {
                 console.log('⏹️ Cones toggled off - stopping cone creation');
                 break;
             }
-            
+
             if (!ac.lat || !ac.lon || !ac.hex) continue;
 
             try {
-                // Fetch position history for this aircraft
-                const historyResponse = await fetch(`http://localhost:3000/api/aircraft/${ac.hex}/trail?window=30`);
-                if (!historyResponse.ok) continue;
-                
-                // Check again after async fetch
-                if (!showProbabilityCones) break;
+                // Use server-computed probability cone (no need to fetch or compute client-side!)
+                const predictions = ac.probabilityCone;
 
-                const historyData = await historyResponse.json();
-                const positionHistory = historyData.trail || [];
+                // Skip if no predictions available from server
+                if (!predictions || predictions.length === 0) continue;
 
-                // Create probability cone with Kalman filter
-                const cone = new ProbabilityCone(
-                    ac,
-                    positionHistory,
-                    predictionTime,
-                    0.95 // 95% confidence
-                );
+                // Track that we've processed this aircraft
+                processedHexCodes.add(ac.hex);
 
-                // Get prediction points from Kalman filter
-                const predictions = cone.getPredictionPoints();
-                if (predictions.length === 0) continue;
+                // Check if we already have cones for this aircraft
+                const existingConeData = probabilityConesByHex.get(ac.hex);
+
+                // If cones exist and predictions haven't changed significantly, reuse them
+                if (existingConeData && existingConeData.predictions) {
+                    const lastPred = existingConeData.predictions[existingConeData.predictions.length - 1];
+                    const currentLastPred = predictions[predictions.length - 1];
+
+                    // Check if predictions are similar (within 100m in lat/lon/alt)
+                    const latDiff = Math.abs(lastPred.lat - currentLastPred.lat);
+                    const lonDiff = Math.abs(lastPred.lon - currentLastPred.lon);
+                    const altDiff = Math.abs(lastPred.altitude - currentLastPred.altitude);
+
+                    // If predictions haven't changed much, reuse existing cones
+                    if (latDiff < 0.001 && lonDiff < 0.001 && altDiff < 100) {
+                        // Reuse existing cone entities
+                        conesReused++;
+                        continue;
+                    } else {
+                        // Predictions changed - remove old cones for this aircraft
+                        if (existingConeData.entities) {
+                            existingConeData.entities.forEach(entity => viewer.entities.remove(entity));
+                        }
+                        conesUpdated++;
+                    }
+                }
+
+                // Create new cone entities for this aircraft
+                const aircraftConeEntities = [];
 
                 const altitude = ac.altitude || 10000;
                 const altitudeMeters = altitude * 0.3048;
@@ -877,14 +919,11 @@ async function displayProbabilityCones(aircraft) {
                 // Use the radius from Kalman filter uncertainty
                 const coneRadius = lastPrediction.radius;
 
-                // MIRROR FIX: The Kalman/ECEF pipeline produces backwards predictions
-                // Flip the predicted position across the current position
-                // correctedFuture = 2 * current - predicted
-                const futurePosition = new Cesium.Cartesian3();
-                Cesium.Cartesian3.multiplyByScalar(apexPosition, 2, futurePosition);
-                Cesium.Cartesian3.subtract(futurePosition, predictedPosition, futurePosition);
+                // Server-computed predictions are already correct - use them directly!
+                // No need for mirror fix anymore since Kalman filter runs server-side
+                const futurePosition = predictedPosition;
 
-                // Direction from current position to corrected future position
+                // Direction from current position to future position
                 const actualDirection = Cesium.Cartesian3.subtract(futurePosition, apexPosition, new Cesium.Cartesian3());
 
                 // Debug: Log positions for one aircraft to check direction
@@ -937,6 +976,7 @@ async function displayProbabilityCones(aircraft) {
                             perPositionHeight: true
                         }
                     });
+                    aircraftConeEntities.push(coneSegment);
                     newCones.push(coneSegment);
                 }
 
@@ -948,6 +988,7 @@ async function displayProbabilityCones(aircraft) {
                         material: color.withAlpha(0.8)
                     }
                 });
+                aircraftConeEntities.push(centerLine);
                 newCones.push(centerLine);
 
                 // Cone base outline
@@ -958,6 +999,7 @@ async function displayProbabilityCones(aircraft) {
                         material: color.withAlpha(0.5)
                     }
                 });
+                aircraftConeEntities.push(coneOutline);
                 newCones.push(coneOutline);
 
                 // Edge lines from apex to base (every 4th point)
@@ -969,8 +1011,15 @@ async function displayProbabilityCones(aircraft) {
                             material: color.withAlpha(0.3)
                         }
                     });
+                    aircraftConeEntities.push(edgeLine);
                     newCones.push(edgeLine);
                 }
+
+                // Store cone entities and predictions for this aircraft
+                probabilityConesByHex.set(ac.hex, {
+                    entities: aircraftConeEntities,
+                    predictions: predictions
+                });
 
                 conesCreated++;
             } catch (error) {
@@ -986,11 +1035,31 @@ async function displayProbabilityCones(aircraft) {
             return;
         }
 
-        // Now remove old cones and replace with new ones atomically
-        probabilityCones.forEach(entity => viewer.entities.remove(entity));
+        // Remove cones for aircraft that are no longer present
+        let conesRemoved = 0;
+        for (const [hex, coneData] of probabilityConesByHex.entries()) {
+            if (!processedHexCodes.has(hex)) {
+                // Aircraft no longer exists - remove its cones
+                if (coneData.entities) {
+                    coneData.entities.forEach(entity => viewer.entities.remove(entity));
+                }
+                probabilityConesByHex.delete(hex);
+                conesRemoved++;
+            }
+        }
+
+        // Update the global array with all current cones
         probabilityCones = newCones;
 
-    console.log(`📊 Displayed ${conesCreated} Kalman filter probability cones for ${aircraft.length} aircraft`);
+        // Update timestamp to track this cone generation
+        lastConeUpdateTimestamp = dataTimestamp;
+
+        // Log update statistics
+        if (conesCreated > 0 || conesUpdated > 0 || conesRemoved > 0) {
+            console.log(`📊 Cones: ${conesCreated} created, ${conesUpdated} updated, ${conesReused} reused, ${conesRemoved} removed`);
+        } else if (conesReused > 0) {
+            console.log(`📊 Cones: ${conesReused} reused (no changes needed)`);
+        }
 
     } finally {
         // Reset the flag to allow next update
@@ -1010,7 +1079,17 @@ function toggleProbabilityCones() {
             try { viewer.entities.remove(entity); } catch(e) {}
         });
         probabilityCones = [];
-        
+
+        // Clear the hex-based tracking map and remove all associated entities
+        for (const [hex, coneData] of probabilityConesByHex.entries()) {
+            if (coneData.entities) {
+                coneData.entities.forEach(entity => {
+                    try { viewer.entities.remove(entity); } catch(e) {}
+                });
+            }
+        }
+        probabilityConesByHex.clear();
+
         // Also remove any cone entities that might have been added during an in-progress update
         // by scanning all entities and removing ones with "Cone:" prefix
         const entitiesToRemove = [];
@@ -1022,7 +1101,7 @@ function toggleProbabilityCones() {
         entitiesToRemove.forEach(entity => {
             try { viewer.entities.remove(entity); } catch(e) {}
         });
-        
+
         console.log(`🗑️ Removed ${entitiesToRemove.length} cone entities`);
     }
 
@@ -1061,14 +1140,18 @@ function toggleStatistics() {
     if (panel) {
         panel.classList.toggle('open', showStatistics);
     }
-    
+
     const button = document.getElementById('toggle-statistics');
     if (button) {
         button.textContent = showStatistics ? '📊 Stats ✓' : '📊 Stats';
     }
-    
-    // Fetch immediately when opening
+
+    // Close aircraft list panel if statistics is being opened (both on right side)
     if (showStatistics) {
+        const listPanel = document.getElementById('aircraft-list-panel');
+        if (listPanel && listPanel.classList.contains('open')) {
+            toggleAircraftList();
+        }
         fetchStatistics();
     }
 }
@@ -1125,9 +1208,9 @@ function updateStatisticsDashboard(data) {
         `;
     }).join('');
 
-    // Build flight durations list (top 10)
-    const topFlights = flight_durations.slice(0, 10);
-    const durationsHTML = topFlights.map(item => {
+    // Build flight durations list (all active flights)
+    const allFlights = flight_durations;
+    const durationsHTML = allFlights.map(item => {
         return `
             <div class="duration-item-3d">
                 <span class="duration-flight-3d">${item.flight || item.hex}</span>
@@ -1158,12 +1241,97 @@ function updateStatisticsDashboard(data) {
         </div>
 
         <div class="stats-section-3d">
-            <h4>Flight Durations (Top 10)</h4>
+            <h4>Flight Durations (All Active)</h4>
             <div class="durations-list-3d">
                 ${durationsHTML}
             </div>
         </div>
     `;
+}
+
+// Aircraft list functions
+function toggleAircraftList() {
+    const panel = document.getElementById('aircraft-list-panel');
+    if (!panel) return;
+
+    const isOpen = panel.classList.contains('open');
+    panel.classList.toggle('open', !isOpen);
+
+    const button = document.getElementById('toggle-list');
+    if (button) {
+        button.textContent = !isOpen ? '📋 Aircraft List ✓' : '📋 Aircraft List';
+    }
+
+    // Close statistics panel if aircraft list is being opened (both on right side)
+    if (!isOpen) {
+        const statsPanel = document.getElementById('statistics-panel');
+        if (statsPanel && statsPanel.classList.contains('open')) {
+            toggleStatistics();
+        }
+        updateAircraftList();
+    }
+}
+
+// Update aircraft list panel
+function updateAircraftList() {
+    const listElement = document.getElementById('aircraft-list');
+    if (!listElement) return;
+
+    if (!currentAircraftData || currentAircraftData.length === 0) {
+        listElement.innerHTML = '<div class="loading-state">No aircraft detected</div>';
+        return;
+    }
+
+    // Sort by altitude (descending)
+    const sortedAircraft = [...currentAircraftData].sort((a, b) => (b.altitude || 0) - (a.altitude || 0));
+
+    const html = sortedAircraft.map(ac => {
+        const callsign = ac.flight ? ac.flight.trim() : 'N/A';
+        const hex = ac.hex || 'Unknown';
+        const altitude = ac.altitude ? `${Math.round(ac.altitude)} ft` : 'N/A';
+        const speed = ac.speed ? `${Math.round(ac.speed)} kts` : 'N/A';
+        const heading = ac.track !== null && ac.track !== undefined ? `${Math.round(ac.track)}°` : 'N/A';
+        const vRate = ac.vertical_rate ? `${ac.vertical_rate > 0 ? '+' : ''}${ac.vertical_rate} fpm` : 'Level';
+
+        return `
+            <div class="aircraft-item-3d" onclick="focusOnAircraft('${hex}')">
+                <div class="aircraft-item-header-3d">
+                    <span class="aircraft-callsign-3d">${callsign}</span>
+                    <span class="aircraft-hex-3d">${hex}</span>
+                </div>
+                <div class="aircraft-details-3d">
+                    <div class="aircraft-detail-3d"><strong>Alt:</strong> ${altitude}</div>
+                    <div class="aircraft-detail-3d"><strong>Spd:</strong> ${speed}</div>
+                    <div class="aircraft-detail-3d"><strong>Hdg:</strong> ${heading}</div>
+                    <div class="aircraft-detail-3d"><strong>V/S:</strong> ${vRate}</div>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    listElement.innerHTML = html;
+}
+
+// Focus camera on specific aircraft
+function focusOnAircraft(hex) {
+    const aircraft = currentAircraftData.find(ac => ac.hex === hex);
+    if (!aircraft || !aircraft.lat || !aircraft.lon) return;
+
+    const altitude = (aircraft.altitude || 10000) * 0.3048; // Convert to meters
+    const position = Cesium.Cartesian3.fromDegrees(aircraft.lon, aircraft.lat, altitude);
+
+    // Fly to aircraft with nice animation - use lookAt for proper offset
+    const distance = 100000; // 100km distance
+    const pitch = Cesium.Math.toRadians(-30);
+    const heading = Cesium.Math.toRadians(aircraft.track || 0);
+
+    viewer.camera.flyToBoundingSphere(
+        new Cesium.BoundingSphere(position, 1),
+        {
+            duration: 2,
+            offset: new Cesium.HeadingPitchRange(heading, pitch, distance)
+        }
+    );
 }
 
 // Create airport icon as a data URL
@@ -1363,6 +1531,19 @@ function updateStatus(connected, text) {
     if (connected) {
         indicator.className = 'status-dot connected';
         statusText.textContent = text || 'Connected';
+
+        // Update last update timestamp
+        const now = new Date();
+        const timeString = now.toLocaleTimeString('en-US', {
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
+        const lastUpdateElement = document.getElementById('last-update');
+        if (lastUpdateElement) {
+            lastUpdateElement.textContent = timeString;
+        }
     } else {
         indicator.className = 'status-dot disconnected';
         statusText.textContent = text || 'Disconnected';
@@ -1584,6 +1765,8 @@ function stopPolling() {
 window.toggleProbabilityCones = toggleProbabilityCones;
 window.toggleHideGroundedPlanes = toggleHideGroundedPlanes;
 window.toggleStatistics = toggleStatistics;
+window.toggleAircraftList = toggleAircraftList;
+window.focusOnAircraft = focusOnAircraft;
 
 // Initialize
 updateStatus(false, 'Connecting...');

@@ -1,5 +1,18 @@
 # ADS-B Aircraft Tracking System - Technical Project Report
 
+**Authors:** Saksham Gupta & Apoorv Sagar Pitta  
+**Course:** IE 421 - University of Illinois Urbana-Champaign  
+**Advisor:** Professor David Lariviere  
+**Date:** December 2025
+
+---
+
+## 🎥 Project Demo Video
+
+**[Watch the Demo Video](https://youtu.be/2cJiwRZ4pls)**
+
+---
+
 ## Introduction
 
 ### Motivation

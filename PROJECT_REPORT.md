@@ -9,7 +9,7 @@
 
 ## 🎥 Project Demo Video
 
-**[Watch the Demo Video](https://youtu.be/2cJiwRZ4pls)**
+**[Watch the Demo Video](https://uofi.app.box.com/file/2081516558093)**
 
 ---
 

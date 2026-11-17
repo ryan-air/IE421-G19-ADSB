@@ -60,11 +60,11 @@ Use WSL2 with Ubuntu 24.04 and follow the Ubuntu steps. Native MSVC is not suppo
 ## 3. Clone, build, and run the tests
 
 ```bash
-git clone https://github.com/ryan-air/IE421-G9-ADSB.git
+git clone https://github.com/ryan-air/IE421-G19-ADSB.git
 ```
 
 ```bash
-cd IE421-G9-ADSB/core
+cd IE421-G19-ADSB/core
 ```
 
 ```bash

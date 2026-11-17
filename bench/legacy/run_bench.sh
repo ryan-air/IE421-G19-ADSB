@@ -11,12 +11,15 @@
 #   SCENARIOS  fleet sizes to run         (default "50 200 1000 3000")
 #   DURATION   seconds of traffic per run (default 120)
 #   SEED       synthetic traffic seed     (default 2025)
+#   KEEP_RAW   1 = keep each run's raw logs after analysis (they reach several
+#              hundred MB per run at high load; default 0 deletes them)
 
 set -uo pipefail
 
 SCENARIOS="${SCENARIOS:-50 200 1000 3000}"
 DURATION="${DURATION:-120}"
 SEED="${SEED:-2025}"
+KEEP_RAW="${KEEP_RAW:-0}"
 DRAIN=8                 # seconds to let the old pipeline catch up after the last frame
 RX_LAT=40.0392          # Willard Airport (the generator's default receiver)
 RX_LON=-88.2781
@@ -131,8 +134,16 @@ for N in $SCENARIOS; do
   "$REPLAY" "$D/traffic.adsbrec" --out "$D/new_updates.bin" --hash-only > /dev/null
 
   # 8. Analyze this scenario.
-  python3 /repo/bench/legacy/analyze.py scenario "$D" > "$D/summary.txt" || { log "analysis failed"; cat "$D/summary.txt"; }
-  cat "$D/summary.txt"
+  if python3 /repo/bench/legacy/analyze.py scenario "$D" > "$D/summary.txt"; then
+    cat "$D/summary.txt"
+    # Raw logs are large; metrics.json and summary.txt keep the results.
+    if [[ "$KEEP_RAW" != "1" ]]; then
+      rm -f "$D"/{traffic.adsbrec,truth.csv,sbs.csv,db.csv,api.csv,api_snapshots.csv,new_updates.bin}
+    fi
+  else
+    log "analysis failed (raw logs kept in $D)"
+    cat "$D/summary.txt"
+  fi
 done
 
 python3 /repo/bench/legacy/analyze.py report "$OUT" > "$OUT/report.md"

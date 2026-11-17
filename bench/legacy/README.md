@@ -8,7 +8,7 @@ SCENARIOS="6000" bench/legacy/run.sh                   # heavier load: needs ~2 
 SCENARIOS="50 200" DURATION=60 bench/legacy/run.sh    # quick run
 ```
 
-Requires Docker and about 2 GB of free disk. Results go to `bench/results/legacy-baseline/`; raw logs stay in `bench/legacy/out/` (not committed).
+Requires Docker and about 2 GB of free disk. Results go to `bench/results/legacy-baseline/`. Each run's raw logs are deleted once analyzed; set `KEEP_RAW=1` to keep them in `bench/legacy/out/` (not committed).
 
 ## What runs
 

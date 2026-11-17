@@ -5,8 +5,6 @@
   "node": "v18.19.1",
   "kernel": "Linux 6.10.14-linuxkit",
   "cpus": 8,
-  "scenarios": "50 200 1000 3000",
-  "duration_s": 120,
-  "seed": 2025,
-  "repo_commit": "2e9373c"
+  "scenarios": "50 200 1000 3000 6000", "duration_s": 120, "seed": 2025,
+  "repo_commit": "a559ef2"
 }

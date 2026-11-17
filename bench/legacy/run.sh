@@ -17,6 +17,7 @@ docker compose run --rm \
   -e SCENARIOS="${SCENARIOS:-50 200 1000 3000}" \
   -e DURATION="${DURATION:-120}" \
   -e SEED="${SEED:-2025}" \
+  -e KEEP_RAW="${KEEP_RAW:-0}" \
   bench
 mkdir -p "$RESULTS"
 cp out/report.md out/environment.json "$RESULTS/"

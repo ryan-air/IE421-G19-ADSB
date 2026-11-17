@@ -1,1 +1,1 @@
-50 aircraft: readsb p50 27 ms | DB p50 567 / p99 1,122 ms | API p50 548 ms | browser p50 1,576 ms | DB coverage 17% | map error p50 352 m | cpu {'readsb': 0.012, 'adsb_streamer_optimized.py': 0.017, 'server.js': 0.044}
+50 aircraft: readsb p50 27 ms | DB p50 570 / p99 1,108 ms | API p50 567 ms | browser p50 1,574 ms | DB coverage 17% | map error p50 344 m | cpu {'readsb': 0.009, 'adsb_streamer_optimized.py': 0.012, 'server.js': 0.039}

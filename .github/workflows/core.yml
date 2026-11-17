@@ -1,0 +1,122 @@
+name: core
+
+on:
+  push:
+    paths:
+      - "core/**"
+      - ".github/workflows/core.yml"
+  pull_request:
+    paths:
+      - "core/**"
+      - ".github/workflows/core.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: core-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: core
+
+jobs:
+  test:
+    name: ${{ matrix.compiler }} / ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        preset: [debug, asan, tsan, release]
+    env:
+      CXX: ${{ matrix.compiler == 'gcc' && 'g++-14' || 'clang++-18' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 clang-18
+
+      # Kernels >= 6.5 use 32 bits of mmap ASLR entropy, which older
+      # sanitizer runtimes cannot handle ("unexpected memory mapping").
+      - name: Reduce ASLR entropy for sanitizers
+        if: matrix.preset == 'asan' || matrix.preset == 'tsan'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -G Ninja -DADSB_WERROR=ON
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+  fuzz:
+    name: libFuzzer smoke (60 s per target)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-18 libclang-rt-18-dev
+          sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Build fuzzers
+        run: |
+          cmake --preset fuzz -G Ninja -DCMAKE_CXX_COMPILER=clang++-18 -DADSB_WERROR=ON
+          cmake --build --preset fuzz
+
+      - name: Fuzz
+        run: |
+          for target in beast decoder; do
+            mkdir -p "/tmp/corpus_$target"
+            cp fuzz/corpus/$target/* "/tmp/corpus_$target/"
+            ./build/fuzz/fuzz/fuzz_$target -max_total_time=60 -print_final_stats=1 \
+              "/tmp/corpus_$target"
+          done
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: core/crash-*
+
+  bench-build:
+    name: benchmarks build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14
+      - name: Build
+        env:
+          CXX: g++-14
+        run: |
+          cmake --preset bench -G Ninja -DADSB_WERROR=ON
+          cmake --build --preset bench
+      # CI runners are shared VMs, so numbers are not meaningful; this only
+      # checks that the benchmarks run.
+      - name: Smoke run
+        run: ./build/bench/bench/adsb_bench --benchmark_min_time=0.01s
+
+  host-check:
+    name: check-host.sh
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: bash -n scripts/check-host.sh
+      - name: Run (must not write to stderr)
+        run: |
+          ./scripts/check-host.sh 2> /tmp/err.txt
+          cat /tmp/err.txt
+          test ! -s /tmp/err.txt
+          ./scripts/check-host.sh --json 2> /tmp/err.txt | python3 -m json.tool > /dev/null
+          test ! -s /tmp/err.txt

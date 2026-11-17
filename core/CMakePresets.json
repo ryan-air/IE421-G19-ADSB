@@ -1,0 +1,102 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "ADSB_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "asan",
+      "displayName": "Debug + AddressSanitizer + UBSan",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ADSB_SANITIZE": "address;undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "RelWithDebInfo + ThreadSanitizer",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ADSB_SANITIZE": "thread"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "bench",
+      "displayName": "Release + native CPU + LTO + benchmarks",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ADSB_BUILD_TESTS": "OFF",
+        "ADSB_BUILD_BENCH": "ON",
+        "ADSB_NATIVE": "ON",
+        "ADSB_LTO": "ON"
+      }
+    },
+    {
+      "name": "fuzz",
+      "displayName": "Fuzz targets (libFuzzer, needs LLVM clang)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "ADSB_BUILD_TESTS": "OFF",
+        "ADSB_BUILD_FUZZ": "ON",
+        "ADSB_FUZZ_ENGINE": "libfuzzer",
+        "ADSB_SANITIZE": "address;undefined"
+      }
+    },
+    {
+      "name": "fuzz-standalone",
+      "displayName": "Fuzz targets (portable driver, e.g. Apple clang)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ADSB_BUILD_TESTS": "OFF",
+        "ADSB_BUILD_FUZZ": "ON",
+        "ADSB_FUZZ_ENGINE": "standalone",
+        "ADSB_SANITIZE": "address;undefined"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug",           "configurePreset": "debug" },
+    { "name": "asan",            "configurePreset": "asan" },
+    { "name": "tsan",            "configurePreset": "tsan" },
+    { "name": "release",         "configurePreset": "release" },
+    { "name": "bench",           "configurePreset": "bench" },
+    { "name": "fuzz",            "configurePreset": "fuzz" },
+    { "name": "fuzz-standalone", "configurePreset": "fuzz-standalone" }
+  ],
+  "testPresets": [
+    {
+      "name": "test-base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    { "name": "debug",   "inherits": "test-base", "configurePreset": "debug" },
+    { "name": "asan",    "inherits": "test-base", "configurePreset": "asan" },
+    { "name": "tsan",    "inherits": "test-base", "configurePreset": "tsan" },
+    { "name": "release", "inherits": "test-base", "configurePreset": "release" }
+  ]
+}

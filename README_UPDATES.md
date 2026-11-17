@@ -2,6 +2,8 @@
 
 This document describes how we are extending the Fall 2025 **ADS-B Aircraft Tracking System** (see [README.md](README.md) and [PROJECT_REPORT.md](PROJECT_REPORT.md)) into a low-latency, HFT-style system. The original README still documents the existing system. This file documents **what we are changing, how, and how we will measure it**.
 
+> **Team setup:** to build and test the new code, start with [SETUP.md](SETUP.md).
+
 > **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed, and own the whole path from **antenna to published decision**. We demodulate the radio samples ourselves, merge redundant A/B receiver lines, decode and maintain state on a lock-free pinned-core pipeline, and publish over kernel UDP, io_uring, AF_XDP, or shared memory. Every segment is measured in cycles and nanoseconds against hardware timestamps. We then show that the same infrastructure handles a real exchange feed (**Nasdaq ITCH 5.0**) at tens of millions of messages per second.
 
 ---
@@ -514,7 +516,7 @@ group_19_project/
 | Reference libraries | Abseil `flat_hash_map` (benchmark baseline only), pyModeS |
 | Fusion | Python 3.11, OpenCV, NumPy, ONNX Runtime |
 | Profiling | `perf`, `ftrace`, `bpftrace` |
-| CI | GitLab CI: build, unit tests, oracle diffs, determinism hash, fuzz smoke run, TLC model check, nightly simulation runs |
+| CI | GitHub Actions ([`.github/workflows/core.yml`](.github/workflows/core.yml)): GCC + Clang × debug/ASan/TSan/release, libFuzzer smoke run, benchmark build; later: oracle diffs, determinism hash, TLC model check, nightly simulation runs |
 
 **Platform note:** macOS can be used to edit and to run unit tests, but **all latency numbers come from Linux**. macOS has no hard thread affinity, no `isolcpus`, no AF_XDP, and no `perf`.
 

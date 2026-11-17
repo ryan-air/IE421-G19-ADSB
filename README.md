@@ -1,6 +1,6 @@
 # ADS-B Aircraft Tracking System
 
-> ⚠️ **To be updated:** This document describes the Fall 2025 system and needs to be updated for the current project extension. See [README_UPDATES.md](README_UPDATES.md) for the new plan.
+> ⚠️ **To be updated:** This document describes the Fall 2025 system and needs to be updated for the current project extension. See [README_UPDATES.md](README_UPDATES.md) for the new plan, and [SETUP.md](SETUP.md) to build and test the new code.
 
 A real-time aircraft tracking system that captures ADS-B (Automatic Dependent Surveillance-Broadcast) data from aircraft, streams it to a cloud database, and visualizes it on an interactive web map.
 

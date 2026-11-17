@@ -25,3 +25,4 @@ endfunction()
 
 adsb_add_fuzzer(fuzz_beast)
 adsb_add_fuzzer(fuzz_decoder)
+adsb_add_fuzzer(fuzz_packet)

@@ -4,6 +4,17 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 
 > **Team setup:** to build and test the new code, start with [SETUP.md](SETUP.md).
 
+> **Status (November 2026):** built and tested in [`core/`](core/), [`protocol/`](protocol/) and [`spec/`](spec/):
+> - the M0 foundations (§19);
+> - the track state engine (Workstream D);
+> - feed spec v0 with generated C++/JS/Python code (§9.1);
+> - `.adsbrec` record/replay with the determinism check (§11.1–11.2);
+> - the synthetic load generator (§11.4) and the naive baseline build (§11.5);
+> - the TLA+ model of gap recovery (§12);
+> - the host tuning scripts (§18).
+>
+> Not started: the live ingest, publisher, and gateway (E), the arbiter (B), the demodulator (A), and fusion (I).
+
 > **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed, and own the whole path from **antenna to published decision**. We demodulate the radio samples ourselves, merge redundant A/B receiver lines, decode and maintain state on a lock-free pinned-core pipeline, and publish over kernel UDP, io_uring, AF_XDP, or shared memory. Every segment is measured in cycles and nanoseconds against hardware timestamps. We then show that the same infrastructure handles a real exchange feed (**Nasdaq ITCH 5.0**) at tens of millions of messages per second.
 
 ---

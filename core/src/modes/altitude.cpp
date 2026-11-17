@@ -73,4 +73,39 @@ std::optional<std::int32_t> decode_ac12(std::uint16_t ac12) noexcept {
   return decode_ac13(ac13);
 }
 
+std::uint16_t mode_a_to_id13(std::uint16_t a) noexcept {
+  std::uint16_t id = 0;
+  if (a & 0x0010) id |= 0x1000;  // C1
+  if (a & 0x1000) id |= 0x0800;  // A1
+  if (a & 0x0020) id |= 0x0400;  // C2
+  if (a & 0x2000) id |= 0x0200;  // A2
+  if (a & 0x0040) id |= 0x0100;  // C4
+  if (a & 0x4000) id |= 0x0080;  // A4
+  if (a & 0x0100) id |= 0x0020;  // B1
+  if (a & 0x0001) id |= 0x0010;  // D1
+  if (a & 0x0200) id |= 0x0008;  // B2
+  if (a & 0x0002) id |= 0x0004;  // D2
+  if (a & 0x0400) id |= 0x0002;  // B4
+  if (a & 0x0004) id |= 0x0001;  // D4
+  return id;
+}
+
+std::optional<std::uint16_t> encode_ac12(std::int32_t alt_ft) noexcept {
+  // N = round((alt + 1000) / 25), an 11-bit value.
+  const std::int32_t shifted = alt_ft + 1000;
+  if (shifted < 0) return std::nullopt;
+  const std::int32_t n = (shifted + 12) / 25;
+  if (n > 2047) return std::nullopt;
+  const auto un = static_cast<unsigned>(n);
+  // High 7 bits, then the Q bit, then the low 4 bits.
+  return static_cast<std::uint16_t>(((un & 0x7F0u) << 1) | 0x10u | (un & 0xFu));
+}
+
+std::optional<std::uint16_t> encode_ac13(std::int32_t alt_ft) noexcept {
+  const auto ac12 = encode_ac12(alt_ft);
+  if (!ac12) return std::nullopt;
+  // Insert M = 0 at bit 6.
+  return static_cast<std::uint16_t>(((*ac12 & 0x0FC0u) << 1) | (*ac12 & 0x003Fu));
+}
+
 }  // namespace adsb::modes

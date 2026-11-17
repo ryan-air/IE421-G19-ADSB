@@ -1,0 +1,46 @@
+{
+  "note": "64-bit integer fields are strings to avoid JSON precision loss",
+  "header": {
+    "session": "ADSB000001",
+    "seq": "1001",
+    "count": 2
+  },
+  "messages": [
+    {
+      "name": "TrackUpdate",
+      "fields": {
+        "msg_type": 85,
+        "version": 0,
+        "update_mask": 33,
+        "icao": 4735190,
+        "event_ts_ns": "1763337600123456789",
+        "radio_ts": "1152921504606846976",
+        "lat_e7": 522572021,
+        "lon_e7": 39193725,
+        "alt_ft": 38000,
+        "gs_dkt": 4500,
+        "track_cdeg": 18288,
+        "vrate_fpm": -832,
+        "squawk": 30464,
+        "callsign": "KLM1023 ",
+        "category": 160,
+        "nic": 0,
+        "flags": 0,
+        "reserved": 0,
+        "publish_ts_ns": "0"
+      }
+    },
+    {
+      "name": "TrackDelete",
+      "fields": {
+        "msg_type": 68,
+        "version": 0,
+        "reason": 1,
+        "reserved": 0,
+        "icao": 4735190,
+        "event_ts_ns": "1763337660123456789"
+      }
+    }
+  ],
+  "size": 104
+}

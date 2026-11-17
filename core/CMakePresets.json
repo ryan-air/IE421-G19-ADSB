@@ -53,6 +53,16 @@
       }
     },
     {
+      "name": "naive-baseline",
+      "displayName": "Release, naive baseline (mutex queues, std::unordered_map)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ADSB_NAIVE": "ON",
+        "ADSB_BUILD_BENCH": "ON"
+      }
+    },
+    {
       "name": "fuzz",
       "displayName": "Fuzz targets (libFuzzer, needs LLVM clang)",
       "inherits": "base",
@@ -84,6 +94,7 @@
     { "name": "tsan",            "configurePreset": "tsan" },
     { "name": "release",         "configurePreset": "release" },
     { "name": "bench",           "configurePreset": "bench" },
+    { "name": "naive-baseline",  "configurePreset": "naive-baseline" },
     { "name": "fuzz",            "configurePreset": "fuzz" },
     { "name": "fuzz-standalone", "configurePreset": "fuzz-standalone" }
   ],
@@ -97,6 +108,7 @@
     { "name": "debug",   "inherits": "test-base", "configurePreset": "debug" },
     { "name": "asan",    "inherits": "test-base", "configurePreset": "asan" },
     { "name": "tsan",    "inherits": "test-base", "configurePreset": "tsan" },
-    { "name": "release", "inherits": "test-base", "configurePreset": "release" }
+    { "name": "release", "inherits": "test-base", "configurePreset": "release" },
+    { "name": "naive-baseline", "inherits": "test-base", "configurePreset": "naive-baseline" }
   ]
 }

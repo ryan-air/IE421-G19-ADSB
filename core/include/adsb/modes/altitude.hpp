@@ -35,4 +35,14 @@ namespace adsb::modes {
 // Decodes a 12-bit ADS-B altitude field to feet.
 [[nodiscard]] std::optional<std::int32_t> decode_ac12(std::uint16_t ac12) noexcept;
 
+// ---- Encoders (used by the synthetic traffic generator and tests) ---------
+
+// Inverse of id13_to_mode_a: Mode A layout 0xABCD -> 13-bit ID field (X = 0).
+[[nodiscard]] std::uint16_t mode_a_to_id13(std::uint16_t mode_a) noexcept;
+
+// Encodes an altitude with the 25 ft Q-bit code (rounded to the nearest
+// 25 ft). nullopt outside the representable range [-1000, 50175] ft.
+[[nodiscard]] std::optional<std::uint16_t> encode_ac12(std::int32_t alt_ft) noexcept;
+[[nodiscard]] std::optional<std::uint16_t> encode_ac13(std::int32_t alt_ft) noexcept;
+
 }  // namespace adsb::modes

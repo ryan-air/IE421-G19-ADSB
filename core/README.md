@@ -1,24 +1,49 @@
-# `core/` — Low-Latency Pipeline Foundations
+# `core/` — Low-Latency Pipeline
 
-C++20 building blocks for the pipeline described in [README_UPDATES.md](../README_UPDATES.md). This is the Week 1–2 "M0 foundations" work, the shared pieces every workstream depends on:
+C++20 implementation of the pipeline described in [README_UPDATES.md](../README_UPDATES.md). For first-time setup see [SETUP.md](../SETUP.md).
+
+## What is here
+
+### Foundations (M0)
 
 | Component | Header | What it is |
 |---|---|---|
 | SPSC ring | [`adsb/common/spsc_ring.hpp`](include/adsb/common/spsc_ring.hpp) | Lock-free single-producer/single-consumer ring: cache-line-separated indices, cached remote index, acquire/release only, batch push/pop, zero-copy `front()`/`pop()` |
-| Latency histogram | [`adsb/common/histogram.hpp`](include/adsb/common/histogram.hpp) | Fixed-memory log-linear (HdrHistogram-style) histogram: 0.2% precision by default, exact min/max, nearest-rank percentiles, `merge()` across threads |
-| Clocks | [`adsb/common/clock.hpp`](include/adsb/common/clock.hpp) | `mono_ns()`, `ticks()` (TSC / `CNTVCT_EL0`), and a fixed-point `TickConverter` calibrated against the monotonic clock |
-| CRC-24 | [`adsb/modes/crc24.hpp`](include/adsb/modes/crc24.hpp) | Compile-time 1 KB table, frame syndrome, bit-by-bit reference implementation |
-| Altitude / squawk | [`adsb/modes/altitude.hpp`](include/adsb/modes/altitude.hpp) | AC12/AC13 altitude (25 ft Q-bit and Gillham Gray code), ID13 → squawk |
-| CPR | [`adsb/modes/cpr.hpp`](include/adsb/modes/cpr.hpp) | Global and local position decoding, airborne and surface, table-based NL (no trig on the hot path), encoder |
-| Mode S decoder | [`adsb/modes/decoder.hpp`](include/adsb/modes/decoder.hpp) | Stateless frame → fixed-size `DecodedMsg`: DF0/4/5/11/16/17/18/20/21/24; ADS-B TC 0–22 and 28 |
-| Beast parser | [`adsb/ingest/beast.hpp`](include/adsb/ingest/beast.hpp) | Resumable streaming parser for readsb/dump1090 Beast output (port 30005), handling escaping and resync, plus an encoder |
-| Host check | [`scripts/check-host.sh`](scripts/check-host.sh) | Reports hardware timestamping, AF_XDP zero-copy drivers, Intel RDT/CAT, isolation settings, SMT, TSC, RTL-SDRs, and so on |
+| Latency histogram | [`adsb/common/histogram.hpp`](include/adsb/common/histogram.hpp) | Fixed-memory log-linear (HdrHistogram-style) histogram: 0.2% precision, exact min/max, nearest-rank percentiles, `merge()` |
+| Clocks | [`adsb/common/clock.hpp`](include/adsb/common/clock.hpp) | `mono_ns()`, `ticks()` (TSC / `CNTVCT_EL0`), fixed-point `TickConverter` |
+| CRC-24 | [`adsb/modes/crc24.hpp`](include/adsb/modes/crc24.hpp) | Compile-time 1 KB table, frame syndrome, bitwise reference |
+| Altitude / squawk | [`adsb/modes/altitude.hpp`](include/adsb/modes/altitude.hpp) | AC12/AC13 (Q-bit and Gillham) decode and encode, ID13 ↔ squawk |
+| CPR | [`adsb/modes/cpr.hpp`](include/adsb/modes/cpr.hpp) | Global and local decoding, airborne and surface, table NL, encoder |
+| Mode S decoder | [`adsb/modes/decoder.hpp`](include/adsb/modes/decoder.hpp) | Frame → fixed-size `DecodedMsg`: DF0/4/5/11/16/17/18/20/21/24, ADS-B TC 0–22 and 28 |
+| Beast parser | [`adsb/ingest/beast.hpp`](include/adsb/ingest/beast.hpp) | Resumable Beast (port 30005) parser and encoder |
 
-Nothing here allocates on the hot path, throws, or takes a lock.
+### Data path (M1–M4 groundwork)
+
+| Component | Header | What it is |
+|---|---|---|
+| Frame encoders | [`adsb/modes/encoder.hpp`](include/adsb/modes/encoder.hpp) | The decoder's inverse: identification, airborne/surface position, velocity, DF11, DF4, DF5, with correct parity. Reproduces the published example frames byte for byte. |
+| Recording format | [`adsb/record/recording.hpp`](include/adsb/record/recording.hpp) | `.adsbrec`: header with receiver position, length-checked records, CRC-32 footer, mmap reader, recovery of truncated files |
+| Synthetic traffic | [`adsb/sim/synth.hpp`](include/adsb/sim/synth.hpp) | Aircraft on realistic paths around a receiver: DO-260B-like message rates, range-dependent loss, A/B receiver lines, corruption, per-line 12 MHz clocks with drift, and **ground truth** |
+| Track store | [`adsb/state/track_store.hpp`](include/adsb/state/track_store.hpp) | Open-addressing table (Fibonacci hash, backward-shift deletion) with a 64-byte hot record; `std::unordered_map` baseline with the same interface |
+| Track engine | [`adsb/state/track_engine.hpp`](include/adsb/state/track_engine.hpp) | CPR pairing, Address/Parity validation, duplicate filter, per-field out-of-order rejection, plausibility check with re-anchoring, timing-wheel expiry, `TrackUpdate`/`TrackDelete` output |
+| Feed messages | [`adsb/protocol/feed_messages.hpp`](include/adsb/protocol/feed_messages.hpp) | **Generated** from [`protocol/schema/feed_v0.json`](../protocol/schema/feed_v0.json); see [`protocol/feed_spec.md`](../protocol/feed_spec.md) |
+| MoldUDP64 framing | [`adsb/protocol/moldudp64.hpp`](include/adsb/protocol/moldudp64.hpp) | Packet builder, bounds-checked parser, subscriber `SequenceTracker` (gap / overlap / duplicate / heartbeat / new session) |
+| Replay | [`adsb/replay/replay.hpp`](include/adsb/replay/replay.hpp) | Inline and two-thread pipeline replay at max or paced speed, per-stage latency histograms, SHA-256 of the output stream |
+| Naive baseline | [`adsb/common/build_config.hpp`](include/adsb/common/build_config.hpp) | `-DADSB_NAIVE=ON` swaps `SpscRing` → mutex queue and the flat table → `std::unordered_map`. The pipeline code is identical. |
+
+### Tools and scripts
+
+| Tool | Purpose |
+|---|---|
+| `build/<preset>/tools/adsb-synth` | Generate synthetic traffic: `.adsbrec`, plus optional raw Beast stream and ground-truth CSV |
+| `build/<preset>/tools/adsb-replay` | Replay a recording through decode + track state: counters, output hash, optional pipeline latency |
+| [`scripts/check-host.sh`](scripts/check-host.sh) | Report a machine's low-latency capabilities (NIC timestamps, AF_XDP, RDT, isolation, ...) |
+| [`scripts/tune-host.sh`](scripts/tune-host.sh) | Put a Linux benchmark host into a reproducible tuned state (dry-run by default), and revert it |
+| [`scripts/check-determinism.sh`](scripts/check-determinism.sh) | Prove the determinism contract: identical output across speeds, threading, and optimized vs naive builds |
+
+Nothing on the hot path allocates, throws, or takes a lock (except deliberately, in the naive build).
 
 ## Build and test
-
-Requires CMake ≥ 3.24 and a C++20 compiler (GCC ≥ 12, Clang ≥ 15, or Apple clang 15). GoogleTest and Google Benchmark are downloaded automatically at pinned versions and SHA-256 hashes.
 
 ```bash
 cd core
@@ -27,67 +52,72 @@ cmake --preset debug && cmake --build --preset debug -j && ctest --preset debug
 
 | Preset | Purpose |
 |---|---|
-| `debug` | Debug build + tests |
+| `debug` | Debug build + tests + tools |
 | `asan` | AddressSanitizer + UndefinedBehaviorSanitizer + tests |
-| `tsan` | ThreadSanitizer + tests (checks the SPSC ring's memory ordering) |
-| `release` | Optimized build + tests |
-| `bench` | `-O3`, native CPU, LTO, Google Benchmark binaries in `build/bench/bench/adsb_bench` |
-| `fuzz` | libFuzzer targets (needs LLVM clang, not Apple clang) |
-| `fuzz-standalone` | Same targets with a portable driver (corpus replay + seeded mutations); works on macOS |
+| `tsan` | ThreadSanitizer + tests (SPSC ring, pipeline replay) |
+| `release` | Optimized build + tests + tools |
+| `naive-baseline` | Release build with mutex queues and `std::unordered_map` (+ tests, benchmarks) |
+| `bench` | `-O3`, native CPU, LTO, Google Benchmark |
+| `fuzz` / `fuzz-standalone` | Fuzz targets (`beast`, `decoder`, `packet`) with libFuzzer or the portable driver |
 
-Add `-G Ninja` to any configure command if Ninja is installed, and `-DADSB_WERROR=ON` to treat warnings as errors (CI does both).
-
-### Fuzzing
+## Using the tools
 
 ```bash
-# Linux, LLVM clang:
-cmake --preset fuzz && cmake --build --preset fuzz
-./build/fuzz/fuzz/fuzz_decoder -max_total_time=300 fuzz/corpus/decoder
-./build/fuzz/fuzz/fuzz_beast   -max_total_time=300 fuzz/corpus/beast
+# 2 minutes of traffic from 200 aircraft seen by two receivers (A/B lines)
+./build/release/tools/adsb-synth -o /tmp/traffic.adsbrec --aircraft 200 --duration 120 --lines 2 --truth /tmp/truth.csv
 
-# macOS / any compiler:
-cmake --preset fuzz-standalone && cmake --build --preset fuzz-standalone
-./build/fuzz-standalone/fuzz/fuzz_decoder -runs=1000000 -max_len=15 fuzz/corpus/decoder
-./build/fuzz-standalone/fuzz/fuzz_beast   -runs=300000 fuzz/corpus/beast
+# Replay as fast as possible: counters + output hash
+./build/release/tools/adsb-replay /tmp/traffic.adsbrec
+
+# Replay at 20x real time through the two-thread pipeline, with latency percentiles
+./build/release/tools/adsb-replay /tmp/traffic.adsbrec --pipeline --speed 20
+
+# Same recording through the naive baseline build, for a before/after comparison
+./build/naive-baseline/tools/adsb-replay /tmp/traffic.adsbrec --pipeline --speed 20
+
+# Determinism contract (CI runs this too)
+./scripts/check-determinism.sh build/release build/naive-baseline
 ```
 
-Both harnesses check invariants beyond "doesn't crash":
-- **Beast:** every emitted frame has the right length for its type, all input bytes are accounted for, and re-encoding the output then parsing it again reproduces the frames exactly.
-- **Decoder:** a frame that fails CRC never reports fields, decoded values stay within physical ranges, and CPR decoding of the fields yields finite, in-range coordinates.
+At `--speed max` the reader outruns the worker, so "queue" latency mostly measures the backlog. Use a paced `--speed N` for latency numbers.
 
-### Benchmarks
+## Indicative numbers (Apple M2 laptop, not the benchmark host)
 
-```bash
-cmake --preset bench && cmake --build --preset bench
-./build/bench/bench/adsb_bench
-```
+| Measurement | Result |
+|---|---|
+| CRC-24 syndrome | 8 ns |
+| Decode one DF17 frame | 22 ns |
+| CPR global decode | 19–30 ns |
+| Track lookup, 4,000 aircraft | flat table **2.4 ns** vs `unordered_map` 8.1 ns |
+| Track insert + erase churn | flat table **19–28 ns** vs `unordered_map` 190–210 ns |
+| Full engine (decode + state) per frame, 300 aircraft | 118 ns flat vs 124 ns naive. At this size the table is not the bottleneck; decoding and CPR are. |
+| Pipeline latency at 65k frames/s, frame in → state updated | optimized p50 0.38 µs / p99 1.8 µs / p99.9 21 µs; naive p50 1.2 µs / p99 29 µs / p99.9 830 µs |
 
-On Linux, pin to isolated cores for meaningful numbers (`taskset -c 2,3 ./build/bench/bench/adsb_bench`). Laptops and CI VMs give indicative numbers only.
-
-### Host capability check
-
-```bash
-./scripts/check-host.sh          # human-readable
-./scripts/check-host.sh --json   # for recording alongside benchmark results
-```
-
-Run it on every candidate benchmark host and receiver. It answers Week 1 open decisions 2 and 3 (benchmark host and NICs) in README_UPDATES.md §21.
+The Apple timer runs at 24 MHz, so latencies are quantized to about 42 ns. Laptops also have no core isolation. **Report numbers only from the Linux benchmark host** (README_UPDATES.md §11.3).
 
 ## How correctness is checked
 
 | Area | Evidence |
 |---|---|
-| CRC-24 | Published DF17 frames have zero syndrome. The table implementation matches the bit-by-bit polynomial division on random input. Every single-bit error in every test frame is detected. Address/Parity recovery works. |
-| Decoder | Published vectors from *The 1090 MHz Riddle* and the pyModeS documentation: callsigns, altitudes, CPR fields, positions, ground speed, track, airspeed, heading, vertical rate, GNSS/baro difference. Synthetic frames cover DF0/4/5/11/16/18/20/21, TC28, and surface positions. Random valid frames stay in physical ranges. |
-| CPR | Riddle worked example (global and local). pyModeS example. The NL table matches the closed-form formula over 250k latitudes. 100k random positions round-trip through encode → global and local decode within the ~5 m airborne resolution, surface within ~3 m. Pairs that straddle a zone boundary are rejected. |
-| Altitude | Every 25 ft Q-bit code. An exhaustive Gillham check: all 1,280 valid codes decode to unique 100 ft altitudes from −1,200 to 126,700 ft, and adjacent altitudes differ by exactly one bit (the Gray-code property), so the decoder is checked without a hand-written encoder. |
-| SPSC ring | Edge cases (full, empty, wrap, batch). Two-thread stress tests with 64-byte messages verify order and detect torn slots, at capacities 2–4096, under ThreadSanitizer. |
-| Histogram | The bucket tiling is checked exhaustively (no gaps or overlaps), along with the relative-error bound for every bucket, percentiles against an exact sort on 200k log-normal samples, and merge equivalence. |
-| Beast | Byte-at-a-time and random chunking of a 2,000-frame stream heavy with `0x1A`, plus garbage, unknown types, truncated frames, and reset. |
+| CRC-24 | Published frames have zero syndrome; the table matches bitwise division; every single-bit error is detected; Address/Parity recovery |
+| Decoder | Published vectors from *The 1090 MHz Riddle* and pyModeS; synthetic frames for every DF; random valid frames stay in physical ranges |
+| Encoders | Reproduce the published example frames exactly; round trips through the decoder over the full altitude, squawk, velocity, position, and surface-speed ranges |
+| CPR | Riddle and pyModeS examples; NL table against the closed form; 100k random global/local round trips; zone-boundary rejection |
+| Altitude | Exhaustive Gillham Gray-code property check over all 1,280 codes |
+| SPSC ring / pipeline | Edge cases; two-thread stress with torn-slot detection; pipeline replay under ThreadSanitizer |
+| Histogram | Exhaustive bucket tiling; error bound; percentiles against exact sort; every integer percentile of 1..100 |
+| Beast | Every chunking of a stream heavy with `0x1A`; garbage, unknown types, truncation, reset |
+| Recording | Round trip; empty file; corruption detected by CRC; truncated file recovers every complete record; bad records rejected |
+| Track store | 300k-operation randomized differential test against `std::unordered_map` (including clustered keys); probe lengths at full load |
+| Track engine | Unit tests for each rule. **End to end against ground truth:** 60 aircraft, 2 lines, 1% corrupted frames. Zero phantom tracks, every reported position within 12 m of the true transmitted position, callsigns/squawks/categories correct, duplicates filtered, every track expires. |
+| Determinism | Same output hash across repeated runs, paced and max speed, inline and pipeline, optimized and naive builds (`scripts/check-determinism.sh`, CI) |
+| Feed protocol | Golden packet decoded and re-encoded identically in C++, Python, and JavaScript; every truncation rejected; generated code checked for staleness in CI |
+| Gap recovery | TLA+ model checked by TLC ([`spec/`](../spec/)); deliberately broken variant fails |
+| Fuzzing | `fuzz_beast`, `fuzz_decoder`, `fuzz_packet` with invariant checks (round trips, no out-of-bounds reads, tracker never moves backwards) |
+| Test quality | Mutation testing: planted bugs in each module are caught by the suite |
 
 ## Limits and next steps
 
-- **Decoder gaps:** TC 29/31, Comm-B (BDS) registers, and single-bit error correction are not decoded yet. TC 20–22 GNSS height uses the same 25 ft encoding as readsb/dump1090; pyModeS treats it as metres. The planned readsb differential diff (README_UPDATES.md §7.3) will settle this against real traffic.
-- **Address/Parity formats:** DF0/4/5/16/20/21/24 frames return `kAddressParity`. The track state engine must accept them only for ICAO addresses that are already live tracks.
-- **Clock on ARM:** `ticks()` on ARM is the generic timer (24 MHz on Apple silicon, 54 MHz on the Pi 5), not CPU cycles. Resolution there is 18–42 ns.
-- **Not yet built:** the track state engine, feed publisher, and recorder (Workstreams D, E, G) are the next pieces and will build on these headers.
+- **Decoder gaps:** TC 29/31, Comm-B (BDS), and single-bit error correction are not decoded. The GNSS-height unit question (feet vs metres, see `decoder.hpp`) awaits the readsb differential diff on real traffic.
+- **Track engine:** `nic` is not populated yet. Heading and airspeed are decoded but not carried in `TrackUpdate` v0 (an open question in `feed_spec.md`).
+- **Not yet built:** live Beast TCP ingest, multicast publisher, retransmit and snapshot servers, WebSocket gateway, A/B arbiter stage, IQ demodulator. These are the next milestones, building on these headers.

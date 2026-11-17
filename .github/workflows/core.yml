@@ -4,10 +4,14 @@ on:
   push:
     paths:
       - "core/**"
+      - "protocol/**"
+      - "spec/**"
       - ".github/workflows/core.yml"
   pull_request:
     paths:
       - "core/**"
+      - "protocol/**"
+      - "spec/**"
       - ".github/workflows/core.yml"
   workflow_dispatch:
 
@@ -28,6 +32,11 @@ jobs:
       matrix:
         compiler: [gcc, clang]
         preset: [debug, asan, tsan, release]
+        include:
+          # Naive baseline (mutex queues, std::unordered_map) must pass the
+          # same tests: it is a data-structure swap, not different logic.
+          - compiler: gcc
+            preset: naive-baseline
     env:
       CXX: ${{ matrix.compiler == 'gcc' && 'g++-14' || 'clang++-18' }}
     steps:
@@ -72,7 +81,7 @@ jobs:
 
       - name: Fuzz
         run: |
-          for target in beast decoder; do
+          for target in beast decoder packet; do
             mkdir -p "/tmp/corpus_$target"
             cp fuzz/corpus/$target/* "/tmp/corpus_$target/"
             ./build/fuzz/fuzz/fuzz_$target -max_total_time=60 -print_final_stats=1 \
@@ -112,7 +121,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax
-        run: bash -n scripts/check-host.sh
+        run: |
+          bash -n scripts/check-host.sh
+          bash -n scripts/tune-host.sh
+          bash -n scripts/check-determinism.sh
+      - name: tune-host.sh dry run (changes nothing)
+        run: |
+          ./scripts/tune-host.sh --dry-run --cpus 1
+          ./scripts/tune-host.sh --status
       - name: Run (must not write to stderr)
         run: |
           ./scripts/check-host.sh 2> /tmp/err.txt
@@ -120,3 +136,67 @@ jobs:
           test ! -s /tmp/err.txt
           ./scripts/check-host.sh --json 2> /tmp/err.txt | python3 -m json.tool > /dev/null
           test ! -s /tmp/err.txt
+
+  determinism:
+    name: replay determinism (GCC vs Clang vs naive)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 clang-18
+      - name: Build GCC optimized, GCC naive, Clang optimized
+        run: |
+          CXX=g++-14 cmake --preset release -G Ninja -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build --preset release
+          CXX=g++-14 cmake --preset naive-baseline -G Ninja -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF -DADSB_BUILD_BENCH=OFF
+          cmake --build --preset naive-baseline
+          CXX=clang++-18 cmake -S . -B build/clang-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/clang-release
+      # Same recording => identical output across replay modes, the naive
+      # build, and compilers (possible because -ffp-contract=off).
+      - name: Check
+        run: ./scripts/check-determinism.sh build/release build/naive-baseline build/clang-release
+
+  protocol:
+    name: feed protocol (generator + C++/JS/Python golden tests)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Generated code is up to date
+        run: python3 protocol/gen.py --check
+      - name: Python
+        run: python3 -m unittest discover -s protocol/tests -v
+      - name: JavaScript
+        run: node protocol/tests/test_feed.mjs
+
+  tlc:
+    name: TLA+ model check (feed recovery)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/cache@v4
+        with:
+          path: spec/.tools
+          key: tla2tools-v1.7.4
+      - run: bash spec/run-tlc.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlc-logs
+          path: spec/out/

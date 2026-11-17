@@ -14,6 +14,8 @@ option(ADSB_BUILD_FUZZ    "Build fuzz targets"                      OFF)
 option(ADSB_WERROR        "Treat compiler warnings as errors"       OFF)
 option(ADSB_NATIVE        "Optimize for the build machine's CPU"    OFF)
 option(ADSB_LTO           "Enable link-time optimization"           OFF)
+option(ADSB_NAIVE         "Build the naive baseline (mutex queues, std::unordered_map)" OFF)
+option(ADSB_BUILD_TOOLS   "Build command-line tools (adsb-synth, adsb-replay)" ON)
 set(ADSB_SANITIZE "" CACHE STRING
   "Semicolon-separated sanitizers: address;undefined | thread")
 set(ADSB_FUZZ_ENGINE "standalone" CACHE STRING
@@ -38,10 +40,15 @@ include(Sanitizers)
 # ---------------------------------------------------------------------------
 add_library(adsb_core STATIC
   src/common/clock.cpp
+  src/common/hash.cpp
+  src/common/thread.cpp
   src/modes/crc24.cpp
   src/modes/altitude.cpp
   src/modes/cpr.cpp
   src/modes/decoder.cpp
+  src/modes/encoder.cpp
+  src/record/recording.cpp
+  src/sim/synth.cpp
 )
 add_library(adsb::core ALIAS adsb_core)
 target_include_directories(adsb_core PUBLIC
@@ -51,6 +58,10 @@ adsb_apply_compiler_options(adsb_core)
 
 find_package(Threads REQUIRED)
 target_link_libraries(adsb_core PUBLIC Threads::Threads)
+if(ADSB_NAIVE)
+  target_compile_definitions(adsb_core PUBLIC ADSB_NAIVE=1)
+  message(STATUS "adsb: NAIVE baseline build (mutex queues, std::unordered_map)")
+endif()
 
 # ---------------------------------------------------------------------------
 # Tests, benchmarks, fuzzers
@@ -70,4 +81,8 @@ endif()
 
 if(ADSB_BUILD_FUZZ)
   add_subdirectory(fuzz)
+endif()
+
+if(ADSB_BUILD_TOOLS)
+  add_subdirectory(tools)
 endif()

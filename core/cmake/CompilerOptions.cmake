@@ -43,6 +43,10 @@ endif()
 
 function(adsb_apply_compiler_options target)
   target_compile_options(${target} PRIVATE ${ADSB_WARNING_FLAGS})
+  # No fused multiply-add contraction: keeps floating-point results (CPR
+  # decoding, unit conversions) identical across optimization levels and
+  # x86/ARM, which the replay determinism checks rely on.
+  target_compile_options(${target} PRIVATE -ffp-contract=off)
   if(ADSB_WERROR)
     target_compile_options(${target} PRIVATE -Werror)
   endif()

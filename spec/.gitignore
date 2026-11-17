@@ -1,0 +1,8 @@
+# TLC tooling and output
+.tools/
+states/
+out/
+*.out
+*_TTrace_*.tla
+*_TTrace_*.bin
+*.st

@@ -6,12 +6,14 @@ on:
       - "core/**"
       - "protocol/**"
       - "spec/**"
+      - "bench/**"
       - ".github/workflows/core.yml"
   pull_request:
     paths:
       - "core/**"
       - "protocol/**"
       - "spec/**"
+      - "bench/**"
       - ".github/workflows/core.yml"
   workflow_dispatch:
 
@@ -125,6 +127,9 @@ jobs:
           bash -n scripts/check-host.sh
           bash -n scripts/tune-host.sh
           bash -n scripts/check-determinism.sh
+          bash -n ../bench/legacy/run.sh
+          bash -n ../bench/legacy/run_bench.sh
+          python3 -m py_compile ../bench/legacy/feeder.py ../bench/legacy/probe.py ../bench/legacy/analyze.py
       - name: tune-host.sh dry run (changes nothing)
         run: |
           ./scripts/tune-host.sh --dry-run --cpus 1

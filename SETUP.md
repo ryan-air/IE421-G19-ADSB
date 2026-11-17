@@ -140,6 +140,16 @@ cmake --preset naive-baseline && cmake --build --preset naive-baseline -j
 ./scripts/check-determinism.sh build/release build/naive-baseline
 ```
 
+### Fall 2025 baseline (the "before" numbers)
+
+`bench/legacy/` runs the unmodified Fall 2025 pipeline (streamer, Postgres, Node API) in Docker, feeds it synthetic traffic through readsb in real time, and measures latency, data loss, and map accuracy against ground truth. Findings so far: [bench/results/legacy-baseline/](bench/results/legacy-baseline/README.md).
+
+```bash
+bench/legacy/run.sh
+```
+
+It takes about 20 minutes and needs about 2 GB of free disk.
+
 ---
 
 ## 6. Feed protocol and TLA+ model

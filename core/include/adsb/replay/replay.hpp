@@ -74,6 +74,7 @@ class HashingSink {
 struct ReplayOptions {
   double speed = 0.0;          // 0 = max speed; 1 = original timing; N = N times faster
   bool flush_at_end = false;   // expire every remaining track after the last record
+  bool busy_wait = false;      // pace by spinning instead of sleeping (precise; uses a core)
 };
 
 struct ReplayResult {
@@ -87,6 +88,7 @@ struct ReplayResult {
 };
 
 struct PipelineLatency {
+  LatencyHistogram release_lag_ns;  // paced replay: actual - intended release (harness accuracy)
   LatencyHistogram queue_ns;    // enqueue -> dequeue (handoff + backlog)
   LatencyHistogram process_ns;  // dequeue -> decode + state done
   LatencyHistogram total_ns;    // intended release (or enqueue at max speed) -> done
@@ -102,14 +104,19 @@ inline state::FrameMeta meta_of(const record::Record& r) {
   return m;
 }
 
-// Waits until mono_ns() >= target: sleeps while far away, spins near it.
-inline void wait_until(std::uint64_t target_ns) {
+// Waits until mono_ns() >= target: sleeps while far away, then spins for the
+// last 2 ms. The spin window is wide because sleeps can overshoot by more than
+// a millisecond (timer slack, and especially inside VMs such as Docker on
+// macOS); an overshoot would be charged to the pipeline as latency, since
+// latency is measured from the intended release time.
+inline void wait_until(std::uint64_t target_ns, bool busy_wait = false) {
+  constexpr std::uint64_t kSpinWindowNs = 2'000'000;
   for (;;) {
     const std::uint64_t now = mono_ns();
     if (now >= target_ns) return;
     const std::uint64_t left = target_ns - now;
-    if (left > 200'000) {
-      const std::uint64_t sleep_ns = left - 100'000;
+    if (!busy_wait && left > kSpinWindowNs + 500'000) {
+      const std::uint64_t sleep_ns = left - kSpinWindowNs;
       timespec ts{static_cast<time_t>(sleep_ns / 1'000'000'000ULL),
                   static_cast<long>(sleep_ns % 1'000'000'000ULL)};
       nanosleep(&ts, nullptr);
@@ -143,7 +150,7 @@ ReplayResult replay_inline(record::RecordingReader& rd, Engine& eng, const Repla
     if (res.records == 0) first_rx = r.rx_ns;
     if (opt.speed > 0.0) {
       const double offset = static_cast<double>(r.rx_ns - first_rx) / opt.speed;
-      detail::wait_until(wall0 + static_cast<std::uint64_t>(offset));
+      detail::wait_until(wall0 + static_cast<std::uint64_t>(offset), opt.busy_wait);
     }
     eng.on_frame(r.payload, r.len, detail::meta_of(r), sink);
     last_rx = r.rx_ns;
@@ -190,7 +197,9 @@ ReplayResult replay_pipeline(record::RecordingReader& rd, Engine& eng, const Rep
       if (n == 0) first_rx = it.rec.rx_ns;
       if (opt.speed > 0.0) {
         const double offset_ns = static_cast<double>(it.rec.rx_ns - first_rx) / opt.speed;
-        detail::wait_until(wall0 + static_cast<std::uint64_t>(offset_ns));
+        const std::uint64_t target = wall0 + static_cast<std::uint64_t>(offset_ns);
+        detail::wait_until(target, opt.busy_wait);
+        if (lat) lat->release_lag_ns.record(mono_ns() - target);
         it.t_release = ticks0 + static_cast<std::uint64_t>(offset_ns * ticks_per_ns);
       }
       it.t_enqueue = ticks();

@@ -1,0 +1,41 @@
+# Fall 2025 baseline harness. Run with bench/legacy/run.sh rather than directly.
+#
+#   db     Postgres 16 with the Fall 2025 schema (ads-b-receiver/schema.sql).
+#          SSL is on because the Fall 2025 Node server always connects with SSL
+#          (it was written for Supabase); a self-signed certificate is enough.
+#   bench  readsb + the Fall 2025 streamer and web server + probes. All
+#          timestamps are taken inside this one container, so they share a clock.
+
+services:
+  db:
+    image: postgres:16.4
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: adsb
+    command: >
+      -c ssl=on
+      -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+      -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+    volumes:
+      - ./supabase_roles.sql:/docker-entrypoint-initdb.d/00_supabase_roles.sql:ro
+      - ../../ads-b-receiver/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./position_history.sql:/docker-entrypoint-initdb.d/02_position_history.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d adsb"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+
+  bench:
+    build:
+      context: ../..
+      dockerfile: bench/legacy/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:bench@db:5432/adsb
+    volumes:
+      - ../..:/repo:ro
+      - ./out:/out
+    command: ["bash", "/repo/bench/legacy/run_bench.sh"]

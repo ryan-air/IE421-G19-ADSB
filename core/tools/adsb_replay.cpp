@@ -25,6 +25,7 @@ namespace {
                "usage: adsb-replay FILE.adsbrec [options]\n"
                "  --speed max|N     max (default) or N x original speed (1 = real time)\n"
                "  --pipeline        two threads: reader -> queue -> decode+state, with latency stats\n"
+               "  --busy-wait       pace by spinning instead of sleeping (precise timing, uses a core)\n"
                "  --cpus R,W        pin reader and worker threads (Linux only; implies --pipeline)\n"
                "  --out FILE        write the emitted messages as {u16 len, bytes} records\n"
                "  --no-flush        do not expire the remaining tracks after the last record\n"
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
       opt.speed = v == "max" ? 0.0 : std::strtod(v.c_str(), nullptr);
       if (v != "max" && opt.speed <= 0.0) usage(1);
     } else if (a == "--pipeline") pipeline = true;
+    else if (a == "--busy-wait") opt.busy_wait = true;
     else if (a == "--cpus") {
       const std::string v = val();
       if (std::sscanf(v.c_str(), "%d,%d", &reader_cpu, &worker_cpu) != 2) usage(1);
@@ -133,6 +135,7 @@ int main(int argc, char** argv) {
   std::printf("output hash %s\n", r.hash.c_str());
   if (pipeline) {
     std::printf("latency (per record):\n");
+    if (opt.speed > 0.0) print_hist("release lag", lat->release_lag_ns);
     print_hist("queue", lat->queue_ns);
     print_hist("decode+state", lat->process_ns);
     print_hist("total", lat->total_ns);

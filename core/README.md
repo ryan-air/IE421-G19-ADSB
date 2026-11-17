@@ -28,7 +28,7 @@ C++20 implementation of the pipeline described in [README_UPDATES.md](../README_
 | Track store | [`adsb/state/track_store.hpp`](include/adsb/state/track_store.hpp) | Open-addressing table (Fibonacci hash, backward-shift deletion) with a 64-byte hot record; `std::unordered_map` baseline with the same interface |
 | Track engine | [`adsb/state/track_engine.hpp`](include/adsb/state/track_engine.hpp) | CPR pairing, Address/Parity validation, duplicate filter, per-field out-of-order rejection, plausibility check with re-anchoring, timing-wheel expiry, `TrackUpdate`/`TrackDelete` output |
 | Feed messages | [`adsb/protocol/feed_messages.hpp`](include/adsb/protocol/feed_messages.hpp) | **Generated** from [`protocol/schema/feed_v0.json`](../protocol/schema/feed_v0.json); see [`protocol/feed_spec.md`](../protocol/feed_spec.md) |
-| MoldUDP64 framing | [`adsb/protocol/moldudp64.hpp`](include/adsb/protocol/moldudp64.hpp) | Packet builder, bounds-checked parser, subscriber `SequenceTracker` (gap / overlap / duplicate / heartbeat / new session) |
+| MoldUDP64 framing | [`adsb/protocol/moldudp64.hpp`](include/adsb/protocol/moldudp64.hpp) | Packet builder, bounds-checked parser, subscriber `SequenceTracker` (gap / overlap / duplicate / heartbeat / new session / malformed: seq 0 or past 2^64 − 1) |
 | Replay | [`adsb/replay/replay.hpp`](include/adsb/replay/replay.hpp) | Inline and two-thread pipeline replay at max or paced speed, per-stage latency histograms, SHA-256 of the output stream |
 | Naive baseline | [`adsb/common/build_config.hpp`](include/adsb/common/build_config.hpp) | `-DADSB_NAIVE=ON` swaps `SpscRing` → mutex queue and the flat table → `std::unordered_map`. The pipeline code is identical. |
 

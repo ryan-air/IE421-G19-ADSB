@@ -119,7 +119,7 @@ The snapshot reflects every incremental message with `seq <= as_of_seq`. The sub
 
 ## 4. Subscriber behaviour
 
-The full subscriber is `SubscriberCore` (`core/include/adsb/feed/subscriber.hpp`), with `SequenceTracker` (`core/include/adsb/protocol/moldudp64.hpp`) as a lighter classifier for simple consumers. The protocol, including loss, duplication, and reordering, is model-checked in TLA+ in [`spec/`](../spec/). Sessions are not in the model; they are covered by unit tests and a randomized simulation.
+The full subscriber is `SubscriberCore` (`core/include/adsb/feed/subscriber.hpp`), with `SequenceTracker` (`core/include/adsb/protocol/moldudp64.hpp`) as a lighter classifier for simple consumers. Both treat a packet with `seq` 0, or one whose messages would run past 2^64 − 1, as malformed: sequence numbers never wrap. The protocol, including loss, duplication, and reordering, is model-checked in TLA+ in [`spec/`](../spec/). Sessions are not in the model; they are covered by unit tests and a randomized simulation.
 
 A subscriber buffers what arrives ahead of `expected` (16,384 messages by default) and requests `[expected, first buffered)` in chunks of up to 1,024 messages. It re-requests after 10 ms without progress.
 

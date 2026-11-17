@@ -65,6 +65,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     const auto o = tracker.on_packet(*p);
     if (o.result == SequenceTracker::Result::kNewSession) {
       tracker.reset(p->header.session, p->header.seq);
+    } else if (o.result == SequenceTracker::Result::kMalformed) {
+      FUZZ_CHECK(tracker.expected() == before);
     } else {
       FUZZ_CHECK(tracker.expected() >= before);
       if (o.result == SequenceTracker::Result::kGap) {

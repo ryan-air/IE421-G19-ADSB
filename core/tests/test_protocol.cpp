@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -202,6 +203,35 @@ TEST(SequenceTracker, ClassifiesPackets) {
   EXPECT_EQ(feed(packet("S1", 20, 1)).result, R::kStaleSession);
   EXPECT_EQ(feed(packet("S2", 2, 1)).result, R::kInOrder);
   EXPECT_EQ(feed(packet("S3", 1, 1)).result, R::kNewSession);
+}
+
+// Found by fuzz_packet in CI: a packet whose seq + count passes 2^64 wrapped
+// `expected` backwards. Sequence numbers never wrap within a session (they
+// start at 1), so such a packet, like seq 0, is malformed and changes nothing.
+TEST(SequenceTracker, RejectsSequenceNumbersThatWouldWrap) {
+  using R = SequenceTracker::Result;
+  constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+  auto feed = [](SequenceTracker& t, const std::vector<std::uint8_t>& bytes) {
+    const auto p = parse_packet(bytes);
+    EXPECT_TRUE(p);
+    return t.on_packet(*p).result;
+  };
+
+  SequenceTracker at_top(kMax - 1);
+  EXPECT_EQ(feed(at_top, packet("S1", kMax - 1, 3)), R::kMalformed);  // would end at 2^64 + 1
+  EXPECT_EQ(at_top.expected(), kMax - 1);
+  EXPECT_EQ(feed(at_top, packet("S1", kMax - 1, 1)), R::kInOrder);  // ends exactly at kMax: fine
+  EXPECT_EQ(at_top.expected(), kMax);
+
+  SequenceTracker t(1);
+  EXPECT_EQ(feed(t, packet("S1", 1, 1)), R::kInOrder);
+  EXPECT_EQ(feed(t, packet("S1", kMax, 2)), R::kMalformed);  // not reported as a gap
+  EXPECT_EQ(feed(t, packet("S1", 0, 1)), R::kMalformed);
+  PacketBuilder hb(make_session("S1"), 0);
+  EXPECT_EQ(t.on_packet(*parse_packet(hb.heartbeat())).result, R::kMalformed);
+  EXPECT_EQ(feed(t, packet("S9", 0, 1)), R::kMalformed) << "not mistaken for a publisher restart";
+  EXPECT_EQ(t.expected(), 2u);
+  EXPECT_EQ(feed(t, packet("S1", 2, 1)), R::kInOrder);
 }
 
 }  // namespace

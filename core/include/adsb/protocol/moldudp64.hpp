@@ -182,6 +182,7 @@ class SequenceTracker {
     kStaleSession,  // late packet from the session we already left: drop it
     kHeartbeat,   // no messages; may still reveal a gap (see gap_from/gap_to)
     kEndOfSession,
+    kMalformed,   // seq 0, or seq + count past 2^64 - 1: nothing changes
   };
 
   struct Outcome {
@@ -197,6 +198,17 @@ class SequenceTracker {
   // buffers the packet, recovers [gap_from, gap_to), then calls advance_to().
   [[nodiscard]] Outcome on_packet(const PacketView& p) noexcept {
     Outcome o;
+    // Sequence numbers start at 1 and never wrap within a session, so a
+    // packet claiming seq 0, or one whose messages would run past 2^64 - 1,
+    // is corrupt or forged (end = seq + count would wrap `expected`
+    // backwards). Checked before the session, as SubscriberCore does, so a
+    // corrupt packet cannot pass for a publisher restart. The end-of-session
+    // count is a marker, not a message count.
+    if (p.header.seq == 0 ||
+        (p.kind == PacketKind::kData && p.header.count > ~std::uint64_t{0} - p.header.seq)) {
+      o.result = Result::kMalformed;
+      return o;
+    }
     if (has_session_ && p.header.session != session_) {
       // UDP can deliver a delayed packet from the previous session after we
       // switched; recognise it rather than switching back (which would force

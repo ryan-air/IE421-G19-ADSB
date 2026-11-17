@@ -107,20 +107,27 @@ SubscriberClientConfig client_cfg(const Server& s, Endpoint feed) {
 struct ClientThread {
   SubscriberClient client;
   std::atomic<bool> stop{false};
+  std::atomic<bool> done{false};  // run() returned: the core may be read
   std::thread th;
   explicit ClientThread(const SubscriberClientConfig& c) : client(c) {
     std::string err;
     EXPECT_TRUE(client.open(&err)) << err;
   }
   void start() {
-    th = std::thread([this] { client.run(stop, /*stop_at_end=*/true); });
+    th = std::thread([this] {
+      client.run(stop, /*stop_at_end=*/true);
+      done.store(true, std::memory_order_release);
+    });
   }
   // Waits for the subscriber to finish; `tick` runs meanwhile (the publisher's
-  // poll(), which repeats the end-of-session marker).
+  // poll(), which repeats the end-of-session marker). The core belongs to the
+  // client thread until it is joined: polling client.core() from here was a
+  // data race (GCC TSan caught it), so wait on `done`, which run() sets on
+  // its way out once the session has ended.
   template <typename Tick = void (*)()>
   bool join_within(std::chrono::milliseconds t, Tick tick = [] {}) {
     const auto end = std::chrono::steady_clock::now() + t;
-    while (std::chrono::steady_clock::now() < end && !client.core().ended()) {
+    while (std::chrono::steady_clock::now() < end && !done.load(std::memory_order_acquire)) {
       tick();
       std::this_thread::sleep_for(2ms);
     }

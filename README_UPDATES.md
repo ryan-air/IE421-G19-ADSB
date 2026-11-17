@@ -2,28 +2,33 @@
 
 This document describes how we are extending the Fall 2025 **ADS-B Aircraft Tracking System** (see [README.md](README.md) and [PROJECT_REPORT.md](PROJECT_REPORT.md)) into a low-latency, HFT-style system. The original README still documents the existing system. This file documents **what we are changing, how, and how we will measure it**.
 
-> **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed. An aircraft is an "instrument", each Mode S frame is a "market data message", and the per-aircraft track table is the "order book". Everything we build (decoding, state, distribution, replay, and measurement) mirrors how a trading firm's feed handler is built and evaluated.
+> **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed, and own the whole path from **antenna to published decision**. We demodulate the radio samples ourselves, merge redundant A/B receiver lines, decode and maintain state on a lock-free pinned-core pipeline, and publish over kernel UDP, io_uring, AF_XDP, or shared memory. Every segment is measured in cycles and nanoseconds against hardware timestamps. We then show that the same infrastructure handles a real exchange feed (**Nasdaq ITCH 5.0**) at tens of millions of messages per second.
 
 ---
 
 ## Table of Contents
 
 1. [Where We Are Starting From](#1-where-we-are-starting-from)
-2. [Goals and Non-Goals](#2-goals-and-non-goals)
-3. [Target Architecture](#3-target-architecture)
-4. [Workstream A — Ingest](#4-workstream-a--ingest)
-5. [Workstream B — Mode S Decoder](#5-workstream-b--mode-s-decoder)
-6. [Workstream C — Track State Engine](#6-workstream-c--track-state-engine)
-7. [Workstream D — Feed Distribution (UDP Multicast)](#7-workstream-d--feed-distribution-udp-multicast)
-8. [Workstream E — Record, Replay, and Measurement](#8-workstream-e--record-replay-and-measurement)
-9. [Workstream F — Camera Fusion](#9-workstream-f--camera-fusion)
-10. [Stretch Goals](#10-stretch-goals)
-11. [Repository Layout](#11-repository-layout)
-12. [Toolchain and Dependencies](#12-toolchain-and-dependencies)
-13. [Hardware and Test Environments](#13-hardware-and-test-environments)
-14. [Timeline and Milestones](#14-timeline-and-milestones)
-15. [Risks and Mitigations](#15-risks-and-mitigations)
-16. [Open Decisions](#16-open-decisions)
+2. [Goals, Targets, and Non-Goals](#2-goals-targets-and-non-goals)
+3. [Scope Priorities](#3-scope-priorities)
+4. [Target Architecture](#4-target-architecture)
+5. [Workstream A — RF Ingest and SIMD Demodulator](#5-workstream-a--rf-ingest-and-simd-demodulator)
+6. [Workstream B — A/B Line Arbitration](#6-workstream-b--ab-line-arbitration)
+7. [Workstream C — Mode S Decoder](#7-workstream-c--mode-s-decoder)
+8. [Workstream D — Track State Engine](#8-workstream-d--track-state-engine)
+9. [Workstream E — Feed Distribution and Transports](#9-workstream-e--feed-distribution-and-transports)
+10. [Workstream F — Overload Semantics and Conflation](#10-workstream-f--overload-semantics-and-conflation)
+11. [Workstream G — Record, Replay, and Measurement](#11-workstream-g--record-replay-and-measurement)
+12. [Workstream H — Correctness and Verification](#12-workstream-h--correctness-and-verification)
+13. [Workstream I — Noisy Neighbor and Camera Fusion](#13-workstream-i--noisy-neighbor-and-camera-fusion)
+14. [Workstream J — Exchange Data: Nasdaq ITCH 5.0 L3 Book](#14-workstream-j--exchange-data-nasdaq-itch-50-l3-book)
+15. [Stretch Goals](#15-stretch-goals)
+16. [Repository Layout](#16-repository-layout)
+17. [Toolchain and Dependencies](#17-toolchain-and-dependencies)
+18. [Hardware and Test Environments](#18-hardware-and-test-environments)
+19. [Timeline and Milestones](#19-timeline-and-milestones)
+20. [Risks and Mitigations](#20-risks-and-mitigations)
+21. [Open Decisions](#21-open-decisions)
 
 ---
 
@@ -32,125 +37,175 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 The Fall 2025 system ([ads-b-receiver/adsb_streamer_optimized.py](ads-b-receiver/adsb_streamer_optimized.py), [ads/server.js](ads/server.js)) works like this:
 
 ```
-dump1090 ──SBS-1 text (TCP 30003)──▶ Python streamer ──batch CSV COPY──▶ Supabase Postgres
-                                                                              │
-                         Browser ◀──HTTP poll every 2 s── Node/Express (2–3 s cache)
+RTL-SDR ─▶ dump1090 ──SBS-1 text (TCP 30003)──▶ Python streamer ──batch CSV COPY──▶ Supabase Postgres
+                                                                                        │
+                                   Browser ◀──HTTP poll every 2 s── Node/Express (2–3 s cache)
 ```
 
 | Property | Fall 2025 system | Why it matters for this project |
 |---|---|---|
-| Input format | SBS-1 text, already decoded by dump1090 | We never see raw frames, CRC, or timing |
+| Demodulation | dump1090 (a separate process) | The largest latency in the system is not ours to control or measure |
+| Input format | SBS-1 text, already decoded | We never see raw samples, frames, CRC, or timing |
 | Language | Python and Node.js | GC, interpreter overhead, allocation on every message |
 | Buffering | 100-record batches, flushed every 1 s | Latency goes into the database by design |
 | Distribution | Database plus HTTP polling | One-to-many fan-out goes through a database |
 | End-to-end latency | About 1–2.2 s, frame to screen (report's data-flow example) | This is our "before" number |
-| Measurement | Throughput only (ops/s, cache hit rate) | No per-stage latency and no tail analysis |
-| Reproducibility | None. Live data only, with a mock generator | Results cannot be re-run |
+| Measurement | Throughput only | No per-stage latency and no tail analysis |
+| Reproducibility | None | Results cannot be re-run |
 
-The existing Kalman filter ([ads/kalman-filter.js](ads/kalman-filter.js)), probability cones, collision detection, and the Leaflet/Cesium frontend are reused. They become **subscribers** of the new feed instead of database readers.
+### Where the time actually goes
+
+This latency budget is why the project owns the radio path instead of starting at a decoded feed:
+
+| Segment | Approximate latency | Who controls it today |
+|---|---|---|
+| RF → USB transfer → SDR sample buffer | **10–60 ms**, set by USB transfer size (librtlsdr default 256 KB ≈ 55 ms at 2.4 MS/s) | librtlsdr defaults |
+| Demodulation and output batching (dump1090/readsb) | **1–100+ ms**, depending on network flush settings | another process |
+| Decode → state → publish (the code we would otherwise optimize) | **1–10 µs** | us |
+| Database write and poll | **1,000–2,000 ms** | Fall 2025 design |
+
+Optimizing only the µs-scale segment would improve something that is under 0.1% of the real path. So this project takes ownership of the whole path, from the first sample of a preamble to the moment its update reaches the wire.
+
+The existing Kalman filter ([ads/kalman-filter.js](ads/kalman-filter.js)), probability cones, collision detection, and Leaflet/Cesium frontend are reused as **subscribers** of the new feed.
 
 ---
 
-## 2. Goals and Non-Goals
+## 2. Goals, Targets, and Non-Goals
 
 ### Goals
-1. **A C++ hot path** (ingest → decode → track state → publish) with no heap allocation, no locks, and no syscalls other than the socket read and send.
-2. **A market-data-style feed**: fixed-size binary messages over UDP multicast with sequence numbers, gap detection, retransmission, and snapshots.
-3. **Deterministic replay**, so every benchmark and bug can be re-run exactly.
-4. **Rigorous latency measurement**: per-stage p50, p99, p99.9, and max, with naive-versus-optimized and old-versus-new comparisons, and an explanation of every tail outlier we can attribute.
-5. **Camera fusion** as an independent subscriber that proves the feed's design: a slow consumer must not affect the fast path.
+1. **Own the wire:** demodulate raw IQ samples in-house with a SIMD demodulator. readsb becomes a correctness oracle, outside the live path.
+2. **Redundant A/B lines:** two independent radio chains, merged by a line arbiter, as exchange feed handlers do.
+3. **A C++ hot path** with no allocation, no locks, and no syscalls beyond I/O, on pinned and isolated cores.
+4. **A market-data-grade feed:** MoldUDP64-style sequenced multicast with retransmission and snapshots, defined overload behavior, and a conflated feed for slow consumers.
+5. **Several transports, compared on the same histograms:** kernel UDP, io_uring, AF_XDP (kernel bypass), and a shared-memory broadcast ring.
+6. **Hardware-timestamped measurement:** NIC timestamps and PTP for true one-way wire latency, cycle-level stage costs, and an explanation for every tail outlier class we observe.
+7. **Correctness you can rely on:** TLA+-checked recovery protocol, memory-model-tested rings, deterministic simulation testing, fuzzing, and differential oracles.
+8. **Generality:** the same infrastructure builds an order-by-order (L3) book from **Nasdaq ITCH 5.0** at exchange rates.
 
-### Latency targets (initial, to be validated in Weeks 3–4)
-| Path | x86 Linux benchmark host | Raspberry Pi 5 |
+### Targets (initial, to be validated in Weeks 3–5)
+| Metric | x86-64 Linux benchmark host | Raspberry Pi 5 |
 |---|---|---|
-| Decode + state update, per frame | p99 < 1 µs | p99 < 5 µs |
-| Ingest read → multicast send (in-process) | p99 < 10 µs | p99 < 50 µs |
-| Sustained throughput (replay, max speed) | ≥ 1 M frames/s | ≥ 100 k frames/s |
-| Frame received → browser render | < 100 ms (versus about 2 s today) | same |
+| Demodulator cost | ≤ 10 cycles/sample (AVX2) | ≤ 30 cycles/sample (NEON) |
+| Demodulator sensitivity | ≥ 90% of readsb's valid frames on the same IQ recording | same |
+| **Sample-to-wire** (preamble sample → NIC TX timestamp) | p99 < 5 ms, versus ~50–150 ms through default readsb | p99 < 8 ms |
+| Decode + state update, per frame | p99 < 300 ns | p99 < 2 µs |
+| Frame ready → `sendmsg` returns (kernel UDP) | p99 < 10 µs | p99 < 40 µs |
+| AF_XDP versus kernel UDP | ≥ 2× lower p99 TX latency | measured (copy mode only, see §9.3) |
+| Shared-memory IPC (same host) | p99 < 500 ns publish → consumer read | p99 < 2 µs |
+| Pipeline throughput under replay | ≥ 2 M frames/s | ≥ 200 k frames/s |
+| ITCH L3 book build (Workstream J) | ≥ 20 M msg/s per core (stretch: 50 M) | n/a |
+| Frame → browser render | < 100 ms (versus about 2 s today) | same |
 
-For scale: a busy live receiver produces about 1,000–5,000 frames per second. The synthetic load generator (§8.4) is what pushes us to rates where design choices actually show up.
+Reported as cycles where the work is CPU-bound and as ns or µs where it crosses a boundary.
 
 ### Non-goals
-- Replacing dump1090/readsb demodulation in the core project. That is the FPGA stretch goal.
-- Kernel-bypass networking (DPDK, ef_vi). It is out of scope for our hardware, but we will discuss where it would help.
-- Live trading of any kind. The market data and strategy stretch goals are **read-only feeds and paper backtests**.
+- DPDK on unsupported NICs. AF_XDP gives us kernel bypass on stock Linux, and we explain where DPDK or ef_vi would go further.
+- Live trading of any kind. All exchange data is historical or public read-only. The backtester is paper only.
+- Weather and visibility classification (cut from the earlier plan to protect depth).
 
 ---
 
-## 3. Target Architecture
+## 3. Scope Priorities
+
+The plan is deliberately prioritized so the core is finished to a high standard before breadth is added.
+
+| Priority | Items |
+|---|---|
+| **Must** (core project) | A: SIMD demodulator · C: decoder · D: track state · E: multicast feed with gap recovery (kernel UDP) · F: overload semantics · G: record/replay/measurement with baselines |
+| **Should** (makes it an HFT-grade systems project) | B: A/B arbitration · E: AF_XDP, hardware timestamps and PTP, shared-memory IPC · F: conflated feed · H: TLA+ and memory-model testing · I: noisy-neighbor isolation with minimal camera fusion |
+| **Could** (planned, scheduled late) | J: ITCH 5.0 L3 book · E: io_uring transport · H: deterministic simulation testing |
+| **Stretch** | Backtester with matching simulation · FPGA demodulator / ITCH parser · multilateration |
+
+---
+
+## 4. Target Architecture
 
 ```
-                         ┌──────────────────────── adsb-core (C++20, one process) ─────────────────────────┐
- RTL-SDR ─▶ readsb ──Beast─▶│ [Ingest]──SPSC──▶[Decode]──SPSC──▶[Track State]──SPSC──▶[Publish]             │
-            (or recording)  │  core 1          core 2           core 2/3             core 3                 │
-                            │   t0               t1               t2                   t3 ─▶ UDP send (t4)  │
-                            │  └──────── per-stage timestamps → per-thread HDR histograms ────────┘         │
-                            │  [Recorder] (tap on ingest; writes raw frames + rx timestamps to disk)        │
-                            └───────────────────────────────────────────────┬────────────────────────────────┘
-                                                                            │ UDP multicast 239.19.0.1:41900
-                                                                            │ (incremental feed, MoldUDP64-style)
-                 ┌────────────────────────────┬─────────────────────────────┼───────────────────────────┐
-                 ▼                            ▼                             ▼                           ▼
-        WebSocket gateway            Camera fusion (Python)         Archiver (optional)        CLI subscriber /
-        (Node) ─▶ browser map        ─▶ fusion feed 239.19.0.2      ─▶ Postgres (history)      latency probe
-                                                                    
-        Gap recovery: Retransmit server (UDP unicast, last 65,536 msgs) + Snapshot server (TCP, full table)
+  Antenna A ─▶ RTL-SDR A ─USB─▶ [IQ Ingest A]─SPSC─▶[Demod A]─┐
+                                  core 1           core 2     │ SPSC
+                                                              ▼
+                                                         [Arbiter]─SPSC─▶[Decode+State]─SPSC─▶[Publish]──▶ transport
+                                                           core 4           core 5             core 6       │
+                                                              ▲ SPSC                                        │
+  Antenna B ─▶ RTL-SDR B ─USB─▶ [IQ Ingest B]─SPSC─▶[Demod B]─┘                                             │
+                                  core 3           core 3                                                   │
+                                                                                                            │
+  Off the live path:  readsb (oracle) · [Recorder] tap on IQ and frames · per-thread HDR histograms         │
+                                                                                                            ▼
+   ┌───────────── Transports (selected at startup, benchmarked against each other) ────────────────────────────┐
+   │ kernel UDP multicast │ io_uring (SQPOLL) │ AF_XDP (XSK, own Eth/IP/UDP headers) │ /dev/shm broadcast ring │
+   └──────────┬───────────────────────┬──────────────────────────────┬────────────────────────┬──────────────┘
+              ▼                       ▼                              ▼                        ▼
+       WebSocket gateway        Conflated feed (10 Hz)        Camera fusion            feed-cli / latency probe
+       ─▶ browser map           ─▶ slow consumers             (noisy-neighbor test)    (HW RX timestamps)
+
+   Gap recovery: Retransmit server (UDP unicast, last 65,536 msgs) + Snapshot server (TCP, full table "as of seq N")
 ```
+
+Core numbers are for an x86 host with at least 8 isolated cores. On a 4-core Pi 5, the pipeline runs a single line (A only), with demodulation, decode, and state fused onto fewer cores. That layout is benchmarked separately.
 
 **Design rules for the hot path**
-- **One thread per stage, pinned** with `pthread_setaffinity_np` to cores isolated with `isolcpus=` and `nohz_full=`, CPU governor set to `performance`.
+- **One thread per stage, pinned** with `pthread_setaffinity_np` to cores isolated with `isolcpus=`, `nohz_full=`, and `rcu_nocbs=`. IRQs are steered away from those cores, and the CPU governor is set to `performance`.
 - **Lock-free SPSC ring buffers** between stages. Capacity is a power of two. Head and tail sit on separate 64-byte cache lines. Each side keeps a cached copy of the other side's index. Ordering uses `acquire`/`release` only. Messages are fixed-size PODs copied by value.
-- **No allocation after startup.** All rings, the track table, and the send buffers are allocated and pre-faulted at init, then `mlockall(MCL_CURRENT | MCL_FUTURE)`. Enforced in debug builds by a `malloc` hook that aborts if called on a hot thread.
-- **Busy-spin consumers**, with a `pause`/`yield` instruction in the spin loop. A configurable backoff mode allows a fair comparison on the Pi, which has few cores.
-- **Event time, not wall time.** All state logic, including expiry and CPR pairing windows, uses the frame's own timestamp. This makes replay deterministic (§8.2).
-- **Pluggable at both ends.** The frame source (live socket, recording file, load generator, later FPGA) and sink (multicast, null sink, in-memory capture for tests) are interfaces chosen at startup. The hot loop is templated on them, so there are no virtual calls per frame.
-
-**Stage placement on a 4-core Raspberry Pi 5:** core 0 runs the OS, readsb, and IRQs. Core 1 runs Ingest. Core 2 runs Decode and Track State fused into one stage (benchmarked both fused and split). Core 3 runs Publish. On the x86 host, every stage gets its own isolated core.
+- **No allocation after startup.** All memory is allocated on 2 MB huge pages where available, pre-faulted, and locked with `mlockall`. Debug builds abort if `malloc` is called on a hot thread.
+- **Busy-spin consumers** with `pause` (x86) or `yield` (ARM). A backoff mode exists for fair comparison on small machines.
+- **Event time, not wall time.** All state logic uses the frame's own timestamp, so replay is deterministic (§11.2).
+- **Pluggable at both ends.** Sources (live SDR, IQ file, Beast TCP, frame recording, load generator, later FPGA) and transports are templated into the hot loop, so there are no virtual calls per message.
 
 ---
 
-## 4. Workstream A — Ingest
+## 5. Workstream A — RF Ingest and SIMD Demodulator
 
-### 4.1 Frame source
-- **Decoder:** **readsb** (preferred) or **dump1090-fa**, run only as a demodulator. We consume its **Beast binary output** on TCP port 30005. SBS-1 on port 30003 is no longer used.
-- **Output-buffering trap:** both programs batch network output by default, and that batching can add **tens to hundreds of ms** of hidden latency. We will set the flush options to their minimums (`--net-ro-size` / `--net-ro-interval`) and measure the effect directly. This is our first "before/after" data point.
-- **Socket setup:** `TCP_NODELAY`, a large `SO_RCVBUF`, non-blocking socket, and a busy-poll `recv` loop (`SO_BUSY_POLL` where supported).
+### 5.1 IQ ingest
+- Read samples directly from **librtlsdr** with `rtlsdr_read_async`, on a dedicated pinned thread. Each USB callback copies the block into a pre-allocated IQ ring and stamps it with `CLOCK_MONOTONIC_RAW` (or TSC/`CNTVCT_EL0`) and a running **sample index**.
+- **USB transfer-size experiment:** sweep the transfer size from 256 KB (≈ 55 ms of samples at 2.4 MS/s, the default) down to 16 KB (≈ 3.4 ms), and the buffer count from 2 to 32. Plot sample-to-wire latency against dropped USB transfers and against CPU and interrupt load. This single tradeoff curve is the largest latency gain in the whole system.
+- Sample-drop detection: gaps in the expected sample index, plus librtlsdr drop counters.
 
-### 4.2 Beast framing
-```
-0x1A  <type>  <6-byte 12 MHz timestamp, big-endian>  <1-byte signal>  <payload>
-type '1' = Mode A/C (2 bytes)   '2' = Mode S short (7 bytes)   '3' = Mode S long (14 bytes)
-Any 0x1A byte inside the frame is escaped as 0x1A 0x1A.
-```
-- The parser is a **resumable state machine** over the raw byte stream, because frames can be split across `recv` calls. It unescapes in place into a fixed `RawFrame` struct and never allocates.
-- Malformed input (bad type, truncated escape) resynchronizes on the next `0x1A <valid type>` and increments a counter. It never throws.
+### 5.2 Demodulator
+- **Stage 1 (2.0 MS/s):** one sample per 0.5 µs chip, the classic dump1090 layout. This is the simplest correct design, and gets us to M1 quickly.
+- **Stage 2 (2.4 MS/s):** the readsb-style demodulator with phase tracking for better sensitivity.
+- **Magnitude:** compute `|I + jQ|` with SIMD (AVX2 / NEON) using an approximation such as alpha-max-plus-beta-min. Benchmark it against the classic 64K-entry, 128 KB lookup table, which does not fit in L1. Measure cache misses for both.
+- **Preamble detection:** a vectorized correlation over the 8 µs, 4-pulse preamble pattern with relative-amplitude checks. Candidates go to a scalar bit slicer that reads 56 or 112 bits.
+- **CRC-24** check, as in §7.2. Output is a `RawFrame` (payload, sample index, signal level, host timestamp of the containing block), the same struct the Beast parser produces. Everything downstream is source-agnostic.
+- **Timing:** we own the sample counter. A frame's radio time is `block_host_time + (sample_index − block_start) / sample_rate`. This is refined by a linear fit of sample index against host time, which absorbs USB callback jitter. The result is a **sample-to-wire** latency with a known error bound.
 
-### 4.3 Timestamps
-Each frame carries two clocks:
-| Clock | Source | Used for |
-|---|---|---|
-| `rx_ns` | `clock_gettime(CLOCK_MONOTONIC)` (or TSC/`CNTVCT_EL0`, calibrated) taken right after `recv` | In-pipeline latency, replay pacing |
-| `beast_ts` | The 12 MHz counter readsb derives from the SDR sample count | Radio-time ordering, MLAT stretch goal, estimating radio → `recv` delay |
-
-We will **evaluate mapping `beast_ts` to wall-clock time** by fitting a linear model (offset plus drift) of `beast_ts` against `rx_ns` over a sliding window. The residuals of that fit show the SDR-buffer and readsb-processing delay, which is the latency we cannot otherwise see. Note that the 12 MHz counter is free-running and **not** GPS-disciplined. Its crystal drifts by tens of ppm, which matters for the MLAT stretch goal (§10.5).
-
-### 4.4 Deliverables
-- `FrameSource` interface plus `BeastTcpSource`, `RecordingSource`, and `SyntheticSource`.
-- Unit tests over captured byte streams that include split frames and escaped `0x1A` bytes.
-- A fuzz target for the Beast parser.
+### 5.3 Verification and comparison
+- **Differential against readsb** on the same IQ recordings (`--ifile`): per-frame match/miss/extra classification, sensitivity as a function of signal level, and false-decode rate.
+- Fuzz the demodulator with noise-only and clipped IQ inputs. Invariant: it never emits a frame that fails CRC.
+- **Beast TCP source retained:** readsb's Beast output on port 30005 stays as an alternative `FrameSource`. That lets the decoder (C) start before the demodulator is finished, and gives a "readsb in the path" baseline.
 
 ---
 
-## 5. Workstream B — Mode S Decoder
+## 6. Workstream B — A/B Line Arbitration
 
-### 5.1 Scope
+Exchanges publish every message on two redundant feeds (A and B). Feed handlers take whichever copy arrives first and use the other only to fill gaps. ADS-B fits this naturally if we run **two independent radio chains at the same site**.
+
+### 6.1 Setup
+- Two RTL-SDRs with separate antennas, placed apart and ideally on separate USB controllers, so their losses are independent (multipath, interference, and USB drops differ per line).
+- Each line runs its own ingest and demodulator threads into its own SPSC ring to the arbiter.
+
+### 6.2 Arbitration
+- ADS-B has **no sequence numbers**, so frame identity is **the payload itself** (56 or 112 bits) within a short host-time window.
+- The arbiter keeps a small open-addressing table of `(payload hash → first-seen time, line)` entries with a **5 ms** window. That is far below the minimum spacing of legitimately repeated identical payloads (≥ ~400 ms for position and identity messages), so a real repeat is never discarded.
+- The first arrival is forwarded and the second is dropped and counted. There is no waiting on the slower line: arbitration adds only a table lookup to the fast line's latency.
+
+### 6.3 Measurements
+- **Unique-frame contribution of each line:** frames only A received, only B received, and both.
+- **Win rate and win margin:** the distribution of `t_late − t_early` for frames received on both lines. This is the latency saved by arbitration.
+- **Relative clock behavior of the two dongles:** at the same site, the true arrival-time difference is about 0. Comparing the two sample counters directly measures their crystal offset and drift, which is the groundwork for multilateration (§15.4).
+- Fault injection: unplug, detune, or attenuate one line, and show that the output feed has no gap.
+
+---
+
+## 7. Workstream C — Mode S Decoder
+
+### 7.1 Scope
 | Downlink Format | Content | CRC handling |
 |---|---|---|
 | **DF17** | ADS-B Extended Squitter (main target) | Parity must be 0. ICAO address is in the clear. |
 | **DF18** | TIS-B / ADS-R / non-transponder | Parity must be 0 |
 | **DF11** | All-call reply | Parity XOR interrogator ID; accept IID 0 only |
-| DF4/5/20/21 | Surveillance altitude/identity | Address/parity: recover the ICAO from the CRC residual and accept it **only if the ICAO is already a known live track** |
-| DF0/16 | ACAS | Parsed later if time allows |
+| DF4/5/20/21 | Surveillance altitude/identity | Recover ICAO from the CRC residual; accept **only if the ICAO is already a live track** |
 
 DF17 type codes decoded:
 | TC | Message | Fields |
@@ -158,64 +213,54 @@ DF17 type codes decoded:
 | 1–4 | Identification | Callsign (6-bit charset, 8 chars), emitter category |
 | 5–8 | Surface position | Surface CPR (local decode against receiver position), ground speed, track |
 | 9–18 | Airborne position (baro altitude) | CPR lat/lon, 12-bit altitude (Q-bit 25 ft or Gillham 100 ft) |
-| 19 | Airborne velocity | Subtypes 1/2 (ground speed, E/W and N/S components) and 3/4 (airspeed and heading), vertical rate |
-| 20–22 | Airborne position (GNSS height) | As above, but geometric altitude |
-| 28 / 29 / 31 | Status, target state, operational status | Squawk/emergency, selected altitude, NIC/NAC/SIL (used as position-quality metadata) |
+| 19 | Airborne velocity | Subtypes 1/2 (ground speed) and 3/4 (airspeed and heading), vertical rate |
+| 20–22 | Airborne position (GNSS height) | As above, with geometric altitude |
+| 28 / 29 / 31 | Status, target state, operational status | Squawk/emergency, selected altitude, NIC/NAC/SIL |
 
-### 5.2 Implementation details
-- **CRC-24** (generator `0xFFF409`) uses byte-wise table lookup: one 256-entry `uint32_t` table, 1 KB, so it stays in L1. A slice-by-4 variant will be benchmarked. Single-bit error correction is **off by default**, because it trades false decodes for coverage. It can be switched on and its effect measured.
-- **Bit extraction:** load the 112-bit message into two `uint64_t` registers and extract fields with constant shifts and masks. No byte-by-byte loops.
+### 7.2 Implementation details
+- **CRC-24** (generator `0xFFF409`): a 256-entry, 1 KB table, so it stays in L1. Slice-by-4 and a carry-less-multiply (PCLMULQDQ / PMULL) variant are benchmarked. Single-bit error correction is off by default, and its effect on false decodes is measured.
+- **Bit extraction:** load the 112-bit message into two `uint64_t` registers and extract fields with constant shifts and masks.
 - **CPR decoding:**
-  - **Global decode** needs an even/odd pair from the same aircraft received **within 10 s** (event time). The most recent pair is stored inside the track record (§6). The NL (number of longitude zones) lookup is a precomputed 59-entry latitude threshold table, so `acos`/`cos` is never called on the hot path.
-  - **Local decode** against the aircraft's last known position, or the receiver location, handles single frames once a track has a position.
-  - **Reasonableness check:** reject a position if the implied speed from the previous fix is above Mach 1 or the jump is larger than 180 NM. Count rejections.
-- **Output:** a fixed-size `DecodedMsg` POD (ICAO, DF/TC, field bitmask, the field values, `rx_ns`, `beast_ts`). No strings anywhere.
+  - **Global decode** needs an even/odd pair from the same aircraft within 10 s (event time). The NL lookup is a precomputed 59-entry threshold table, so no trigonometry runs on the hot path.
+  - **Local decode** against the last known position, or the receiver position.
+  - **Reasonableness check:** reject a position if the implied speed is above Mach 1 or the jump exceeds 180 NM. Rejections are counted.
+- **Output:** a fixed-size `DecodedMsg` POD. No strings anywhere.
 
-### 5.3 Verification
-1. **Known vectors:** the worked examples from *The 1090 MHz Riddle* (J. Sun) and the **pyModeS** test suite become unit tests.
-2. **Differential oracle:** replay a recorded session into readsb's Beast input port (30004) and also into our decoder, then diff the decoded fields per frame (ICAO, callsign, altitude, velocity, lat/lon to 1e-5°). **pyModeS** is a second, independent oracle. Any mismatch fails CI.
-3. **Fuzzing:** libFuzzer with ASan and UBSan on `decode(const uint8_t*, size_t)`, seeded with real frames. Invariants: no crash, no out-of-bounds read, a frame with bad CRC is never emitted as valid, and decoded values stay in physical ranges.
-4. **Property tests:** encode → decode round trips for CPR and altitude across the full input range.
+### 7.3 Verification
+1. Known vectors from *The 1090 MHz Riddle* (J. Sun) and the **pyModeS** test suite.
+2. **Differential oracle:** the same recording is decoded by readsb (fed through its Beast input on port 30004) and by our decoder. Fields are diffed per frame. **pyModeS** is a second oracle.
+3. **libFuzzer** with ASan and UBSan, seeded with real frames.
+4. Property tests: CPR and altitude encode → decode round trips across the full input range.
 
 ---
 
-## 6. Workstream C — Track State Engine
+## 8. Workstream D — Track State Engine
 
-### 6.1 Data structure
-- An **open-addressing hash table** keyed by 24-bit ICAO. Capacity is a fixed power of two (default 8,192 slots, about 4× the largest realistic live count, so load factor stays at or below 0.25 live and 0.5 under synthetic load). It uses **linear probing**, a multiplicative (Fibonacci) hash of the ICAO, and **backward-shift deletion**, so there are no tombstones.
-- **A cache-conscious record split:**
-  - *Index array:* `uint32_t icao` plus `uint32_t slot` (8 B per entry, 8 entries per cache line). Probing touches only this array.
-  - *Hot record:* exactly **64 bytes, cache-line aligned**. It holds lat/lon (int32 at 1e-7°), altitude, ground speed, track, vertical rate, last-update event time, a per-field "last updated" bitmask, and the outgoing sequence number.
-  - *Cold record:* callsign, squawk, category, NIC/NAC, CPR even/odd pair buffers, and counters. It is touched only when those messages arrive.
-- **Baseline for comparison:** `std::unordered_map<uint32_t, Track>` with the same API (node-based, with an allocation on insert). We also benchmark `absl::flat_hash_map` as a "good off-the-shelf" reference point.
+### 8.1 Data structure
+- An **open-addressing hash table** keyed by 24-bit ICAO. Capacity is a power of two (default 8,192). It uses linear probing, a Fibonacci hash, and backward-shift deletion (no tombstones).
+- **A cache-conscious split:** an index array of `icao` and `slot` (8 B per entry, 8 per cache line), a **64-byte cache-line-aligned hot record** (position, altitude, velocity, timestamps, update bitmask), and a cold record (callsign, squawk, quality, CPR buffers, counters).
+- **Baselines:** `std::unordered_map<uint32_t, Track>` and `absl::flat_hash_map`.
 
-### 6.2 Semantics
+### 8.2 Semantics
 | Concern | Rule |
 |---|---|
-| **Duplicates** (same frame seen twice: readsb duplicates or multiple receivers) | A 64-entry ring per track of `(hash(payload), beast_ts)`. Drop if the same payload is seen within 2 ms event time. |
-| **Out-of-order frames** | Each field group (position, velocity, identity) keeps its own event timestamp. An update older than the stored one is dropped for that field and counted. CPR pairing always uses the newest even and newest odd frame. |
-| **Stale-track expiry** | A **timing wheel** with 1 s buckets and a 64 s horizon, driven by event time. Tracks with no update for 60 s are evicted and a `TrackDelete` message is published. Expiry costs O(1) per tick, with no full-table sweep. |
-| **Change detection** | A `TrackUpdate` is published only when a field actually changes. The update bitmask tells subscribers which fields changed. |
+| **Duplicates** | Removed across lines by the arbiter (§6). Within a single line, a per-track ring of `(payload hash, time)` catches demodulator double-detections. |
+| **Out-of-order frames** | Each field group keeps its own event timestamp. Older updates are dropped and counted. |
+| **Stale-track expiry** | A **timing wheel** (1 s buckets, 64 s horizon) driven by event time. A track is evicted after 60 s of silence and a `TrackDelete` is published. |
+| **Change detection** | A `TrackUpdate` is published only when a field actually changes. The bitmask tells subscribers which fields changed. |
 
-### 6.3 Benchmarks
-- Google Benchmark microbenchmarks: lookup hit, lookup miss, insert, and update, at 100 / 1k / 10k live tracks, with uniform and Zipf-skewed ICAO distributions (real traffic is skewed). Reported as ns/op and cache misses/op from `perf stat`.
-- End-to-end: the state stage's latency histogram under replay at 1×, 100×, and max speed, compared against the `unordered_map` build.
+### 8.3 Benchmarks
+- Google Benchmark: lookup hit, lookup miss, insert, and update at 100 / 1k / 10k tracks, with uniform and Zipf-skewed key distributions. Reported as ns/op, cycles/op, and cache misses/op.
+- End-to-end state-stage histograms under replay at 1×, 100×, and max speed, against both baselines.
 
 ---
 
-## 7. Workstream D — Feed Distribution (UDP Multicast)
+## 9. Workstream E — Feed Distribution and Transports
 
-### 7.1 Framing: modeled on Nasdaq MoldUDP64
-Using a real exchange framing scheme keeps us honest. It is also what the market-data stretch goal will reuse unchanged.
+### 9.1 Framing: modeled on Nasdaq MoldUDP64
+**Packet header (20 bytes):** `session` char[10] (changes on every publisher restart), `seq` u64 (sequence number of the first message), `count` u16 (`0` = heartbeat, `0xFFFF` = end of session). It is followed by `count` message blocks, each prefixed with a `u16` length.
 
-**Packet header (20 bytes)**
-| Field | Type | Notes |
-|---|---|---|
-| `session` | char[10] | Changes on every publisher restart. A subscriber that sees a new session resets its state. |
-| `seq` | u64 | Sequence number of the **first message** in this packet |
-| `count` | u16 | Number of messages. `0` = heartbeat. `0xFFFF` = end of session. |
-
-This is followed by `count` message blocks, each prefixed with `u16 length`. All integers are **little-endian**. MoldUDP64 itself is big-endian, but every machine we use is little-endian, so we deviate here on purpose and say so in the spec.
+Byte order: **little-endian for our own ADS-B messages**, a deliberate deviation recorded in the spec. **ITCH payloads (§14) are carried unchanged in their native big-endian form**, because MoldUDP64 is ITCH's real transport, so the framing layer is shared exactly.
 
 **`TrackUpdate` (64 bytes, fixed). Draft layout:**
 | Offset | Field | Type | Unit |
@@ -224,251 +269,320 @@ This is followed by `count` message blocks, each prefixed with `u16 length`. All
 | 1 | `version` | u8 | 1 |
 | 2 | `update_mask` | u16 | which fields changed |
 | 4 | `icao` | u32 | lower 24 bits |
-| 8 | `event_ts_ns` | u64 | frame rx time |
-| 16 | `beast_ts` | u64 | 12 MHz counter |
+| 8 | `event_ts_ns` | u64 | radio time of the frame (§5.2) |
+| 16 | `sample_index` | u64 | per-line sample counter, with the line ID in the top 4 bits |
 | 24 | `lat_e7` / `lon_e7` | i32 ×2 | 1e-7 deg |
-| 32 | `alt_ft` | i32 | ft (baro or GNSS, per a flag) |
+| 32 | `alt_ft` | i32 | ft |
 | 36 | `gs_dkt` | u16 | 0.1 kt |
 | 38 | `track_cdeg` | u16 | 0.01 deg |
 | 40 | `vrate_fpm` | i16 | ft/min |
 | 42 | `squawk` | u16 | BCD |
 | 44 | `callsign` | char[8] | space-padded |
-| 52 | `category`, `nic`, `flags` | u8 ×3 | |
+| 52 | `category`, `nic`, `flags` | u8 ×3 | `flags` includes baro/GNSS altitude and winning line |
 | 55 | reserved | u8 | |
-| 56 | `publish_ts_ns` | u64 | stamped right before `sendmsg`, for wire latency |
+| 56 | `publish_ts_ns` | u64 | software timestamp taken just before transmit |
 
-Other message types: `TrackDelete` (16 B), `Heartbeat` (as an empty packet), and later `FusionMatch` / `UnidentifiedObject` (from camera fusion) and `BookUpdate` (stretch). The spec lives in `protocol/feed_spec.md`. Matching struct definitions for **C++, JavaScript (DataView), and Python (`struct`/NumPy dtype)** are generated from one schema file so they cannot drift apart. A CI test checks that all three parse a golden packet identically.
+Other message types: `TrackDelete` (16 B), `FusionMatch` / `UnidentifiedObject` (fusion), and ITCH messages (unchanged). The spec lives in `protocol/feed_spec.md`. **C++, JavaScript, and Python struct definitions are generated from one schema file**, and CI checks a golden packet across all three.
 
-### 7.2 Publishing policy
-- A UDP payload of at most 1,472 bytes (so no IP fragmentation) holds 20 + 22 × (2 + 64) = **1,472 bytes, so 22 messages per packet**.
-- **Flush policy** is configurable and part of the benchmark: `immediate` (one message per packet, lowest latency) versus `batch` (flush when full or after N µs). We will plot the latency/throughput tradeoff.
-- Socket options: `IP_MULTICAST_TTL=1`, `IP_MULTICAST_LOOP` on (single-host testing), and a large `SO_SNDBUF`. Publishing must go over **wired Ethernet**. Wi-Fi multicast is rate-limited and lossy, and it will look like a gap-recovery bug.
+### 9.2 Publishing policy
+- A packet holds 20 + 22 × (2 + 64) = **1,472 bytes**, which fits a 1500-byte MTU with no fragmentation.
+- Flush policy is part of the benchmark: `immediate` versus `batch` (flush when full or after N µs). We plot the latency/throughput tradeoff.
+- `IP_MULTICAST_TTL=1`, **wired Ethernet only**. Wi-Fi multicast is rate-limited and lossy.
 
-### 7.3 Gap detection and recovery
-1. A subscriber tracks `expected_seq`. On `seq > expected_seq` it buffers what arrived and sends a **retransmit request** (`session`, `seq`, `count`) by unicast UDP to the **retransmit server**. That server is a separate thread holding a ring of the last 65,536 messages (about 4 MB).
-2. If the gap is older than the ring, the subscriber falls back to the **snapshot server** (TCP). It receives the full track table tagged "as of seq N", then applies buffered incrementals with `seq > N`. This is the same pattern exchanges use for late joiners.
-3. Heartbeats (an empty packet carrying the next `seq`) are sent every 1 s, so a subscriber detects a gap even when traffic stops.
-4. **Testing:** a `--drop-rate p` / `--drop-burst k` fault injector in the publisher, plus `tc netem` on Linux. The test asserts that after recovery, the subscriber's reconstructed table is byte-identical to the publisher's.
+### 9.3 Transports (selected at startup, compared on identical histograms)
+| Transport | Implementation notes |
+|---|---|
+| **Kernel UDP** | `sendmsg`/`recvmmsg` with `SO_BUSY_POLL`. This is the baseline. |
+| **io_uring** | `IORING_SETUP_SQPOLL`, so a kernel thread polls submissions and no syscall is made per packet. Registered buffers. |
+| **AF_XDP** | Publisher: an XSK socket in TX mode, building Ethernet, IPv4, and UDP headers ourselves (multicast MAC `01:00:5e` plus the low 23 bits of the group address). Subscriber: a small XDP/eBPF program redirects our UDP port into the XSK map and passes everything else to the kernel. **Zero-copy needs driver support** (Intel `igc` / `i40e` / `ice`, Mellanox `mlx5`). The Pi 5's NIC runs in copy mode only, and we report both. |
+| **Shared-memory broadcast ring** | For subscribers on the same host: a single-producer, multi-consumer log on `/dev/shm` backed by huge pages (Aeron / LMAX Disruptor style). Each consumer keeps its own cursor. A consumer that falls a full lap behind detects it from the sequence number and recovers from a snapshot. |
 
-### 7.4 Subscribers
+### 9.4 Hardware timestamps and clock sync
+- `SO_TIMESTAMPING` with `SOF_TIMESTAMPING_TX_HARDWARE` and `RX_HARDWARE` on publisher and subscriber NICs. Check support with `ethtool -T`.
+- **linuxptp:** `ptp4l` syncs the NIC clocks between hosts, and `phc2sys` syncs each NIC clock to its system clock. We report the PTP offset alongside every cross-host result.
+- That splits each packet's journey into measured segments: **software → NIC TX** (stack latency), **TX → RX** (wire plus switch, or direct cable), and **NIC RX → application** (receive path).
+
+### 9.5 Gap detection and recovery
+1. On `seq > expected_seq`, the subscriber buffers what arrived and sends a unicast **retransmit request** to the retransmit server, which holds a ring of the last 65,536 messages (about 4 MB).
+2. If the gap is older than that ring, the subscriber falls back to the **snapshot server** (TCP): full table "as of seq N", then the buffered messages with `seq > N`.
+3. Heartbeats every 1 s, so a subscriber detects a gap even when traffic stops.
+4. Fault injection (`--drop-rate`, `--drop-burst`, `tc netem`). The test asserts that the reconstructed table is **byte-identical** to the publisher's.
+
+### 9.6 Subscribers
 | Subscriber | Language | Purpose |
 |---|---|---|
-| `feed-cli` | C++ | Prints, measures one-way latency (`now − publish_ts_ns`), and verifies sequence numbers |
-| **WebSocket gateway** | Node (`dgram` multicast) | Browsers cannot join multicast. The gateway joins the group and pushes binary frames to the existing Leaflet/Cesium UI over WebSocket, **replacing the 2 s database polling**. It throttles to the display rate for each browser independently. |
-| Camera fusion | Python | §9 |
-| Archiver (optional) | Python | Writes to the existing Postgres schema so history, statistics, and trails keep working |
+| `feed-cli` | C++ | Sequence verification and latency probe (software and hardware RX timestamps) |
+| **WebSocket gateway** | Node (`dgram` multicast) | Pushes binary frames to the existing Leaflet/Cesium UI, **replacing the 2 s database polling**. Subscribes to the conflated feed. |
+| Camera fusion | Python | §13 |
+| Archiver (optional) | Python | Keeps the existing Postgres history, statistics, and trails working |
 
 ---
 
-## 8. Workstream E — Record, Replay, and Measurement
+## 10. Workstream F — Overload Semantics and Conflation
 
-### 8.1 Recording format (`.adsbrec`)
-```
-File header: magic "ADSBREC1", version, receiver id, receiver lat/lon/alt, start wall-clock time,
-             clock calibration (TSC frequency), build git hash
-Records:     u64 rx_ns | u64 beast_ts | u8 type | u8 signal | u8 len | payload[len]   (packed, append-only)
-Footer:      record count, CRC32 of file
-```
-- The recorder is a tap on the ingest stage through its own SPSC ring, so disk I/O never blocks the hot path. A full ring drops records and counts the drops, rather than applying backpressure.
-- Replay reads the file through `mmap` with `MADV_SEQUENTIAL`.
-- **Datasets to capture early:** a quiet hour, a peak hour, a 24-hour run, and sessions recorded alongside camera video (§9). Raw IQ samples (`rtl_sdr`) are also captured for a few minutes, which the FPGA stretch goal needs.
+A feed handler is judged by what it does when it cannot keep up, not only by how fast it is when it can.
 
-### 8.2 Deterministic replay
-- Speeds: `1×` (original inter-arrival times), `N×` (scaled), and `max` (as fast as the pipeline accepts input).
-- **Determinism contract:** for a given recording and build, the sequence of published messages, excluding the `*_ts_ns` wall-clock fields, is **byte-identical** across runs and replay speeds. This works because all state logic uses event time (§3). CI replays a reference recording and compares a SHA-256 of the output stream against a stored golden hash.
+### 10.1 Overload policy at each boundary
+| Boundary | Policy | Reason |
+|---|---|---|
+| SDR → IQ ring | **Drop the sample block** and count it | The radio cannot be paused. Loss is recorded at the single place it can occur. |
+| IQ ring → demodulator → arbiter → decode/state → publish | **Producer spins** (lossless inside the pipeline) | Internal stages stay lossless, so pressure shows up at the SDR boundary as counted drops. |
+| Publisher → network | **Never block**. A socket-buffer or XSK ring overflow is counted. | Subscribers recover through gap recovery. |
+| Shared-memory ring → consumer | **Producer never waits**. A lapped consumer resyncs from a snapshot. | A slow consumer must never slow the producer. |
 
-### 8.3 Measurement harness
-- **Timestamp points:** t0 = after `recv`, t1 = frame parsed, t2 = decoded, t3 = state updated, t4 = after `sendmsg`. The timestamps travel with the message through the rings, so each stage boundary is measured on the same frame.
-- **Histograms:** per-thread, fixed-memory, log-linear buckets (HdrHistogram style, 3 significant digits, 1 ns to 10 s). Recording costs no allocation and no shared cache lines. Histograms are merged when the run ends. Reported per stage and end to end: **p50, p90, p99, p99.9, p99.99, max**, plus throughput.
-- **Coordinated omission:** in fixed-rate replay, latency is measured from the **intended** send time, not the actual one, so a stalled pipeline cannot hide its own stall.
-- **Methodology:** warm up for 5 s, use ≥ 5 runs per configuration, fix CPU frequency, isolate cores, and record machine and kernel config in every result file. Results go to `bench/results/<date>-<config>.json`, and a Python script plots them.
+### 10.2 Conflated feed
+- A separate multicast group carrying **only the latest state per aircraft** at a configurable rate (default 10 Hz). It is built from a per-ICAO dirty bitmap, so the cost is proportional to the number of changed aircraft, not total aircraft.
+- The browser gateway and camera fusion subscribe here, as real vendors do with slow consumers.
 
-### 8.4 Synthetic load generator
-- Takes a recording and **multiplies the traffic**: each copy XORs every ICAO with a different constant (and recomputes CRC/address-parity) and offsets positions. This scales from about 200 to **10,000+ simultaneous aircraft** at real message mixes and up to millions of frames per second.
-- It can also inject pathological cases: duplicate bursts, reordered frames, corrupt CRCs, and CPR pairs split across the 10 s window.
+### 10.3 Measurements
+- Run the load generator at 1×, 2×, and 10× the measured saturation rate. Report where loss occurs, how much, how quickly the system recovers, and how latency degrades. Healthy degradation means a bounded queue delay and loss counted only at the SDR boundary, with no crash and no unbounded memory.
 
-### 8.5 Baselines: before versus after
+---
+
+## 11. Workstream G — Record, Replay, and Measurement
+
+### 11.1 Recording formats
+- **`.iqrec`:** raw 8-bit IQ samples with periodic `(sample_index, host_time)` anchors and a header (line ID, sample rate, gain, center frequency, receiver position). It is the input for the demodulator, the readsb diff, and the FPGA work.
+- **`.adsbrec`:** frames (`rx_ns`, `sample_index`, line, type, signal, payload) with a header and a footer CRC. It is the input for the decoder and state benchmarks.
+- Recorders are taps on their own SPSC rings, so disk I/O never blocks the hot path. A full ring drops records and counts them.
+- **Datasets:** a quiet hour, a peak hour, a 24-hour frame run, and A/B IQ captures (a few minutes at a time, about 4.8 MB/s per line at 2.4 MS/s).
+
+### 11.2 Deterministic replay
+- Speeds: `1×`, `N×`, `max`.
+- **Determinism contract:** for a given recording and build, the published message stream, excluding wall-clock timestamp fields, is **byte-identical** across runs and speeds. CI compares a SHA-256 of the stream against a golden hash.
+
+### 11.3 Measurement harness
+- **Timestamp points:** first preamble sample (radio time) → frame demodulated → arbitrated → decoded → state updated → transmitted (software) → **NIC TX (hardware)** → **subscriber NIC RX (hardware)** → subscriber application.
+- **Histograms:** per-thread, fixed-memory, log-linear (HdrHistogram-style, 1 ns to 10 s), merged after the run. Reported: p50, p90, p99, p99.9, p99.99, max, and throughput. CPU-bound stages are also reported in **cycles** using `rdtsc` / `CNTVCT_EL0` and `perf stat` counters.
+- **Coordinated omission:** latency is measured from the **intended** send time during fixed-rate replay.
+- **Methodology:** warmup, ≥ 5 runs per configuration, pinned frequency, isolated cores, and host configuration recorded in every result file (`bench/results/*.json`).
+
+### 11.4 Synthetic load generator
+- Multiplies traffic from a recording by remapping ICAOs (recomputing CRC) and offsetting positions: **10,000+ aircraft**, up to millions of frames per second.
+- Injects pathological cases: duplicate bursts, reordered frames, corrupt CRCs, and split CPR pairs.
+- Also generates **synthetic IQ**: frames modulated into noise at a chosen signal-to-noise ratio, for demodulator sensitivity curves with known ground truth.
+
+### 11.5 Baselines: before versus after
 | Comparison | "Before" | "After" |
 |---|---|---|
-| **System level** | Fall 2025 Python SBS-1 → Postgres → 2 s poll | C++ Beast → multicast → WebSocket |
-| **Implementation level** (same C++ code, chosen by a build flag) | `std::mutex` + `std::condition_variable` queues, `std::unordered_map`, `std::string` callsigns, heap allocation per message, unpinned threads | SPSC rings, open-addressing table, POD messages, no allocation, pinned and isolated cores |
-| **Ablation** | Turn each optimization off one at a time | This shows which change actually bought the improvement |
-| **dump1090 output buffering** | Default flush settings | Minimum flush |
+| **System level** | Fall 2025: dump1090 → SBS-1 → Python → Postgres → 2 s poll | IQ → own demodulator → A/B → C++ → multicast → WebSocket |
+| **Radio path** | readsb in the path, default buffers | Own demodulator, tuned USB transfer size |
+| **Implementation level** (same code, chosen by a build flag) | Mutex and condition-variable queues, `unordered_map`, `std::string`, heap allocation per message, unpinned threads | SPSC rings, open addressing, POD messages, no allocation, pinned and isolated cores |
+| **Transport** | Kernel UDP | io_uring, AF_XDP, shared memory |
+| **Ablation** | Each optimization turned off one at a time | Shows which change bought the improvement |
 
-### 8.6 Tail analysis
-For every configuration, we explain the p99.9 and max values, not just report them. Tools: `perf record` and `perf stat` (cache misses, branch misses, page faults), `perf sched` and `ftrace` (context switches, IRQ preemption), `/proc/interrupts`, and comparing the timing of outliers against kernel activity. Expected causes, which we will test one at a time: page faults (fixed by `mlockall` and pre-faulting), IRQs on pipeline cores (fixed by IRQ affinity), CPU frequency changes, SMT siblings, timer ticks (`nohz_full`), and hash table probe-length spikes.
-
----
-
-## 9. Workstream F — Camera Fusion
-
-### 9.1 Setup
-- **Camera:** a Raspberry Pi HQ Camera (12 MP, interchangeable lens) or a USB camera with a manual-focus telephoto lens, mounted on a fixed tripod.
-- **Site:** pointed at the **approach or departure path of Willard Airport (CMI)**, where aircraft are low, close, and large enough in the image. An airliner at cruise altitude would cover only a few pixels.
-- **Compute:** a separate laptop or Jetson-class machine, **not** the pipeline host. That keeps inference off the latency-critical cores.
-
-### 9.2 Pipeline (separate process, subscribes to the multicast feed)
-1. **Frame capture with timestamps:** use the sensor timestamp from libcamera / V4L2, which is on `CLOCK_MONOTONIC`, mapped to `CLOCK_REALTIME`. All machines run **chrony** against the same NTP server (or PTP if the NICs support it). The offset between the camera host and the pipeline host is logged continuously.
-2. **Extrapolation:** ADS-B positions are seconds old by the time a frame is captured. Each track is propagated to the **exact frame time** with a constant-velocity Kalman filter in local ENU coordinates (a port of the existing [kalman-filter.js](ads/kalman-filter.js) model), producing a predicted position and covariance.
-3. **Projection:** geodetic → ECEF → camera-centered ENU → camera frame (extrinsic rotation R, t) → pinhole plus distortion (intrinsics K, d) → pixel (u, v). The position covariance is projected too, giving a **pixel uncertainty ellipse**.
-4. **Region-of-interest detection:** the detector runs only inside each track's 3σ ellipse plus a margin, which is the main optimization. Tracks predicted outside the field of view are skipped.
-5. **Full-frame scan at low rate (for example 1 Hz):** ROI-only detection **cannot find aircraft that are not broadcasting**, by construction. A periodic full-frame pass finds candidates that are then checked against all tracks.
-6. **Detection:** we evaluate two detectors on our footage:
-   - *Classical:* sky background subtraction and blob detection. Fast, and good for small dark targets against a uniform sky.
-   - *Learned:* a YOLOv8n-class model (via ONNX Runtime). Better against clutter, slower.
-7. **Matching:** Hungarian assignment on Mahalanobis distance in pixel space, with χ² gating. A detection that stays unmatched for ≥ N consecutive frames is flagged as an **Unidentified Object** and published on the fusion multicast group, then highlighted in the GUI.
-
-### 9.3 Calibration
-- **Intrinsics:** OpenCV checkerboard calibration, done once per lens and focus setting.
-- **Extrinsics:** a surveyed camera position (lat/lon/alt), then azimuth, elevation, and roll solved with `solvePnP`, **using matched ADS-B aircraft as the calibration targets**. Their positions are known, so the system refines its own pointing over time. A star field at night gives an independent check.
-
-### 9.4 What we measure
-- Clock offset and jitter between hosts, and the projection error (in pixels) it causes.
-- Camera capture latency, measured by filming a high-resolution clock or LED on a screen.
-- Inference latency with ROI versus full frame, and the speedup.
-- **Isolation check:** pipeline latency histograms with fusion running versus not running. A correctly isolated design shows no difference.
-- Match rate and false-match rate on labeled footage.
-
-### 9.5 Extension: weather and visibility
-- Classify sky conditions (clear, haze, fog, rain) from image features such as contrast, dark-channel prior, and edge density, validated against the **CMI METAR** for the same time.
-- Use **"maximum distance at which known ADS-B aircraft are still detected"** as a visibility metric that needs no ground truth. That metric directly supports deciding **when free-space optical (FSO) links are viable**, a concern relevant to microwave and laser HFT networks.
+### 11.6 Tail analysis
+Every p99.9 and max value is explained, not just reported. Tools: `perf record` / `perf stat`, `perf sched`, `ftrace`, `bpftrace` (scheduler and IRQ events lined up against outlier timestamps), and `/proc/interrupts`. Candidate causes, tested one at a time: page faults, IRQs, frequency transitions, SMT siblings, timer ticks, USB callback jitter, hash table probe-length spikes, and last-level-cache contention (§13).
 
 ---
 
-## 10. Stretch Goals
+## 12. Workstream H — Correctness and Verification
 
-We pick these up in this order once the core is done (§14). Each reuses the core rather than starting from scratch.
-
-### 10.1 Market data adapter and limit order book
-- **Venue:** the **Kraken v2 WebSocket `book` channel** (public, no auth). It publishes a **CRC32 checksum of the top 10 levels** with each update, which gives us a built-in correctness oracle for our book. Coinbase Advanced Trade `level2` is the fallback.
-- **Pipeline:** WebSocket ingest → simdjson parse → normalize to fixed-size `BookDelta` → L2 book (price-indexed arrays around the mid price for the top levels, plus a sorted fallback for outliers) → publish `BookUpdate` over the **same** MoldUDP64-style feed. Snapshot-then-delta reconciliation mirrors §7.3.
-- **Measured:** the same per-stage histograms, plus the checksum mismatch rate (target: 0).
-
-### 10.2 Strategy layer and backtester
-- An event-driven strategy API (`on_book_update`, `on_trade`, `on_timer`) that runs identically live (paper) and in replay.
-- The backtester replays recorded book data with **simulated feed latency and order latency** (configurable distributions) and a simple queue-position fill model. It reports PnL, fill ratio, and **PnL sensitivity to latency**, which is the curve that motivates the whole project.
-- **Paper only:** no orders are ever sent to a real exchange.
-
-### 10.3 Hardware demodulator (FPGA)
-- Preamble detector (8 µs, 4-pulse pattern), PPM bit slicer, and streaming CRC-24 checker in SystemVerilog. It outputs Beast-format frames, so it plugs into the existing `FrameSource` interface unchanged.
-- **Path:** (1) verify in **Verilator** against the raw IQ recordings from §8.1, diffing frames against dump1090 run on the same IQ file. (2) Deploy to a board if one is available, with samples streamed from the host. A direct RF front end is only possible on a board with an ADC.
-- **Measured:** frames decoded versus dump1090 at matched signal levels, and the processing latency per sample block.
-
-### 10.4 Multilateration across receiver stations
-- **Needs:** ≥ 3 stations (≥ 4 for full 3D without barometric altitude) **several km apart** with overlapping coverage, all publishing their feeds with `beast_ts`.
-- **Clock sync is the hard part:** RTL-SDR counters are not synchronized and drift. We use the approach mlat-server uses. **Reference aircraft** that broadcast their own ADS-B positions let us solve for each station's clock offset and drift continuously. GPS-disciplined oscillators are an alternative if hardware is available.
-- **Solver:** TDOA equations solved by Gauss-Newton or Levenberg-Marquardt, seeded with the last known position.
-- **Validation:** for ADS-B-equipped aircraft, we have ground truth. We report the MLAT error distribution against their self-reported positions. The 12 MHz counter resolution (about 83 ns, or about 25 m) sets a theoretical floor. We expect errors in the hundreds of meters in practice.
+| Technique | Applied to | What it proves |
+|---|---|---|
+| **TLA+ model plus TLC model checking** | Sequenced feed, retransmit, snapshot, and session restart, under loss, duplication, and reordering | Safety: every message is applied exactly once, in sequence order. Liveness: a subscriber that keeps receiving packets eventually matches the publisher's state. Checked within bounded model sizes. |
+| **Memory-model testing** | SPSC ring and shared-memory broadcast ring | ThreadSanitizer, multi-hour stress runs on **ARM** (the Pi 5, where weak memory ordering exposes bugs x86 hides) and on x86, plus **GenMC** model checking of the ring core written with C11 atomics |
+| **Deterministic simulation testing** | Publisher, retransmit/snapshot servers, and subscribers in one process, with simulated network and clock | Millions of seeded fault schedules in nightly CI. Any failure replays exactly from its seed. |
+| **Fuzzing** (libFuzzer + ASan/UBSan) | Beast parser, Mode S decoder, demodulator, ITCH parser | No crashes, no out-of-bounds reads, no invalid frames emitted |
+| **Differential oracles** | Demodulator against readsb (IQ), decoder against readsb and pyModeS, ITCH book against a reference implementation (§14) | Agreement within documented tolerances |
+| **Determinism hash** | Full pipeline replay | Byte-identical output across runs |
 
 ---
 
-## 11. Repository Layout
+## 13. Workstream I — Noisy Neighbor and Camera Fusion
 
-New directories are added next to the existing ones. The Fall 2025 code is kept unchanged as the system-level baseline.
+Camera fusion is kept, but its main purpose is now a systems experiment. **Colocated workloads compete with the pipeline for cores, cache, and memory bandwidth**, which is a real production concern for trading servers. The fusion process is a realistic noisy neighbor: CPU-heavy, cache-thrashing, and bursty.
+
+### 13.1 Interference experiment
+Run fusion inference, plus `stress-ng` memory workers as a controlled second neighbor, **on the same host** as the pipeline, and measure the pipeline's histograms in each configuration:
+
+| Configuration | Expected effect |
+|---|---|
+| Pipeline alone | Baseline |
+| + neighbor, no isolation | Tail latency grows from preemption and cache contention |
+| + core isolation (`isolcpus`, `nohz_full`) | Removes preemption. Last-level-cache contention remains. |
+| + **Cache Allocation Technology** (`resctrl` L3 partition) | Removes most last-level-cache contention |
+| + **Memory Bandwidth Allocation** | Limits the neighbor's DRAM bandwidth |
+| + IRQ affinity | Removes interrupt noise on the pipeline cores |
+
+This requires Intel RDT or AMD PQoS (check `/sys/fs/resctrl` and the `cat_l3` / `rdt_a` CPU flags). If the benchmark host lacks it, we report core isolation results and document the gap.
+
+### 13.2 Minimal fusion pipeline
+1. **Camera:** a Pi HQ Camera or a USB camera with telephoto lens, pointed at the **CMI approach path**, where aircraft are large enough in the image.
+2. **Timing:** sensor timestamps from libcamera / V4L2. chrony on every host, with offset logged.
+3. **Extrapolation:** a constant-velocity Kalman filter in ENU coordinates (a port of [kalman-filter.js](ads/kalman-filter.js)) predicts each track's position at the exact frame time, consuming the **conflated feed**.
+4. **Projection:** geodetic → ECEF → ENU → camera frame → pixel, with the covariance projected to a pixel uncertainty ellipse. Intrinsics come from a checkerboard. Extrinsics come from `solvePnP` using matched ADS-B aircraft as calibration targets.
+5. **ROI detection:** run only inside each track's 3σ ellipse, plus a **1 Hz full-frame scan** to find aircraft that are not broadcasting.
+6. **Matching:** Hungarian assignment on Mahalanobis distance with χ² gating. A detection unmatched for N frames is published as `UnidentifiedObject` and highlighted in the GUI.
+
+### 13.3 Measurements
+Inference latency with ROI versus full frame, projection error, match rate, and clock offset. The interference matrix from §13.1 is the main result.
+
+---
+
+## 14. Workstream J — Exchange Data: Nasdaq ITCH 5.0 L3 Book
+
+This proves the infrastructure is market-data infrastructure, not ADS-B-only code, using a real exchange's binary protocol at real exchange rates.
+
+### 14.1 Data
+- **Nasdaq TotalView-ITCH 5.0** historical sample files, published by Nasdaq. Each is a full trading day of order-by-order messages, several GB compressed and hundreds of millions of messages.
+- Message types: system event, stock directory, **Add Order (`A`, `F`)**, **Order Executed (`E`, `C`)**, **Cancel (`X`)**, **Delete (`D`)**, **Replace (`U`)**, Trade (`P`), and others.
+
+### 14.2 Pipeline reuse
+- File source → **MoldUDP64 replay over our own multicast and transports** (ITCH's native transport) → subscriber-side ITCH parser → **L3 book builder** → top-of-book updates published as a feed.
+- The same SPSC rings, histograms, replay modes, fault injection, gap recovery, and load generator are used unchanged.
+
+### 14.3 Book design
+- **Order store:** order reference numbers are dense and increasing over a day, so orders live in a **direct-indexed array** or flat table keyed by reference number, avoiding a general hash map.
+- **Price levels:** for each symbol, arrays indexed by price tick around a moving center, with a sorted fallback for far-from-market prices. Best bid and ask are tracked incrementally.
+- **Symbols:** locate codes map directly to per-symbol book slots, with no string handling on the hot path.
+
+### 14.4 Validation and targets
+- Invariants: no negative quantities, every execute/cancel/delete refers to a live order, books never cross outside auction periods, and the book matches a reference implementation's top-of-book at sampled timestamps.
+- **Throughput target:** ≥ 20 M msg/s per core on a full-day file (stretch: 50 M), with per-message-type cycle costs and end-to-end histograms through the multicast stack.
+
+---
+
+## 15. Stretch Goals
+
+Each stretch goal is planned to build on the core rather than start from scratch.
+
+### 15.1 Backtester with matching simulation
+- An event-driven strategy API (`on_book_update`, `on_trade`, `on_timer`), identical in replay and live paper mode.
+- A **price-time priority matching simulation** using the **queue position** estimated from the L3 book, with configurable feed latency and order latency distributions.
+- Main output: **PnL against latency** for a simple strategy, the curve that justifies the rest of the project. **Paper only.**
+
+### 15.2 FPGA
+- **Demodulator:** preamble detector, PPM bit slicer, and streaming CRC-24 in SystemVerilog, emitting the same `RawFrame` format. Verified in **Verilator** against `.iqrec` files, diffed against our software demodulator and readsb.
+- **ITCH parser and top-of-book:** the classic FPGA market data design, verified against our software book.
+- Deployed to a board if one is available. Measured in clock cycles per message against the software paths.
+
+### 15.3 Hardware SDR alternative
+- If a higher-end SDR with an FPGA (for example a USRP-class or LimeSDR-class device) is available, compare it against the RTL-SDR on sample-to-wire latency and sensitivity.
+
+### 15.4 Multilateration
+- **Needs:** ≥ 3 stations (≥ 4 for 3D without barometric altitude), several km apart, with overlapping coverage.
+- **Clock sync** builds on the dongle drift characterization from A/B (§6.3). **Reference aircraft** that broadcast their own ADS-B positions let us solve continuously for each station's clock offset and drift.
+- **Solver:** TDOA equations by Gauss-Newton or Levenberg-Marquardt. Validated against ADS-B-equipped aircraft's own positions. The 2.4 MS/s sample period (≈ 417 ns, about 125 m) is the raw resolution; sub-sample interpolation of the preamble improves on it.
+
+---
+
+## 16. Repository Layout
+
+New directories are added next to the existing ones. The Fall 2025 code is kept as the system-level baseline.
 
 ```
 group_19_project/
-├── README.md                 # Fall 2025 system (unchanged)
+├── README.md                 # Fall 2025 system (to be updated)
 ├── README_UPDATES.md         # This document
-├── PROJECT_REPORT.md         # Fall 2025 report (unchanged)
+├── PROJECT_REPORT.md         # Fall 2025 report (to be updated)
 ├── core/                     # NEW — C++20 low-latency pipeline
 │   ├── CMakeLists.txt
-│   ├── include/adsb/         #   spsc_ring.hpp, clock.hpp, histogram.hpp, beast.hpp, modes.hpp, cpr.hpp, track_table.hpp, feed.hpp
-│   ├── src/                  #   ingest/, decode/, state/, publish/, recovery/, main.cpp
-│   ├── tools/                #   recorder, replayer, loadgen, feed-cli
-│   ├── tests/                #   unit + golden-vector + determinism tests
-│   ├── fuzz/                 #   libFuzzer targets (beast parser, decoder)
-│   └── bench/                #   Google Benchmark microbenchmarks
-├── protocol/                 # NEW — feed_spec.md + schema → C++ / JS / Python struct generators
+│   ├── include/adsb/         #   spsc_ring, shm_ring, clock, histogram, iq, demod, arbiter, beast, modes, cpr, track_table, feed
+│   ├── src/                  #   ingest/, demod/, arbiter/, decode/, state/, publish/, transports/{udp,uring,xdp,shm}/, recovery/, conflate/
+│   ├── bpf/                  #   XDP redirect program for AF_XDP subscribers
+│   ├── tools/                #   iq-recorder, frame-recorder, replayer, loadgen, feed-cli
+│   ├── tests/  fuzz/  bench/
+│   └── scripts/              #   tune-host.sh, ptp-setup.sh, resctrl-setup.sh
+├── itch/                     # NEW — ITCH 5.0 parser, L3 book, MoldUDP64 replayer
+├── backtest/                 # NEW (stretch) — strategy API, matching simulation
+├── fpga/                     # NEW (stretch) — SystemVerilog + Verilator testbenches
+├── spec/                     # NEW — TLA+ models of the feed protocol
+├── protocol/                 # NEW — feed_spec.md + schema → C++ / JS / Python generators
 ├── gateway/                  # NEW — Node multicast → WebSocket bridge
-├── fusion/                   # NEW — Python camera fusion (capture, calibrate, project, detect, match)
-├── bench/results/            # NEW — benchmark JSON + plots (committed)
-├── data/recordings/          # NEW — small sample recordings (large ones kept outside git or in Git LFS)
-├── ads/                      # Existing web app — modified to consume the WebSocket gateway
-├── ads-b-receiver/           # Existing Python streamer — kept as the "before" baseline
+├── fusion/                   # NEW — Python camera fusion
+├── bench/results/            # NEW — benchmark JSON + plots
+├── data/recordings/          # NEW — small samples (large files kept outside git)
+├── ads/                      # Existing web app — modified to consume the gateway
+├── ads-b-receiver/           # Existing Python streamer — "before" baseline
 └── data-generator/           # Existing mock generator
 ```
 
 ---
 
-## 12. Toolchain and Dependencies
+## 17. Toolchain and Dependencies
 
-| Area | Choice | Notes |
-|---|---|---|
-| Language | C++20 | GCC ≥ 12 or Clang ≥ 15. `-O3 -march=native`, with LTO for benchmark builds |
-| Build | CMake + Ninja | Presets: `debug-asan`, `release`, `bench`, `naive-baseline` |
-| Tests | GoogleTest | Fetched with CMake `FetchContent` |
-| Microbenchmarks | Google Benchmark | |
-| Fuzzing | libFuzzer + ASan/UBSan | Clang only |
-| Hash table reference | Abseil `flat_hash_map` | Benchmark comparison only, never on the hot path |
-| JSON (stretch) | simdjson | |
-| Fusion | Python 3.11, OpenCV, NumPy, ONNX Runtime | |
-| Oracles | readsb, pyModeS | |
-| Profiling | `perf`, `ftrace`, `bpftrace` | Linux only |
-| CI | GitLab CI | Build, unit tests, golden-vector diff, determinism hash, 60 s fuzz smoke run |
+| Area | Choice |
+|---|---|
+| Language | C++20 (GCC ≥ 12 / Clang ≥ 15), `-O3 -march=native`, LTO, **profile-guided optimization** for benchmark builds |
+| Build | CMake + Ninja. Presets: `debug-asan`, `tsan`, `release`, `bench`, `bench-pgo`, `naive-baseline` |
+| SDR | librtlsdr; readsb (oracle and baseline) |
+| Kernel interfaces | liburing, libxdp / libbpf, `SO_TIMESTAMPING`, `resctrl` |
+| Time sync | linuxptp (`ptp4l`, `phc2sys`), chrony |
+| Testing | GoogleTest, Google Benchmark, libFuzzer, ASan, UBSan, TSan |
+| Formal methods | TLA+ with TLC; GenMC |
+| Reference libraries | Abseil `flat_hash_map` (benchmark baseline only), pyModeS |
+| Fusion | Python 3.11, OpenCV, NumPy, ONNX Runtime |
+| Profiling | `perf`, `ftrace`, `bpftrace` |
+| CI | GitLab CI: build, unit tests, oracle diffs, determinism hash, fuzz smoke run, TLC model check, nightly simulation runs |
 
-**Platform note:** macOS can be used to edit and to run unit tests, but **all latency numbers come from Linux**. macOS has no hard thread affinity (`thread_policy_set` affinity is only a hint, and is ignored on Apple Silicon), no `isolcpus`, and no `perf`.
+**Platform note:** macOS can be used to edit and to run unit tests, but **all latency numbers come from Linux**. macOS has no hard thread affinity, no `isolcpus`, no AF_XDP, and no `perf`.
 
 ---
 
-## 13. Hardware and Test Environments
+## 18. Hardware and Test Environments
 
 | Environment | Hardware | Used for |
 |---|---|---|
-| **Live receiver** | Raspberry Pi 5 (4 cores) + RTL-SDR + 1090 MHz antenna, wired Ethernet | Live capture, recording, live demo |
-| **Benchmark host** | x86-64 Linux machine (≥ 6 physical cores, SMT disabled for benchmark runs) | Headline latency and throughput numbers, tail analysis |
-| **Camera node** | Pi HQ Camera or USB camera + laptop/Jetson | Camera fusion |
-| **Extra receivers** (stretch) | 2–3 more Pi + RTL-SDR kits at separate sites | MLAT |
-| **FPGA** (stretch) | TBD (§16) | Hardware demodulator |
+| **Receiver site** | **2× RTL-SDR (v4 preferred) + 2× 1090 MHz antennas** (A/B), on separate USB controllers | Live A/B capture |
+| **Benchmark host** | x86-64 Linux, ≥ 8 physical cores, **Intel RDT or AMD PQoS**, SMT off for benchmark runs | Headline numbers, noisy-neighbor and transport experiments |
+| **NICs** | **2× NIC with hardware timestamping and AF_XDP zero-copy** (for example Intel i210/i225/i226, X710, E810), direct cable between hosts | Wire latency, PTP, kernel bypass |
+| **Second host** | Any Linux box with a matching NIC | Cross-host subscriber |
+| **Raspberry Pi 5** | 4 cores, RTL-SDR | ARM results, weak-memory-ordering testing, field demo |
+| **Camera node** | Pi HQ Camera or USB camera + telephoto | Fusion |
+| **Stretch** | FPGA board; extra receiver kits for MLAT | §15 |
 
-Kernel tuning on benchmark hosts is scripted in `core/scripts/tune-host.sh`: `isolcpus`, `nohz_full`, `rcu_nocbs`, IRQ affinity away from pipeline cores, the `performance` governor, turbo/SMT settings recorded, and transparent huge pages set to `madvise`.
+Host tuning is scripted in `core/scripts/`: core isolation, IRQ affinity, governor, huge pages, PTP, and `resctrl` partitions. The applied configuration is captured in every result file.
 
 ---
 
-## 14. Timeline and Milestones
+## 19. Timeline and Milestones
 
-The plan assumes a 14-week semester. Workstreams A–E are sequential and depend on each other. F (camera) runs in parallel from week 4, because it only needs the feed spec and a stub publisher.
+The plan assumes a 14-week semester. The Beast TCP source lets the decoder and state work start before the demodulator is finished.
 
 | Week | Milestone | Exit criteria |
 |---|---|---|
-| 1–2 | **M0 — Foundations** | CMake/CI working. SPSC ring, clock, and histogram done with tests. readsb running on the Pi with Beast output. Recorder captures the first datasets. Feed spec v1 drafted. |
-| 3–4 | **M1 — Decoder** | All DF17 TCs from §5.1 decoded. Golden vectors pass. Differential diff against readsb at ≥ 99.9% agreement on a peak-hour recording. Fuzzers running in CI. |
-| 4–5 | **M2 — Track state** | Open-addressing table with expiry, dedup, and out-of-order handling. Microbenchmarks against `unordered_map` and `flat_hash_map` published. |
-| 5–7 | **M3 — Feed** | Publisher, retransmit server, snapshot server, `feed-cli`, and WebSocket gateway done. The web UI runs off the feed with no database in the live path. The gap-recovery test passes under 1% random loss and burst loss. |
-| 7–9 | **M4 — Replay and measurement** | Determinism hash passes in CI. Load generator reaches 10k aircraft. Naive baseline build exists. **First full benchmark report** (system-level and implementation-level before/after). |
-| 4–11 | **M5 — Camera fusion** (parallel) | Calibrated camera. ROI detection and matching on live footage. Unidentified objects shown in the GUI. Isolation check done. |
-| 10–12 | **M6 — Tuning and tail analysis** | Ablation table done. Every p99.9 outlier class explained. Targets in §2 met or the gap explained. |
-| 12–13 | **M7 — Stretch** | At least one of: market data/order book, backtester, FPGA in simulation, MLAT. |
-| 14 | **M8 — Final** | Final report, demo video, and reproducible benchmark instructions. |
+| 1–2 | **M0 — Foundations** | CMake and CI working. SPSC ring, clock, and histogram done with tests. Hardware capability checks (`ethtool -T`, AF_XDP zero-copy, RDT). First IQ and frame recordings. Feed spec v1. |
+| 2–5 | **M1 — Demodulator + decoder** (in parallel) | Demodulator at 2.0 MS/s reaching ≥ 90% of readsb on IQ recordings. USB transfer-size sweep done. Decoder ≥ 99.9% agreement with the oracle. Fuzzers in CI. |
+| 4–6 | **M2 — Track state + A/B arbitration** | Open-addressing table with expiry. Microbenchmarks against both baselines. Two-line arbitration live, with per-line contribution and win-margin results. |
+| 5–7 | **M3 — Feed (kernel UDP)** | Publisher, retransmit and snapshot servers, `feed-cli`, gateway. The web UI runs off the feed. **TLA+ model checks.** Gap recovery passes under random and burst loss. |
+| 7–9 | **M4 — Measurement + overload** | Determinism hash in CI. Load generator at 10k aircraft. Naive baseline. Overload tests at 2× and 10×. Conflated feed. **First full benchmark report.** |
+| 8–11 | **M5 — Transports and isolation** | AF_XDP, shared-memory ring, and hardware timestamps with PTP across two hosts. Noisy-neighbor matrix with CAT/MBA. Minimal fusion live (from week 6 in parallel). |
+| 10–12 | **M6 — ITCH L3 book** | Full-day ITCH file replayed through our MoldUDP64 stack. Book invariants pass. Throughput and per-message costs published. io_uring transport if time allows. |
+| 12–13 | **M7 — Tuning and tail analysis** | PGO and ablation table done. Every p99.9 outlier class explained. Targets in §2 met or the gap explained. Deterministic simulation testing in nightly CI. |
+| 13–14 | **M8 — Final** | Final report, demo video, reproducible benchmark instructions. Stretch goals only if M0–M7 are complete. |
+
+**Suggested ownership** for a team of four: (1) RF ingest, demodulator, and A/B arbitration; (2) decoder, track state, and ITCH book; (3) feed, transports, PTP, and TLA+; (4) measurement, overload, noisy neighbor, and fusion.
 
 ---
 
-## 15. Risks and Mitigations
+## 20. Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Live traffic is too low to stress the pipeline | Benchmarks look the same either way | The synthetic load generator (§8.4) is the primary benchmark input. Live data is used for correctness. |
-| The Pi has too few cores for one thread per stage | Pinning has little effect | Benchmark fused versus split stages. Headline numbers come from the x86 host. |
-| dump1090/readsb buffering dominates end-to-end latency | Our gains in µs are hidden by ms of upstream buffering | Measure it separately, minimize the flush settings, and report radio → `recv` and `recv` → send as separate numbers. The FPGA stretch goal addresses this. |
-| Wi-Fi multicast is unreliable | Spurious gaps | Wired Ethernet only. Loopback for single-host tests. |
-| Aircraft too small or too far for the camera | Fusion has nothing to match | Site near the CMI approach, telephoto lens, and the classical small-target detector. |
-| Clock offset between hosts corrupts the projection | Mismatches | chrony on all hosts, continuous offset logging, and online extrinsic refinement from matched aircraft. |
-| Decoder disagrees with the oracle on edge cases | Blocks M1 | Triage each mismatch class, and document any intended difference (for example, error correction off). |
-| MLAT needs remote sites and clock sync | Stretch goal may not finish | Strictly a stretch goal. A fallback demo with two stations shows TDOA alone. |
+| The in-house demodulator is less sensitive than readsb | Fewer frames | Start at 2.0 MS/s for correctness, then move to 2.4 MS/s. readsb's Beast source stays available. Report sensitivity honestly. |
+| Small USB transfers cause sample drops | Latency gain costs data | That tradeoff is the experiment. We pick the knee of the curve and report both axes. |
+| Benchmark NIC lacks hardware timestamps or AF_XDP zero-copy | Weaker transport results | Check in week 1. Buy a cheap Intel i210/i226 card if needed. Copy-mode AF_XDP is still reported. |
+| Benchmark CPU lacks RDT | No CAT/MBA rows | Check in week 1. Report the isolation-only rows otherwise. |
+| Live ADS-B traffic is too low to stress the pipeline | Weak throughput story | Synthetic load generator, plus the ITCH workstream for real exchange-rate data. |
+| Scope is large | Breadth over depth | Strict Must/Should/Could tiers (§3). Must items finish to report quality before Should items start. |
+| Wi-Fi multicast is unreliable | Spurious gaps | Wired Ethernet only. |
+| Formal methods take longer than expected | Late M3 | Keep the TLA+ model to the protocol core (sequence, retransmit, snapshot). Session restart is optional. |
 
 ---
 
-## 16. Open Decisions
+## 21. Open Decisions
 
 These are team and hardware questions to settle in Week 1:
 
-1. **Owners for each workstream.** A natural split: (A+B) decoder, (C+E) state and measurement, (D) feed and gateway, (F) camera fusion.
-2. **Benchmark host.** Which x86 Linux machine (personal, lab, or cloud bare-metal) do we get root on for core isolation?
-3. **Camera hardware and site.** Which camera and lens, and do we have access to a viewpoint on the CMI approach path?
-4. **FPGA board.** Is there a board available through the course, and does it have an ADC or RF front end?
-5. **Extra receiver kits** for MLAT: how many, and where can they be hosted?
-6. **readsb versus dump1090-fa.** The plan defaults to readsb (more actively maintained, more flexible networking). Confirm after the Week 1 check on the Pi.
-7. **Large recordings.** Git LFS or external storage?
+1. **Workstream owners** (see the suggestion in §19).
+2. **Benchmark host:** which x86 Linux machine with root, ≥ 8 cores, and RDT?
+3. **NICs:** do our hosts have hardware timestamping and AF_XDP zero-copy, or do we buy Intel i210/i226 cards?
+4. **Second RTL-SDR and antenna** for the B line: purchase or borrow?
+5. **Camera hardware and a site** with a view of the CMI approach path.
+6. **FPGA board availability** through the course.
+7. **ITCH data:** confirm access to and storage for full-day Nasdaq sample files.
+8. **Large recordings:** Git LFS or external storage?
 
 ---
 

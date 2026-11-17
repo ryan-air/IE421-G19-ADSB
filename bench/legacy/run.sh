@@ -24,6 +24,6 @@ cp out/report.md out/environment.json "$RESULTS/"
 for d in out/n*/; do
   n="$(basename "$d")"
   mkdir -p "$RESULTS/$n"
-  cp "$d/metrics.json" "$d/summary.txt" "$RESULTS/$n/" 2>/dev/null || true
+  cp "$d/metrics.json" "$d/summary.txt" "$d/new_pipeline.txt" "$RESULTS/$n/" 2>/dev/null || true
 done
 echo "results: $RESULTS/report.md (raw logs in $HERE/out/)"

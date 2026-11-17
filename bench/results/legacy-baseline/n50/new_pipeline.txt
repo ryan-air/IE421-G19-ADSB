@@ -7,7 +7,7 @@ tracks      created 50, expired 50, live 0, table full 0
 output      11925 updates, 50 deletes
 output hash accb599fc3bc350fad5260e4e62eafde9ac02428e65acdf3ce50a37b8593f2a6
 latency (per record):
-  release lag    p50       66  p99     5503  p99.9   403455  p99.99  4194303  max    5925228 ns
-  queue          p50      125  p99    10927  p99.9   134911  p99.99  1048575  max    1573750 ns
-  decode+state   p50     1000  p99    20863  p99.9    30815  p99.99    41855  max     158958 ns
-  total          p50     1167  p99    24447  p99.9   591871  p99.99  4825087  max    6337541 ns
+  release lag    p50       30  p99     7495  p99.9 16678911  p99.99 55377919  max   58473428 ns
+  queue          p50       83  p99     8255  p99.9  8716287  p99.99 15286271  max   28959208 ns
+  decode+state   p50      625  p99     5295  p99.9    20767  p99.99   930815  max   15106708 ns
+  total          p50      750  p99    22335  p99.9 20807679  p99.99 64749567  max   67855458 ns

@@ -1,6 +1,8 @@
 # group_19_project
 
-## About Me
+> ⚠️ **To be updated:** This document describes the Fall 2025 system and needs to be updated for the current project extension. See [README_UPDATES.md](../README_UPDATES.md) for the new plan.
+
+## About Me (To be updated)
 
 <div align="center">
 </div>
@@ -24,7 +26,7 @@
 
 ---
 
-## About Me
+## About Me (To be updated)
 
 <div align="center">
 </div>

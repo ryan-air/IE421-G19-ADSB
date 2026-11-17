@@ -1,5 +1,7 @@
 # ADS-B Data Streamer
 
+> ⚠️ **To be updated:** This document describes the Fall 2025 system and needs to be updated for the current project extension. See [README_UPDATES.md](../README_UPDATES.md) for the new plan.
+
 Python-based real-time ADS-B data streaming from dump1090 to Supabase. This streamer consumes live aircraft data from your Raspberry Pi running dump1090 and stores it in separate tables from synthetic/mock data.
 
 ## Features

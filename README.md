@@ -1,5 +1,7 @@
 # ADS-B Aircraft Tracking System
 
+> ⚠️ **To be updated:** This document describes the Fall 2025 system and needs to be updated for the current project extension. See [README_UPDATES.md](README_UPDATES.md) for the new plan.
+
 A real-time aircraft tracking system that captures ADS-B (Automatic Dependent Surveillance-Broadcast) data from aircraft, streams it to a cloud database, and visualizes it on an interactive web map.
 
 ![ADS-B Tracker](https://img.shields.io/badge/ADS--B-Tracker-blue)
@@ -476,7 +478,7 @@ app.use(cors());
 - **Railway**: Cloud deployment platform
 - **OpenStreetMap**: Map data contributors
 
-## Team
+## Team (To be updated)
 
 <div align="center">
 

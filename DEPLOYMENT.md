@@ -1,5 +1,7 @@
 # ADS-B System Deployment Guide for Raspberry Pi
 
+> ⚠️ **To be updated:** This document describes the Fall 2025 system and needs to be updated for the current project extension. See [README_UPDATES.md](README_UPDATES.md) for the new plan.
+
 This guide covers deploying both the optimized ADS-B streamer and web application on a Raspberry Pi.
 
 ## Architecture

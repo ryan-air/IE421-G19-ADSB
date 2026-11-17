@@ -1,6 +1,8 @@
 # ADS-B Aircraft Tracking System - Technical Project Report
 
-**Authors:** Saksham Gupta & Apoorv Sagar Pitta  
+> ⚠️ **To be updated:** This document describes the Fall 2025 system and needs to be updated for the current project extension. See [README_UPDATES.md](README_UPDATES.md) for the new plan.
+
+**Authors:** Saksham Gupta & Apoorv Sagar Pitta *(To be updated)*  
 **Course:** IE 421 - University of Illinois Urbana-Champaign  
 **Advisor:** Professor David Lariviere  
 **Date:** December 2025

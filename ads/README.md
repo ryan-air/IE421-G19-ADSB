@@ -3,7 +3,6 @@
 ## About Me
 
 <div align="center">
-  <img src="saksham.png" alt="Saksham" width="200" style="border-radius: 50%;">
 </div>
 
 ### Education & Career Timeline
@@ -28,7 +27,6 @@
 ## About Me
 
 <div align="center">
-  <img src="apoorv.jpg" alt="Apoorv" width="200" style="border-radius: 50%;">
 </div>
 
 ### Education & Career Timeline

@@ -481,7 +481,6 @@ app.use(cors());
 <div align="center">
 
 ### Saksham Gupta
-<img src="saksham.png" width="150" height="150" style="border-radius: 50%;">
 
 Saksham is a Master's student in Computer Science at the University of Illinois Urbana-Champaign, expected to graduate in May 2027. He is currently open to full-time new graduate roles.
 
@@ -491,7 +490,6 @@ Saksham is a Master's student in Computer Science at the University of Illinois 
 ---
 
 ### Apoorv Sagar Pitta
-<img src="apoorv.jpg" width="150" height="150" style="border-radius: 50%;">
 
 Apoorv is a Master's student in Computer Science at the University of Illinois Urbana-Champaign, expected to graduate in May 2027. He is currently open to full-time new graduate roles.
 

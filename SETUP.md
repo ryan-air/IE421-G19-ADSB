@@ -17,13 +17,14 @@ Implemented, tested, and running in CI (details in [core/README.md](core/README.
 | `.adsbrec` recording format | `core/include/adsb/record/` |
 | Synthetic traffic generator (with ground truth) | `core/include/adsb/sim/`, tool `adsb-synth` |
 | Track state engine + flat track table | `core/include/adsb/state/` |
+| Live Beast ingest from readsb (`adsb-live`), with reconnect and recording | `core/include/adsb/ingest/beast_tcp.hpp`, tool `adsb-live`, test `bench/live/` |
 | Replay (inline / two-thread pipeline), determinism check | `core/include/adsb/replay/`, tool `adsb-replay`, `core/scripts/check-determinism.sh` |
 | Naive baseline build (mutex queues, `unordered_map`) | preset `naive-baseline` |
 | Feed wire spec v0 + C++/JS/Python code generator | `protocol/` |
 | TLA+ model of gap recovery, checked with TLC | `spec/` |
 | Host capability check / host tuning | `core/scripts/check-host.sh`, `core/scripts/tune-host.sh` |
 
-**Next up** (open for owners): live Beast TCP ingest, the multicast publisher with retransmit and snapshot servers (Workstream E), the WebSocket gateway, the A/B arbiter (B), and the IQ demodulator (A). The feed spec v0 also needs the team's review (§5 of `protocol/feed_spec.md`).
+**Next up** (open for owners): the multicast publisher with retransmit and snapshot servers (Workstream E), the WebSocket gateway, the A/B arbiter (B), and the IQ demodulator (A). The feed spec v0 also needs the team's review (§5 of `protocol/feed_spec.md`).
 
 ---
 
@@ -71,7 +72,7 @@ cd IE421-G19-ADSB/core
 cmake --preset debug && cmake --build --preset debug -j && ctest --preset debug
 ```
 
-Expected result: `100% tests passed, 0 tests failed out of 131`.
+Expected result: `100% tests passed, 0 tests failed out of 137`.
 
 The first configure takes a minute because it downloads the test frameworks. Later builds are incremental. Add `-G Ninja` after `--preset debug` on the first configure if you installed Ninja.
 
@@ -139,6 +140,16 @@ cmake --preset naive-baseline && cmake --build --preset naive-baseline -j
 ```bash
 ./scripts/check-determinism.sh build/release build/naive-baseline
 ```
+
+### With a real receiver (readsb running)
+
+`adsb-live` connects to readsb's Beast output port, tracks aircraft, and can record everything for replay later. It reconnects by itself if readsb restarts.
+
+```bash
+./build/release/tools/adsb-live --host PI_ADDRESS --port 30005 --record /tmp/live.adsbrec --receiver 40.0392,-88.2781
+```
+
+`bench/live/run.sh` tests this end to end in Docker against a real readsb, including a readsb restart (CI runs it too).
 
 ### Fall 2025 baseline (the "before" numbers)
 

@@ -16,6 +16,7 @@ C++20 implementation of the pipeline described in [README_UPDATES.md](../README_
 | CPR | [`adsb/modes/cpr.hpp`](include/adsb/modes/cpr.hpp) | Global and local decoding, airborne and surface, table NL, encoder |
 | Mode S decoder | [`adsb/modes/decoder.hpp`](include/adsb/modes/decoder.hpp) | Frame → fixed-size `DecodedMsg`: DF0/4/5/11/16/17/18/20/21/24, ADS-B TC 0–22 and 28 |
 | Beast parser | [`adsb/ingest/beast.hpp`](include/adsb/ingest/beast.hpp) | Resumable Beast (port 30005) parser and encoder |
+| Live Beast ingest | [`adsb/ingest/beast_tcp.hpp`](include/adsb/ingest/beast_tcp.hpp) | TCP client for readsb/dump1090 Beast output: frames stamped with receive time, automatic reconnect with exponential backoff, `poll()` or busy-poll receive |
 
 ### Data path (M1–M4 groundwork)
 
@@ -37,6 +38,7 @@ C++20 implementation of the pipeline described in [README_UPDATES.md](../README_
 |---|---|
 | `build/<preset>/tools/adsb-synth` | Generate synthetic traffic: `.adsbrec`, plus optional raw Beast stream and ground-truth CSV |
 | `build/<preset>/tools/adsb-replay` | Replay a recording through decode + track state: counters, output hash, optional pipeline latency |
+| `build/<preset>/tools/adsb-live` | Run the pipeline on a live readsb feed (ingest → track state, optional recording), with receive → state latency |
 | [`scripts/check-host.sh`](scripts/check-host.sh) | Report a machine's low-latency capabilities (NIC timestamps, AF_XDP, RDT, isolation, ...) |
 | [`scripts/tune-host.sh`](scripts/tune-host.sh) | Put a Linux benchmark host into a reproducible tuned state (dry-run by default), and revert it |
 | [`scripts/check-determinism.sh`](scripts/check-determinism.sh) | Prove the determinism contract: identical output across speeds, threading, and optimized vs naive builds |
@@ -74,6 +76,9 @@ cmake --preset debug && cmake --build --preset debug -j && ctest --preset debug
 
 # Same recording through the naive baseline build, for a before/after comparison
 ./build/naive-baseline/tools/adsb-replay /tmp/traffic.adsbrec --pipeline --speed 20
+
+# Live: connect to readsb's Beast output, track, and record (Ctrl-C to stop)
+./build/release/tools/adsb-live --host 127.0.0.1 --port 30005 --record /tmp/live.adsbrec --receiver 40.0392,-88.2781
 
 # Determinism contract (CI runs this too)
 ./scripts/check-determinism.sh build/release build/naive-baseline
@@ -120,4 +125,4 @@ The Apple timer runs at 24 MHz, so latencies are quantized to about 42 ns. Lapto
 
 - **Decoder gaps:** TC 29/31, Comm-B (BDS), and single-bit error correction are not decoded. The GNSS-height unit question (feet vs metres, see `decoder.hpp`) awaits the readsb differential diff on real traffic.
 - **Track engine:** `nic` is not populated yet. Heading and airspeed are decoded but not carried in `TrackUpdate` v0 (an open question in `feed_spec.md`).
-- **Not yet built:** live Beast TCP ingest, multicast publisher, retransmit and snapshot servers, WebSocket gateway, A/B arbiter stage, IQ demodulator. These are the next milestones, building on these headers.
+- **Not yet built:** multicast publisher, retransmit and snapshot servers, WebSocket gateway, A/B arbiter stage, IQ demodulator. These are the next milestones, building on these headers.

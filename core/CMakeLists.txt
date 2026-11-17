@@ -47,6 +47,7 @@ add_library(adsb_core STATIC
   src/modes/cpr.cpp
   src/modes/decoder.cpp
   src/modes/encoder.cpp
+  src/ingest/beast_tcp.cpp
   src/record/recording.cpp
   src/sim/synth.cpp
 )

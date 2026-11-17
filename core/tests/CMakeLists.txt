@@ -16,6 +16,7 @@ set(ADSB_TEST_SOURCES
   test_track_store.cpp
   test_track_engine.cpp
   test_synth_replay.cpp
+  test_beast_tcp.cpp
 )
 
 add_executable(adsb_tests ${ADSB_TEST_SOURCES})

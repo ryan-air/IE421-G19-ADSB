@@ -205,3 +205,22 @@ jobs:
         with:
           name: tlc-logs
           path: spec/out/
+
+  live-ingest:
+    name: live ingest against readsb (integration)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      # Builds the bench image (readsb + toolchain), then streams synthetic
+      # traffic through readsb into adsb-live, including a readsb restart.
+      - name: Run
+        run: bench/live/run.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-ingest
+          path: bench/live/out/

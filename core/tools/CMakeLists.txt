@@ -17,3 +17,7 @@ adsb_apply_compiler_options(adsb-publish)
 add_executable(adsb-feed-cli adsb_feed_cli.cpp)
 target_link_libraries(adsb-feed-cli PRIVATE adsb::core)
 adsb_apply_compiler_options(adsb-feed-cli)
+
+add_executable(adsb-clock adsb_clock.cpp)
+target_link_libraries(adsb-clock PRIVATE adsb::core)
+adsb_apply_compiler_options(adsb-clock)

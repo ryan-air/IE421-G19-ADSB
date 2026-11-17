@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - "core/**"
+      - "gateway/**"
       - "protocol/**"
       - "spec/**"
       - "bench/**"
@@ -11,6 +12,7 @@ on:
   pull_request:
     paths:
       - "core/**"
+      - "gateway/**"
       - "protocol/**"
       - "spec/**"
       - "bench/**"
@@ -245,3 +247,29 @@ jobs:
       # byte for byte, and the publisher's must match a plain replay.
       - name: Run
         run: FEED_IFACE=127.0.0.1 scripts/check-feed.sh build/feed
+
+  gateway:
+    name: websocket gateway (unit tests, then publisher -> gateway -> clients)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14
+      - name: Unit tests (subscriber port, simulation, WebSocket, fan-out, flow control)
+        working-directory: gateway
+        run: node --test --test-timeout 60000 test/*.test.mjs
+      - name: Build publisher tools
+        run: |
+          CXX=g++-14 cmake -S . -B build/gw -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/gw
+      # Loss, a small ring (snapshot fallback), a late-joining gateway, a slow
+      # WebSocket client and a publisher restart: every gateway's book and
+      # every client's table must equal the publisher's book byte for byte.
+      - name: Integration
+        run: FEED_IFACE=127.0.0.1 ../gateway/scripts/check-gateway.sh build/gw

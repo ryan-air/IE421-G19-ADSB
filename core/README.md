@@ -51,6 +51,7 @@ C++20 implementation of the pipeline described in [README_UPDATES.md](../README_
 | `build/<preset>/tools/adsb-live` | Run the pipeline on a live readsb feed (ingest → track state, optional recording, optional `--publish` to the feed), with receive → state latency |
 | `build/<preset>/tools/adsb-publish` | Replay a recording through decode + track state and publish it as the feed, with the retransmit and snapshot servers; fault injection; prints the final book digest |
 | `build/<preset>/tools/adsb-feed-cli` | Subscribe: verify sequencing, recover gaps, report counters and publish → applied latency, print the reconstructed book's digest |
+| `build/<preset>/tools/adsb-clock` | Answers clock queries on stdin with `mono_ns()`, so the Node gateway can measure latency against the publisher's clock ([gateway/](../gateway/README.md)) |
 | [`scripts/check-feed.sh`](scripts/check-feed.sh) | Feed integration test: loss, small ring, late join, publisher restart; every subscriber's book must equal the publisher's and a plain replay's (CI) |
 | [`scripts/check-host.sh`](scripts/check-host.sh) | Report a machine's low-latency capabilities (NIC timestamps, AF_XDP, RDT, isolation, ...) |
 | [`scripts/tune-host.sh`](scripts/tune-host.sh) | Put a Linux benchmark host into a reproducible tuned state (dry-run by default), and revert it |
@@ -147,4 +148,4 @@ The Apple timer runs at 24 MHz, so latencies are quantized to about 42 ns. Lapto
 - **Decoder gaps:** TC 29/31, Comm-B (BDS), and single-bit error correction are not decoded. The GNSS-height unit question (feet vs metres, see `decoder.hpp`) awaits the readsb differential diff on real traffic.
 - **Track engine:** `nic` is not populated yet. Heading and airspeed are decoded but not carried in `TrackUpdate` v0 (an open question in `feed_spec.md`).
 - **Feed:** kernel UDP only. io_uring, AF_XDP and the shared-memory ring (§9.3), hardware timestamps (§9.4), and the conflated feed (§10) are not built. IPv4 only. The subscriber's snapshot fetch blocks its thread (datagrams queue in the kernel meanwhile). The snapshot server copies the whole book on the recovery thread, which delays retransmits by that long (about 20 µs per 1,000 tracks). The retransmit server answers any requester (LAN only: no rate limit against spoofed requests). If the recovery thread stalls for long enough to fill its 65,536-entry log, the publisher waits rather than lose retransmit state. A reused session id cannot be detected by subscribers, so the tools generate a unique one per start.
-- **Not yet built:** WebSocket gateway, A/B arbiter stage, IQ demodulator.
+- **Not yet built:** A/B arbiter stage, IQ demodulator. The WebSocket gateway (Node) is in [`gateway/`](../gateway/README.md).

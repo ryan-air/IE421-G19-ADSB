@@ -136,6 +136,8 @@ A subscriber buffers what arrives ahead of `expected` (16,384 messages by defaul
 | Retransmit reply (data) | Same as a multicast data packet |
 | NAK whose `seq > expected` | The gap is older than the server's ring: take a snapshot. A NAK with `seq <= expected` is stale and ignored |
 
+Browsers do not join the multicast group. The WebSocket gateway (`gateway/`) is a subscriber like any other, with a JavaScript port of `SubscriberCore`. It forwards the same `TrackUpdate` and `TrackDelete` bytes to browsers in conflated frames, with per-client flow control. That format is specified in [`gateway/README.md`](../gateway/README.md#protocol-gateway--browser).
+
 ---
 
 ## 5. Open questions for review

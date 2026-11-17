@@ -22,9 +22,11 @@ Implemented, tested, and running in CI (details in [core/README.md](core/README.
 | Naive baseline build (mutex queues, `unordered_map`) | preset `naive-baseline` |
 | Feed wire spec v0 + C++/JS/Python code generator | `protocol/` |
 | TLA+ model of gap recovery, checked with TLC | `spec/` |
+| Feed publisher, retransmit and snapshot servers, subscriber library (Workstream E, kernel UDP) | `core/include/adsb/feed/`, tools `adsb-publish`, `adsb-feed-cli`, `core/scripts/check-feed.sh` |
+| WebSocket gateway (Node): feed → browsers, serves the Fall 2025 map from memory | `gateway/`, `gateway/scripts/check-gateway.sh` |
 | Host capability check / host tuning | `core/scripts/check-host.sh`, `core/scripts/tune-host.sh` |
 
-**Next up** (open for owners): the multicast publisher with retransmit and snapshot servers (Workstream E), the WebSocket gateway, the A/B arbiter (B), and the IQ demodulator (A). The feed spec v0 also needs the team's review (§5 of `protocol/feed_spec.md`).
+**Next up** (open for owners): the new pipeline inside the Fall 2025 benchmark harness (first end-to-end before/after numbers), the A/B arbiter (B), and the IQ demodulator (A). The feed spec v0 also needs the team's review (§5 of `protocol/feed_spec.md`).
 
 ---
 
@@ -161,6 +163,18 @@ cmake --preset naive-baseline && cmake --build --preset naive-baseline -j
 ```
 
 Both print a `book digest` line at the end, and they must be identical. To publish a live receiver instead of a recording, add `--publish 239.19.0.1:41900 --publish-interface ADDR` to `adsb-live`. Useful options: `--drop-rate 0.01 --drop-burst 3` (on either side) injects loss, `--ring 2048` shrinks the retransmit window so subscribers fall back to snapshots, and `--batch-us 50` batches messages per datagram. Use `--interface 127.0.0.1` on one machine. Across machines, use the wired interface's address, since Wi-Fi drops multicast. `scripts/check-feed.sh build/release` runs the full loss, late-join and restart test (CI runs it too).
+
+### The map, fed by the gateway
+
+`gateway/` subscribes to the feed and pushes it to browsers over WebSockets. It serves the Fall 2025 map from `ads/` (unmodified) with no database. It needs Node 22 and has no dependencies. From the repository root:
+
+```bash
+core/build/release/tools/adsb-synth -o /tmp/demo.adsbrec --aircraft 150 --duration 900 --receiver 41.88,-87.63
+node gateway/bin/adsb-gateway.mjs --feed 127.0.0.1:41900 &
+core/build/release/tools/adsb-publish /tmp/demo.adsbrec --feed 127.0.0.1:41900 --bind 127.0.0.1 --speed 1 --busy-wait
+```
+
+Then open http://127.0.0.1:8080/. Tests: `cd gateway && node --test test/*.test.mjs`, and `gateway/scripts/check-gateway.sh core/build/release` for the integration test against the C++ publisher. Details, protocol and numbers: [gateway/README.md](gateway/README.md).
 
 ### Fall 2025 baseline (the "before" numbers)
 

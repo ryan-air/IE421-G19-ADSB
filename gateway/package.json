@@ -1,0 +1,17 @@
+{
+  "name": "adsb-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WebSocket gateway: subscribes to the ADS-B track feed (with gap recovery) and pushes it to browsers; serves the Fall 2025 map from memory.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "bin": {
+    "adsb-gateway": "bin/adsb-gateway.mjs",
+    "adsb-ws-client": "bin/adsb-ws-client.mjs"
+  },
+  "scripts": {
+    "start": "node bin/adsb-gateway.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "MIT"
+}

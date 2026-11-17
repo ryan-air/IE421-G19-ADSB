@@ -15,16 +15,8 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 RESULTS="$ROOT/bench/results/legacy-baseline"
 cd "$HERE"
 REF="${FALL2025_REF:-fall2025-final}"
-if ! git -C "$ROOT" rev-parse --verify --quiet "$REF^{commit}" > /dev/null; then
-  git -C "$ROOT" fetch --quiet github "refs/tags/$REF:refs/tags/$REF" 2>/dev/null || true
-fi
-FALL_COMMIT="$(git -C "$ROOT" rev-parse --verify --quiet "$REF^{commit}")" || {
-  echo "missing git ref $REF (the original Fall 2025 code); try: git fetch github --tags" >&2
-  exit 2
-}
 # Extract the original code into fall2025/ (gitignored, recreated every run).
-rm -rf fall2025 && mkdir -p fall2025
-git -C "$ROOT" archive "$FALL_COMMIT" ads ads-b-receiver | tar -x -C fall2025
+FALL_COMMIT="$("$HERE/extract-fall2025.sh" "$REF")"
 echo "Fall 2025 code: $REF = $(git -C "$ROOT" rev-parse --short "$FALL_COMMIT")"
 rm -rf out && mkdir -p out
 cleanup() { docker compose down -v --remove-orphans >/dev/null 2>&1 || true; }

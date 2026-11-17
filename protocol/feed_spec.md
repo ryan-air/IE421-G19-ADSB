@@ -54,7 +54,15 @@ Rules:
 - Receivers must reject a datagram whose blocks run past its end or leave trailing bytes, and a heartbeat or end-of-session packet that has a body. `parse_packet()` in C++, `decodePacket` in JS, and `decode_packet` in Python all enforce this, and the golden-packet tests check that they agree.
 - Receivers must skip (not fail on) messages with an unknown `msg_type`, so new message types can be added.
 
-**`RetransmitRequest`** (packed, 20 bytes, unicast UDP to the retransmit server): `session` char[10] @0, `seq` u64 @10, `count` u16 @18. The server replies with ordinary data packets for that range, if it still holds them.
+**`RetransmitRequest`** (packed, 20 bytes, unicast UDP to the retransmit server): `session` char[10] @0, `seq` u64 @10, `count` u16 @18. The server replies to the requester's address:
+
+| Server state | Reply |
+|---|---|
+| Holds `seq` | Ordinary data packets of the same session covering `[seq, seq + count)`, truncated to what has been published and to the server's per-request cap (4,096 messages by default). The subscriber asks again for anything still missing. |
+| `seq` has left its ring | One header-only packet (`count` 0) whose `seq` is the **oldest sequence number the server still holds**. This is the NAK: on the request socket it means "that range is gone", and the subscriber takes a snapshot. (On the multicast feed the same shape is a heartbeat; the socket it arrives on tells them apart.) |
+| `seq` not published yet, wrong session, or malformed request | Nothing. The subscriber retries after its timeout. |
+
+**End of session.** The publisher sends the end-of-session packet three times when it stops, then repeats it at the heartbeat interval for as long as it keeps running (its recovery servers stay up for a configurable linger time). The marker cannot be retransmitted, so a subscriber that lost every copy would otherwise never learn that the session ended.
 
 ---
 
@@ -96,21 +104,24 @@ The first byte of every message is its ASCII type, and the second is the schema 
 
 ### `SnapshotBegin` — `'S'`, 24 bytes / `SnapshotEnd` — `'E'`, 16 bytes
 
-These are sent by the snapshot server over TCP. The same framing is used, with each message prefixed by its u16 length. A snapshot is:
+These are sent by the snapshot server over TCP. The subscriber connects, and the server writes one snapshot and closes the connection:
 
 ```
-SnapshotBegin { track_count, as_of_seq, event_ts_ns }
-TrackUpdate x track_count
-SnapshotEnd   { as_of_seq }
+session        char[10]       the publisher session the snapshot belongs to
+u16 len + SnapshotBegin { track_count, as_of_seq, event_ts_ns }
+u16 len + TrackUpdate   x track_count, in strictly increasing ICAO order
+u16 len + SnapshotEnd   { as_of_seq }
 ```
 
-The snapshot reflects every incremental message with `seq <= as_of_seq`. The subscriber then applies buffered incremental messages with `seq > as_of_seq` and discards older ones.
+The snapshot reflects every incremental message with `seq <= as_of_seq`. The subscriber then applies buffered incremental messages with `seq > as_of_seq` and discards older ones. If the subscriber already holds a later state (`expected > as_of_seq + 1`), it keeps its own state. A receiver rejects the stream if a length or type is wrong, the count does not match, the ICAO order is broken, the two `as_of_seq` values differ, or any byte follows `SnapshotEnd`. The session prefix lets a subscriber notice that the publisher restarted between its request and the answer.
 
 ---
 
 ## 4. Subscriber behaviour
 
-The decision logic is implemented in `SequenceTracker` (`core/include/adsb/protocol/moldudp64.hpp`). The full protocol, including loss, duplication, and reordering, is model-checked in TLA+ in [`spec/`](../spec/).
+The full subscriber is `SubscriberCore` (`core/include/adsb/feed/subscriber.hpp`), with `SequenceTracker` (`core/include/adsb/protocol/moldudp64.hpp`) as a lighter classifier for simple consumers. The protocol, including loss, duplication, and reordering, is model-checked in TLA+ in [`spec/`](../spec/). Sessions are not in the model; they are covered by unit tests and a randomized simulation.
+
+A subscriber buffers what arrives ahead of `expected` (16,384 messages by default) and requests `[expected, first buffered)` in chunks of up to 1,024 messages. It re-requests after 10 ms without progress.
 
 | Packet vs. `expected` | Action |
 |---|---|
@@ -119,9 +130,11 @@ The decision logic is implemented in `SequenceTracker` (`core/include/adsb/proto
 | `seq < expected < seq + count` | Overlap: skip the first `expected − seq` messages, apply the rest |
 | `seq > expected` | Gap: buffer this packet. Send a `RetransmitRequest` for `[expected, seq)`; if the server no longer holds that range, take a snapshot |
 | Heartbeat with `seq > expected` | Gap at the tail: request `[expected, seq)` |
-| New `session` | Discard state, take a snapshot, then reset the tracker to the new session |
+| New `session` | Discard state. If the packet starts at `seq` 1, nothing else is needed (the state as of 0 is empty); otherwise take a snapshot |
 | Packet from the previous session (after the switch) | Stale (UDP reordering): drop |
-| End of session | Stop; expect a new session |
+| End of session | Like a heartbeat: recover any gap before it. The session is complete once every message before its `seq` is applied |
+| Retransmit reply (data) | Same as a multicast data packet |
+| NAK whose `seq > expected` | The gap is older than the server's ring: take a snapshot. A NAK with `seq <= expected` is stale and ignored |
 
 ---
 
@@ -130,4 +143,4 @@ The decision logic is implemented in `SequenceTracker` (`core/include/adsb/proto
 1. **`nic` / position quality:** populate from TC 31 (operational status) once it is decoded, or replace with NUCp derived from the position type code?
 2. **Heading and airspeed:** these are decoded (velocity subtypes 3/4) but not carried. Add them in v1, at the cost of a second cache line, or as a separate `'V'` message?
 3. **Conflated feed** (README_UPDATES.md §10.2): same messages on a separate multicast group, or a dedicated compact message?
-4. **Multicast group and port:** placeholder `239.19.0.1:41900` for the incremental feed, `239.19.0.2` for fusion. Confirm these against the lab network.
+4. **Multicast group and ports:** defaults are `239.19.0.1:41900` for the incremental feed, UDP 41901 for retransmit requests, TCP 41902 for snapshots, and `239.19.0.2` for fusion. Confirm these against the lab network.

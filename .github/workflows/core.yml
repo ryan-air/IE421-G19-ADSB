@@ -83,7 +83,7 @@ jobs:
 
       - name: Fuzz
         run: |
-          for target in beast decoder packet; do
+          for target in beast decoder packet feed; do
             mkdir -p "/tmp/corpus_$target"
             cp fuzz/corpus/$target/* "/tmp/corpus_$target/"
             ./build/fuzz/fuzz/fuzz_$target -max_total_time=60 -print_final_stats=1 \
@@ -127,6 +127,7 @@ jobs:
           bash -n scripts/check-host.sh
           bash -n scripts/tune-host.sh
           bash -n scripts/check-determinism.sh
+          bash -n scripts/check-feed.sh
           bash -n ../bench/legacy/run.sh
           bash -n ../bench/legacy/run_bench.sh
           python3 -m py_compile ../bench/legacy/feeder.py ../bench/legacy/probe.py ../bench/legacy/analyze.py
@@ -224,3 +225,23 @@ jobs:
         with:
           name: live-ingest
           path: bench/live/out/
+
+  feed:
+    name: feed recovery (publisher -> multicast -> subscribers, integration)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14
+      - name: Build
+        run: |
+          CXX=g++-14 cmake -S . -B build/feed -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/feed
+      # Loss, a small retransmit ring (snapshot fallback), a late joiner and a
+      # publisher restart; every subscriber's book must match the publisher's
+      # byte for byte, and the publisher's must match a plain replay.
+      - name: Run
+        run: FEED_IFACE=127.0.0.1 scripts/check-feed.sh build/feed

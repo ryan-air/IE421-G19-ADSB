@@ -14,9 +14,10 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 > - the host tuning scripts (§18).
 >
 > - live Beast ingest from readsb (`adsb-live`, §5.3);
+> - the feed over kernel UDP (§9.1–9.2, 9.5): publisher, retransmit and snapshot servers, subscriber library and `adsb-feed-cli`, with loss injection; reconstructed books are byte-identical to the publisher's;
 > - the Fall 2025 baseline measured: about 1.1–1.6 s to the map, with 83% of positions discarded ([findings](bench/results/legacy-baseline/README.md)).
 >
-> Not started: the publisher and gateway (E), the arbiter (B), the demodulator (A), and fusion (I).
+> Not started: the faster transports and hardware timestamps (§9.3–9.4), the gateway (E), the arbiter (B), the demodulator (A), and fusion (I).
 
 > **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed, and own the whole path from **antenna to published decision**. We demodulate the radio samples ourselves, merge redundant A/B receiver lines, decode and maintain state on a lock-free pinned-core pipeline, and publish over kernel UDP, io_uring, AF_XDP, or shared memory. Every segment is measured in cycles and nanoseconds against hardware timestamps. We then show that the same infrastructure handles a real exchange feed (**Nasdaq ITCH 5.0**) at tens of millions of messages per second.
 

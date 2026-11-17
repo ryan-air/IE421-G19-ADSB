@@ -72,7 +72,7 @@ cd IE421-G19-ADSB/core
 cmake --preset debug && cmake --build --preset debug -j && ctest --preset debug
 ```
 
-Expected result: `100% tests passed, 0 tests failed out of 137`.
+Expected result: `100% tests passed, 0 tests failed out of 187`.
 
 The first configure takes a minute because it downloads the test frameworks. Later builds are incremental. Add `-G Ninja` after `--preset debug` on the first configure if you installed Ninja.
 
@@ -150,6 +150,17 @@ cmake --preset naive-baseline && cmake --build --preset naive-baseline -j
 ```
 
 `bench/live/run.sh` tests this end to end in Docker against a real readsb, including a readsb restart (CI runs it too).
+
+### The feed: publisher and subscribers
+
+`adsb-publish` replays a recording through the pipeline and publishes the tracks as the sequenced UDP feed (multicast `239.19.0.1:41900` by default), with the retransmit server (UDP 41901) and snapshot server (TCP 41902) alongside. `adsb-feed-cli` subscribes, recovers any gaps, and prints what it reconstructed. Start one or more subscribers, then the publisher:
+
+```bash
+./build/release/tools/adsb-feed-cli --interface 127.0.0.1 --until-end
+./build/release/tools/adsb-publish /tmp/traffic.adsbrec --interface 127.0.0.1 --speed 10
+```
+
+Both print a `book digest` line at the end, and they must be identical. To publish a live receiver instead of a recording, add `--publish 239.19.0.1:41900 --publish-interface ADDR` to `adsb-live`. Useful options: `--drop-rate 0.01 --drop-burst 3` (on either side) injects loss, `--ring 2048` shrinks the retransmit window so subscribers fall back to snapshots, and `--batch-us 50` batches messages per datagram. Use `--interface 127.0.0.1` on one machine. Across machines, use the wired interface's address, since Wi-Fi drops multicast. `scripts/check-feed.sh build/release` runs the full loss, late-join and restart test (CI runs it too).
 
 ### Fall 2025 baseline (the "before" numbers)
 

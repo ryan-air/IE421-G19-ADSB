@@ -3,6 +3,7 @@
 //   adsb-live [--host 127.0.0.1] [--port 30005] [--record FILE.adsbrec]
 //             [--duration SECONDS] [--receiver LAT,LON] [--stats-every SECONDS]
 //             [--busy-poll] [--cpus INGEST,STATE[,RECORDER]] [--line N] [--quiet]
+//             [--publish GROUP:PORT [--publish-interface ADDR] [--batch-us N] ...]
 //
 // Threads:
 //   ingest    BeastTcpSource: recv -> parse -> Record (rx_ns = receive time)
@@ -10,7 +11,11 @@
 //               -> recorder queue (if --record; dropped and counted if full,
 //                  so a slow disk never stalls ingest)
 //   state     decode + track engine; per-frame latency histogram from receive
-//             to track state updated; expires idle tracks on event time
+//             to track state updated; expires idle tracks on event time.
+//             With --publish, the engine's output also goes to the feed
+//             publisher (README_UPDATES.md §9), and the histogram then covers
+//             receive -> published.
+//   recovery  (with --publish) retransmit and snapshot servers
 //   recorder  writes the .adsbrec file
 //
 // Stop with Ctrl-C (or --duration): queues drain, the recording gets its
@@ -29,6 +34,9 @@
 #include "adsb/common/histogram.hpp"
 #include "adsb/common/spsc_ring.hpp"
 #include "adsb/common/thread.hpp"
+#include "adsb/feed/net.hpp"
+#include "adsb/feed/publisher.hpp"
+#include "adsb/feed/recovery.hpp"
 #include "adsb/ingest/beast_tcp.hpp"
 #include "adsb/record/recording.hpp"
 #include "adsb/state/track_engine.hpp"
@@ -50,7 +58,14 @@ void on_signal(int) { g_stop.store(true); }
                "  --busy-poll           spin on the socket instead of poll() (lowest latency, uses a core)\n"
                "  --cpus I,S[,R]        pin ingest, state, recorder threads (Linux only)\n"
                "  --line N              receiver line id to stamp on frames (default 0)\n"
-               "  --quiet               no connection status messages\n");
+               "  --quiet               no connection status messages\n"
+               "feed (README_UPDATES.md §9):\n"
+               "  --publish HOST:PORT   publish tracks on this multicast group (or unicast address)\n"
+               "  --publish-interface A multicast egress interface address (default: kernel's choice)\n"
+               "  --batch-us N          batch up to N microseconds per datagram (default 0)\n"
+               "  --retransmit-port P   UDP retransmit server (default 41901)\n"
+               "  --snapshot-port P     TCP snapshot server (default 41902)\n"
+               "  --session ID          session id, up to 10 characters (default: from the clock)\n");
   std::exit(code);
 }
 
@@ -65,14 +80,21 @@ struct Shared {
   std::atomic<std::uint64_t> recorded{0}, record_dropped{0};
 };
 
+using FeedPublisher = adsb::feed::Publisher<adsb::feed::UdpSender>;
+
 struct CountingSink {
   Shared* shared;
+  FeedPublisher* pub = nullptr;  // --publish
   std::uint64_t updates = 0, deletes = 0, positions = 0;
   void on_update(const adsb::protocol::TrackUpdate& u) {
     ++updates;
     if (u.update_mask & adsb::protocol::update_mask::kPosition) ++positions;
+    if (pub) pub->on_update(u);
   }
-  void on_delete(const adsb::protocol::TrackDelete&) { ++deletes; }
+  void on_delete(const adsb::protocol::TrackDelete& d) {
+    ++deletes;
+    if (pub) pub->on_delete(d);
+  }
 };
 
 void print_hist(const char* name, const adsb::LatencyHistogram& h) {
@@ -93,6 +115,17 @@ int main(int argc, char** argv) {
   double duration_s = 0, stats_every_s = 10;
   bool quiet = false;
   int cpu_ingest = -1, cpu_state = -1, cpu_recorder = -1;
+  std::string publish_to, session_id;
+  adsb::feed::UdpSender::Options send_opt;
+  adsb::feed::PublisherConfig pub_cfg;
+  adsb::feed::RecoveryServerConfig rec_cfg;
+  rec_cfg.retransmit_port = 41901;
+  rec_cfg.snapshot_port = 41902;
+  auto parse_port = [](const std::string& v) -> std::uint16_t {
+    const long p = std::strtol(v.c_str(), nullptr, 10);
+    if (p <= 0 || p > 65535) usage(1);
+    return static_cast<std::uint16_t>(p);
+  };
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -119,6 +152,14 @@ int main(int argc, char** argv) {
     } else if (a == "--cpus") {
       const std::string v = val();
       if (std::sscanf(v.c_str(), "%d,%d,%d", &cpu_ingest, &cpu_state, &cpu_recorder) < 2) usage(1);
+    } else if (a == "--publish") publish_to = val();
+    else if (a == "--publish-interface") send_opt.interface_host = val();
+    else if (a == "--batch-us") pub_cfg.max_batch_delay_ns = std::strtoull(val().c_str(), nullptr, 10) * 1000;
+    else if (a == "--retransmit-port") rec_cfg.retransmit_port = parse_port(val());
+    else if (a == "--snapshot-port") rec_cfg.snapshot_port = parse_port(val());
+    else if (a == "--session") {
+      session_id = val();
+      if (session_id.empty() || session_id.size() > 10) usage(1);
     } else {
       std::fprintf(stderr, "adsb-live: unknown option %s\n", a.c_str());
       usage(1);
@@ -142,6 +183,45 @@ int main(int argc, char** argv) {
     if (!writer.open(record_path, info, &err)) {
       std::fprintf(stderr, "adsb-live: %s\n", err.c_str());
       return 1;
+    }
+  }
+
+  // Feed publisher and recovery servers (optional).
+  std::unique_ptr<adsb::feed::UdpSender> udp;
+  std::unique_ptr<adsb::feed::MessageLog> feed_log;
+  std::unique_ptr<adsb::feed::RecoveryServer> recovery;
+  std::unique_ptr<FeedPublisher> pub;
+  std::atomic<bool> rec_stop{false};
+  std::thread rec_thread;
+  if (!publish_to.empty()) {
+    adsb::feed::Endpoint dest;
+    if (!adsb::feed::parse_endpoint(publish_to, dest)) usage(1);
+    if (session_id.empty()) {
+      const adsb::protocol::Session s = adsb::feed::unique_session('L');
+      session_id.assign(s.begin(), s.end());
+    }
+    pub_cfg.session = adsb::protocol::make_session(session_id.c_str());
+    rec_cfg.recovery.session = pub_cfg.session;
+    std::string err;
+    udp = std::make_unique<adsb::feed::UdpSender>();
+    if (!udp->open(dest, send_opt, &err)) {
+      std::fprintf(stderr, "adsb-live: publish %s: %s\n", publish_to.c_str(), err.c_str());
+      return 1;
+    }
+    feed_log = adsb::feed::make_message_log();
+    recovery = std::make_unique<adsb::feed::RecoveryServer>(rec_cfg, *feed_log);
+    if (!recovery->open(&err)) {
+      std::fprintf(stderr, "adsb-live: recovery servers: %s\n", err.c_str());
+      return 1;
+    }
+    pub = std::make_unique<FeedPublisher>(pub_cfg, *udp, feed_log.get());
+    rec_thread = std::thread([&] {
+      adsb::set_current_thread_name("adsb-recovery");
+      recovery->run(rec_stop);
+    });
+    if (!quiet) {
+      std::fprintf(stderr, "adsb-live: publishing session %s on %s (retransmit :%u, snapshot :%u)\n",
+                   session_id.c_str(), publish_to.c_str(), recovery->retransmit_port(), recovery->snapshot_port());
     }
   }
 
@@ -189,7 +269,7 @@ int main(int argc, char** argv) {
   std::thread state([&] {
     adsb::set_current_thread_name("adsb-state");
     if (cpu_state >= 0) adsb::pin_current_thread(cpu_state);
-    CountingSink sink{&shared};
+    CountingSink sink{&shared, pub.get()};
     auto publish = [&](std::uint64_t bad) {
       shared.tracks.store(engine->track_count(), std::memory_order_relaxed);
       shared.updates.store(sink.updates, std::memory_order_relaxed);
@@ -225,6 +305,8 @@ int main(int argc, char** argv) {
           engine->advance(adsb::mono_ns(), sink);
           publish(engine->stats().bad_frames);
         }
+        // Batches due and heartbeats while the feed is quiet.
+        if (pub && idle_spins % 64 == 0) pub->poll();
         adsb::cpu_relax();
       }
     }
@@ -275,6 +357,18 @@ int main(int argc, char** argv) {
   ingest.join();
   state.join();
   if (recorder.joinable()) recorder.join();
+  if (pub) {
+    // End the session, then keep answering recovery requests briefly so
+    // subscribers can fill the tail.
+    pub->end_session();
+    const std::uint64_t until = adsb::mono_ns() + 1'000'000'000ULL;
+    while (adsb::mono_ns() < until) {
+      pub->poll();
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    rec_stop = true;
+    rec_thread.join();
+  }
   const bool rec_ok = record_path.empty() || writer.close();
 
   // Final report (all worker threads have finished; reading their state is safe).
@@ -295,8 +389,17 @@ int main(int argc, char** argv) {
     std::printf("recording   %s: %llu records, %llu dropped%s\n", record_path.c_str(), u(writer.count()),
                 u(shared.record_dropped.load()), rec_ok ? "" : " (WRITE FAILED)");
   }
+  if (pub) {
+    const auto& ps = pub->stats();
+    const auto& rc = recovery->counters();
+    std::printf("feed        session %s: %llu messages in %llu datagrams, %llu heartbeats, %llu send failures; "
+                "%llu retransmit requests, %llu snapshots\n",
+                session_id.c_str(), u(ps.messages), u(ps.packets), u(ps.heartbeats), u(ps.send_failures),
+                u(rc.requests.load()), u(rc.snapshots.load()));
+    std::printf("book digest %s\n", recovery->state().book().hex_digest().c_str());
+  }
   std::printf("build       %s\n", adsb::build_variant());
-  std::printf("latency (receive -> track state updated, per frame):\n");
+  std::printf("latency (receive -> track state updated%s, per frame):\n", pub ? " and published" : "");
   print_hist("queue wait", *queue_wait);
   print_hist("receive -> state done", *recv_to_state);
   return rec_ok ? 0 : 1;

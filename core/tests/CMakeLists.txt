@@ -17,6 +17,9 @@ set(ADSB_TEST_SOURCES
   test_track_engine.cpp
   test_synth_replay.cpp
   test_beast_tcp.cpp
+  test_feed.cpp
+  test_feed_subscriber.cpp
+  test_feed_net.cpp
 )
 
 add_executable(adsb_tests ${ADSB_TEST_SOURCES})

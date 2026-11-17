@@ -10,11 +10,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "adsb/common/build_config.hpp"
+#include "adsb/feed/book.hpp"
 #include "adsb/record/recording.hpp"
 #include "adsb/replay/replay.hpp"
 
@@ -30,7 +32,9 @@ namespace {
                "  --out FILE        write the emitted messages as {u16 len, bytes} records\n"
                "  --no-flush        do not expire the remaining tracks after the last record\n"
                "  --allow-truncated read a recording that has no footer (recorder was killed)\n"
-               "  --hash-only       print only the output hash\n");
+               "  --hash-only       print only the output hash\n"
+               "  --book-digest     also print the digest of the final track book (what a feed\n"
+               "                    subscriber reconstructs; compare with adsb-publish --no-publish-ts)\n");
   std::exit(code);
 }
 
@@ -49,7 +53,7 @@ int main(int argc, char** argv) {
   std::string path, out_path;
   adsb::replay::ReplayOptions opt;
   opt.flush_at_end = true;
-  bool pipeline = false, allow_truncated = false, hash_only = false;
+  bool pipeline = false, allow_truncated = false, hash_only = false, book_digest = false;
   int reader_cpu = -1, worker_cpu = -1;
 
   for (int i = 1; i < argc; ++i) {
@@ -73,6 +77,7 @@ int main(int argc, char** argv) {
     else if (a == "--no-flush") opt.flush_at_end = false;
     else if (a == "--allow-truncated") allow_truncated = true;
     else if (a == "--hash-only") hash_only = true;
+    else if (a == "--book-digest") book_digest = true;
     else if (!a.empty() && a[0] == '-') {
       std::fprintf(stderr, "adsb-replay: unknown option %s\n", a.c_str());
       usage(1);
@@ -97,7 +102,7 @@ int main(int argc, char** argv) {
   auto engine = std::make_unique<adsb::DefaultTrackEngine>(ecfg);
 
   std::vector<std::uint8_t> captured;
-  std::vector<std::uint8_t>* capture = out_path.empty() ? nullptr : &captured;
+  std::vector<std::uint8_t>* capture = out_path.empty() && !book_digest ? nullptr : &captured;
   auto lat = std::make_unique<adsb::replay::PipelineLatency>();
   const adsb::replay::ReplayResult r =
       pipeline ? adsb::replay::replay_pipeline(rd, *engine, opt, lat.get(), reader_cpu, worker_cpu, capture)
@@ -113,8 +118,22 @@ int main(int argc, char** argv) {
     }
   }
 
+  std::string book_hex;
+  std::size_t book_size = 0;
+  if (book_digest) {
+    adsb::feed::FeedBook book;
+    for (std::size_t off = 0; off + 2 <= captured.size();) {
+      std::uint16_t len;
+      std::memcpy(&len, captured.data() + off, 2);
+      book.apply(std::span<const std::uint8_t>(captured.data() + off + 2, len));
+      off += 2u + len;
+    }
+    book_hex = book.hex_digest();
+    book_size = book.size();
+  }
   if (hash_only) {
     std::printf("%s\n", r.hash.c_str());
+    if (book_digest) std::printf("%s\n", book_hex.c_str());
     return 0;
   }
   const auto& s = r.stats;
@@ -139,6 +158,10 @@ int main(int argc, char** argv) {
     print_hist("queue", lat->queue_ns);
     print_hist("decode+state", lat->process_ns);
     print_hist("total", lat->total_ns);
+  }
+  if (book_digest) {
+    std::printf("book        %zu tracks\n", book_size);
+    std::printf("book digest %s\n", book_hex.c_str());
   }
   return 0;
 }

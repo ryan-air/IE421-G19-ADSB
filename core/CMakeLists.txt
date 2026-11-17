@@ -48,6 +48,11 @@ add_library(adsb_core STATIC
   src/modes/decoder.cpp
   src/modes/encoder.cpp
   src/ingest/beast_tcp.cpp
+  src/feed/book.cpp
+  src/feed/snapshot.cpp
+  src/feed/net.cpp
+  src/feed/recovery.cpp
+  src/feed/subscriber.cpp
   src/record/recording.cpp
   src/sim/synth.cpp
 )

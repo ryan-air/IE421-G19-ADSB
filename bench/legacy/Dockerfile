@@ -6,6 +6,8 @@
 #   * the Fall 2025 Node.js web server's dependencies (ads/package-lock.json)
 #   * a C++ toolchain to build core/ (adsb-synth, adsb-replay) at run time
 # The project source is mounted read-only at /repo; nothing in it is modified.
+# The Fall 2025 code is read from bench/legacy/fall2025/, which run.sh extracts
+# from the git tag fall2025-final, so later edits to ads/ do not leak in.
 
 FROM ubuntu:24.04
 
@@ -30,12 +32,12 @@ RUN git clone --depth 1 --branch ${READSB_TAG} https://github.com/wiedehopf/read
 
 # Fall 2025 streamer dependencies, exactly as pinned in its requirements.txt,
 # plus numpy for the analysis script only.
-COPY ads-b-receiver/requirements.txt /opt/legacy/requirements.txt
+COPY bench/legacy/fall2025/ads-b-receiver/requirements.txt /opt/legacy/requirements.txt
 RUN python3 -m venv /opt/venv \
   && /opt/venv/bin/pip install --quiet --no-cache-dir -r /opt/legacy/requirements.txt numpy==1.26.4
 
 # Fall 2025 web server dependencies, from its lockfile.
-COPY ads/package.json ads/package-lock.json /opt/legacy/ads/
+COPY bench/legacy/fall2025/ads/package.json bench/legacy/fall2025/ads/package-lock.json /opt/legacy/ads/
 RUN cd /opt/legacy/ads && npm ci --omit=dev --no-audit --no-fund --loglevel=error
 
 ENV PATH=/opt/venv/bin:$PATH

@@ -4,11 +4,28 @@
 #
 #   bench/legacy/run.sh                       # default sweep: 50 200 1000 3000 aircraft, 120 s each
 #   SCENARIOS="50 200" DURATION=60 bench/legacy/run.sh   # quicker run
+#
+# The Fall 2025 code is taken from the git tag `fall2025-final` (override with
+# FALL2025_REF), never from the working tree: ads/, ads-b-receiver/ and
+# data-generator/ may be edited later, and the "before" numbers must keep
+# measuring the system as it was delivered.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 RESULTS="$ROOT/bench/results/legacy-baseline"
 cd "$HERE"
+REF="${FALL2025_REF:-fall2025-final}"
+if ! git -C "$ROOT" rev-parse --verify --quiet "$REF^{commit}" > /dev/null; then
+  git -C "$ROOT" fetch --quiet github "refs/tags/$REF:refs/tags/$REF" 2>/dev/null || true
+fi
+FALL_COMMIT="$(git -C "$ROOT" rev-parse --verify --quiet "$REF^{commit}")" || {
+  echo "missing git ref $REF (the original Fall 2025 code); try: git fetch github --tags" >&2
+  exit 2
+}
+# Extract the original code into fall2025/ (gitignored, recreated every run).
+rm -rf fall2025 && mkdir -p fall2025
+git -C "$ROOT" archive "$FALL_COMMIT" ads ads-b-receiver | tar -x -C fall2025
+echo "Fall 2025 code: $REF = $(git -C "$ROOT" rev-parse --short "$FALL_COMMIT")"
 rm -rf out && mkdir -p out
 cleanup() { docker compose down -v --remove-orphans >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -18,6 +35,8 @@ docker compose run --rm \
   -e DURATION="${DURATION:-120}" \
   -e SEED="${SEED:-2025}" \
   -e KEEP_RAW="${KEEP_RAW:-0}" \
+  -e FALL2025_REF="$REF" \
+  -e FALL2025_COMMIT="$FALL_COMMIT" \
   bench
 mkdir -p "$RESULTS"
 cp out/report.md out/environment.json "$RESULTS/"

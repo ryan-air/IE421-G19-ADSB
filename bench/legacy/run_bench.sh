@@ -40,8 +40,13 @@ cmake --build "$WORK/core-build" >/dev/null || exit 1
 SYNTH="$WORK/core-build/tools/adsb-synth"
 REPLAY="$WORK/core-build/tools/adsb-replay"
 
+# The Fall 2025 code as delivered: extracted by run.sh from the git tag
+# fall2025-final into bench/legacy/fall2025/, never the working tree's ads/.
+FALL=/repo/bench/legacy/fall2025
+[[ -f "$FALL/ads/server.js" && -f "$FALL/ads-b-receiver/adsb_streamer_optimized.py" ]] || {
+  log "missing $FALL (run bench/legacy/run.sh, which extracts the fall2025-final tag)"; exit 1; }
 rm -rf "$WORK/ads" && mkdir -p "$WORK/ads"
-cp -R /repo/ads/. "$WORK/ads/"
+cp -R "$FALL/ads/." "$WORK/ads/"
 rm -rf "$WORK/ads/node_modules"
 ln -s /opt/legacy/ads/node_modules "$WORK/ads/node_modules"
 
@@ -54,6 +59,7 @@ ln -s /opt/legacy/ads/node_modules "$WORK/ads/node_modules"
   echo "  \"kernel\": \"$(uname -sr)\","
   echo "  \"cpus\": $(nproc),"
   echo "  \"scenarios\": \"$SCENARIOS\", \"duration_s\": $DURATION, \"seed\": $SEED,"
+  echo "  \"fall2025_ref\": \"${FALL2025_REF:-unknown}\", \"fall2025_commit\": \"${FALL2025_COMMIT:-unknown}\","
   echo "  \"repo_commit\": \"$(git -C /repo rev-parse --short HEAD 2>/dev/null || echo unknown)\""
   echo "}"
 } > "$OUT/environment.json"
@@ -102,7 +108,7 @@ for N in $SCENARIOS; do
   PIDS+=($!)
 
   # 3. The Fall 2025 streamer, unmodified, with its production flags.
-  python3 /repo/ads-b-receiver/adsb_streamer_optimized.py --host 127.0.0.1 --port 30003 \
+  python3 "$FALL/ads-b-receiver/adsb_streamer_optimized.py" --host 127.0.0.1 --port 30003 \
           --receiver-id bench --batch-size 100 --flush-interval 1.0 --cleanup-interval 5 \
           > "$D/streamer.log" 2>&1 &
   PIDS+=($!)

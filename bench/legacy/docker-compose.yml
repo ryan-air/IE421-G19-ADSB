@@ -1,5 +1,8 @@
 # Fall 2025 baseline harness. Run with bench/legacy/run.sh rather than directly.
 #
+# The Fall 2025 code comes from ./fall2025/, which run.sh extracts from the
+# git tag fall2025-final (never the working tree's ads/ or ads-b-receiver/).
+#
 #   db     Postgres 16 with the Fall 2025 schema (ads-b-receiver/schema.sql).
 #          SSL is on because the Fall 2025 Node server always connects with SSL
 #          (it was written for Supabase); a self-signed certificate is enough.
@@ -18,7 +21,7 @@ services:
       -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
     volumes:
       - ./supabase_roles.sql:/docker-entrypoint-initdb.d/00_supabase_roles.sql:ro
-      - ../../ads-b-receiver/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./fall2025/ads-b-receiver/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./position_history.sql:/docker-entrypoint-initdb.d/02_position_history.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d adsb"]

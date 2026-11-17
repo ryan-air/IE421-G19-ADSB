@@ -26,9 +26,11 @@ adsb-synth ──.adsbrec──▶ feeder.py ──Beast──▶ readsb ──S
 | `feeder.py` | RTL-SDR | Sends each frame to readsb's Beast input at the moment it would have arrived |
 | readsb v3.16.21 | dump1090 on the Pi | Same software family, default output buffering. Pinned tag, built from source. |
 | Postgres 16 | Supabase | Local, SSL on: the Fall 2025 server always connects with SSL |
-| Streamer, web server | — | Run exactly as committed in `ads-b-receiver/` and `ads/` |
+| Streamer, web server | — | Run exactly as delivered: `ads-b-receiver/` and `ads/` from the git tag `fall2025-final` |
 
-Nothing in `ads/` or `ads-b-receiver/` is modified. Two database fixes are applied at startup, both as separate init scripts:
+**The Fall 2025 code comes from the git tag `fall2025-final`, not from the working tree.** The tag points at the last commit of the Fall 2025 GitLab repository (`7b52633`, 2025-12-21). `run.sh` extracts `ads/` and `ads-b-receiver/` from it with `git archive` into `bench/legacy/fall2025/` (gitignored, recreated every run), and the image, the database schema and the processes all use that copy. The working-tree `ads/` and `ads-b-receiver/` may be changed by later work, and the "before" numbers stay those of the delivered system. `environment.json` records the tag and commit measured. Override with `FALL2025_REF=<ref>` only to measure something else on purpose.
+
+The Fall 2025 code is not modified. Two database fixes are applied at startup, both as separate init scripts:
 - [`supabase_roles.sql`](supabase_roles.sql) creates the Supabase roles (`authenticated`, ...) that `schema.sql` grants permissions to.
 - [`position_history.sql`](position_history.sql) creates `aircraft_position_history`. The streamer writes this table and the server reads it, but `ads-b-receiver/schema.sql` does not create it. The definition is taken from PROJECT_REPORT.md. **This is a bug in the committed schema:** a fresh deployment from the repository fails on every batch insert.
 

@@ -1,2 +1,5 @@
 out/
 __pycache__/
+
+# Original Fall 2025 code, extracted from the fall2025-final tag by run.sh
+fall2025/

@@ -312,3 +312,23 @@ jobs:
       # and adsb-live: every conflated book must equal the main feed's state.
       - name: Run
         run: FEED_IFACE=127.0.0.1 scripts/check-conflate.sh build/conf
+
+  shm:
+    name: shared-memory transport (publisher -> ring -> subscribers, integration)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14
+      - name: Build
+        run: |
+          CXX=g++-14 cmake -S . -B build/shm -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/shm
+      # A subscriber that keeps up, one that is lapped and resyncs by snapshot,
+      # a late joiner, and a publisher restart: every book must equal the
+      # publisher's byte for byte.
+      - name: Run
+        run: scripts/check-shm.sh build/shm

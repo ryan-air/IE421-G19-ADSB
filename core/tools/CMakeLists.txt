@@ -25,3 +25,11 @@ adsb_apply_compiler_options(adsb-clock)
 add_executable(adsb-beast-serve adsb_beast_serve.cpp)
 target_link_libraries(adsb-beast-serve PRIVATE adsb::core)
 adsb_apply_compiler_options(adsb-beast-serve)
+
+add_executable(adsb-shm-cli adsb_shm_cli.cpp)
+target_link_libraries(adsb-shm-cli PRIVATE adsb::core)
+adsb_apply_compiler_options(adsb-shm-cli)
+
+add_executable(adsb-shm-bench adsb_shm_bench.cpp)
+target_link_libraries(adsb-shm-bench PRIVATE adsb::core)
+adsb_apply_compiler_options(adsb-shm-bench)

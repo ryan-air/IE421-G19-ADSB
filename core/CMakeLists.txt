@@ -53,6 +53,8 @@ add_library(adsb_core STATIC
   src/feed/net.cpp
   src/feed/recovery.cpp
   src/feed/subscriber.cpp
+  src/feed/shm_ring.cpp
+  src/feed/shm_subscriber.cpp
   src/record/recording.cpp
   src/sim/synth.cpp
 )

@@ -201,6 +201,7 @@ int main(int argc, char** argv) {
                 u(h.percentile(50)), u(h.percentile(99)), u(h.percentile(99.9)), u(h.max()));
   }
   std::printf("book        %zu tracks\n", core.book().size());
+  std::printf("state digest %s\n", core.book().hex_state_digest().c_str());
   std::printf("book digest %s\n", core.book().hex_digest().c_str());
   return until_end && !core.ended() ? 3 : 0;
 }

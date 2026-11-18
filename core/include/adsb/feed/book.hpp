@@ -53,6 +53,13 @@ class FeedBook {
   [[nodiscard]] std::array<std::uint8_t, 32> digest() const;
   [[nodiscard]] std::string hex_digest() const;
 
+  // The same digest with update_mask and publish_ts_ns zeroed: compares
+  // aircraft state only. The conflated feed carries the main feed's state
+  // with a union mask and its own publish time, so the two books match on
+  // this digest (README_UPDATES.md §10.2), not on digest().
+  [[nodiscard]] std::array<std::uint8_t, 32> state_digest() const;
+  [[nodiscard]] std::string hex_state_digest() const;
+
   [[nodiscard]] bool operator==(const FeedBook& other) const;
 
  private:

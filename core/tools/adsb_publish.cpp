@@ -25,6 +25,7 @@
 #include "adsb/common/thread.hpp"
 #include "adsb/feed/net.hpp"
 #include "adsb/feed/publisher.hpp"
+#include "adsb/feed/conflated_feed.hpp"
 #include "adsb/feed/recovery.hpp"
 #include "adsb/record/recording.hpp"
 #include "adsb/replay/replay.hpp"
@@ -64,7 +65,12 @@ void on_signal(int) { g_stop.store(true); }
                "  --drop-burst N          datagrams per drop burst (default 1)\n"
                "  --reply-drop-rate P     probability a retransmit reply datagram is dropped\n"
                "  --seed N                fault injection seed (default 1)\n"
-               "  --drop-only-first N     inject only into the first N feed datagrams\n");
+               "  --drop-only-first N     inject only into the first N feed datagrams\n"
+               "conflated feed (README_UPDATES.md §10.2; latest state per aircraft at a fixed rate):\n"
+               "  --conflate GROUP:PORT   also publish the conflated feed on this group (e.g. 239.19.0.3:41910)\n"
+               "  --conflate-hz N         ticks per second, on recording time (default 10)\n"
+               "  --conflate-retransmit-port P   (default 41911)    --conflate-snapshot-port P   (default 41912)\n"
+               "  --conflate-session ID   (default: unique, from the clock)\n");
   std::exit(code);
 }
 
@@ -86,18 +92,21 @@ std::uint16_t parse_port(const std::string& v) {
   return static_cast<std::uint16_t>(p);
 }
 
-// Fans the engine's output into the publisher and counts it.
+// Fans the engine's output into the publisher (and the conflated feed) and counts it.
 template <typename Pub>
 struct PublishSink {
   Pub* pub;
+  ConflatedFeed* conf = nullptr;
   std::uint64_t updates = 0, deletes = 0;
   void on_update(const protocol::TrackUpdate& u) {
     ++updates;
     pub->on_update(u);
+    if (conf) conf->on_update(u);
   }
   void on_delete(const protocol::TrackDelete& d) {
     ++deletes;
     pub->on_delete(d);
+    if (conf) conf->on_delete(d);
   }
 };
 
@@ -108,6 +117,8 @@ int main(int argc, char** argv) {
   Endpoint feed{"239.19.0.1", 41900};
   UdpSender::Options send_opt;
   std::string session_id;
+  std::string conflate_to, conflate_session;
+  ConflatedFeedConfig ccfg;
   PublisherConfig pcfg;
   RecoveryServerConfig rcfg;
   rcfg.retransmit_port = 41901;
@@ -132,6 +143,11 @@ int main(int argc, char** argv) {
     else if (a == "--heartbeat-ms") { pcfg.heartbeat_interval_ns = parse_u64(val()) * 1'000'000; if (!pcfg.heartbeat_interval_ns) usage(1); }
     else if (a == "--no-publish-ts") pcfg.stamp_publish_ts = false;
     else if (a == "--bind") rcfg.bind_host = val();
+    else if (a == "--conflate") conflate_to = val();
+    else if (a == "--conflate-hz") ccfg.hz = std::strtod(val().c_str(), nullptr);
+    else if (a == "--conflate-retransmit-port") ccfg.retransmit_port = parse_port(val());
+    else if (a == "--conflate-snapshot-port") ccfg.snapshot_port = parse_port(val());
+    else if (a == "--conflate-session") { conflate_session = val(); if (conflate_session.empty() || conflate_session.size() > 10) usage(1); }
     else if (a == "--retransmit-port") rcfg.retransmit_port = parse_port(val());
     else if (a == "--snapshot-port") rcfg.snapshot_port = parse_port(val());
     else if (a == "--ring") {
@@ -202,6 +218,25 @@ int main(int argc, char** argv) {
   LossyOut<UdpSender> out(udp, feed_loss);
   Publisher<LossyOut<UdpSender>> pub(pcfg, out, log.get());
   PublishSink<Publisher<LossyOut<UdpSender>>> sink{&pub};
+  ConflatedFeed conflated;
+  if (!conflate_to.empty()) {
+    if (!parse_endpoint(conflate_to, ccfg.group)) usage(1);
+    ccfg.send = send_opt;
+    ccfg.bind_host = rcfg.bind_host;
+    ccfg.heartbeat_interval_ns = pcfg.heartbeat_interval_ns;
+    ccfg.stamp_publish_ts = pcfg.stamp_publish_ts;
+    if (!conflate_session.empty()) ccfg.session = protocol::make_session(conflate_session.c_str());
+    if (!conflated.open(ccfg, &err)) {
+      std::fprintf(stderr, "adsb-publish: conflated feed %s: %s\n", conflate_to.c_str(), err.c_str());
+      rec_stop = true;
+      rec_thread.join();
+      return 1;
+    }
+    sink.conf = &conflated;
+    std::printf("conflated   session %s  feed %s at %.3g Hz  retransmit %s:%u  snapshot %s:%u\n",
+                conflated.session_text().c_str(), to_string(ccfg.group).c_str(), ccfg.hz, rcfg.bind_host.c_str(),
+                conflated.recovery().retransmit_port(), rcfg.bind_host.c_str(), conflated.recovery().snapshot_port());
+  }
 
   std::printf("session     %s  feed %s  retransmit %s:%u  snapshot %s:%u\n", session_id.c_str(),
               to_string(feed).c_str(), rcfg.bind_host.c_str(), recovery.retransmit_port(),
@@ -222,6 +257,7 @@ int main(int argc, char** argv) {
         const std::uint64_t now = mono_ns();
         if (now >= target) break;
         pub.poll();
+        if (sink.conf) conflated.poll_publisher();  // heartbeats during gaps; ticks stay on recording time
         if (!busy_wait && target - now > 2'000'000) {
           timespec ts{0, 500'000};
           nanosleep(&ts, nullptr);
@@ -232,6 +268,7 @@ int main(int argc, char** argv) {
     }
     engine->on_frame(r.payload, r.len, replay::detail::meta_of(r), sink);
     pub.poll();
+    if (sink.conf) conflated.poll(r.rx_ns);  // ticks on recording time: deterministic
     last_rx = r.rx_ns;
     ++records;
   }
@@ -239,17 +276,20 @@ int main(int argc, char** argv) {
     engine->advance(last_rx + engine->config().track_timeout_ns + 2'000'000'000ULL, sink);
   }
   pub.end_session();
+  if (sink.conf) conflated.end_session();  // sends what is pending, then ends
   const double wall = static_cast<double>(mono_ns() - wall0) * 1e-9;
 
   // Linger: keep repeating the end-of-session marker and serving recovery.
   const std::uint64_t linger_end = mono_ns() + static_cast<std::uint64_t>(linger_s * 1e9);
   while (!g_stop.load() && mono_ns() < linger_end) {
     pub.poll();
+    if (sink.conf) conflated.poll_ended();
     timespec ts{0, 1'000'000};
     nanosleep(&ts, nullptr);
   }
   rec_stop = true;
   rec_thread.join();
+  if (sink.conf) conflated.stop();
 
   auto u = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
   const auto& ps = pub.stats();
@@ -270,6 +310,18 @@ int main(int argc, char** argv) {
   }
   std::printf("book        %zu tracks as of seq %llu\n", recovery.state().book().size(),
               u(recovery.state().last_seq()));
+  std::printf("state digest %s\n", recovery.state().book().hex_state_digest().c_str());
+  if (sink.conf) {
+    const auto& cs = conflated.conflator_stats();
+    const auto& cp = conflated.publisher_stats();
+    std::printf("conflated   %llu updates in -> %llu out (%.1f%%), %llu deletes out, %llu suppressed, %llu passed through, "
+                "%llu ticks; %llu datagrams; recovery %llu requests, %llu snapshots\n",
+                u(cs.updates_in), u(cs.updates_out),
+                cs.updates_in ? 100.0 * static_cast<double>(cs.updates_out) / static_cast<double>(cs.updates_in) : 0.0,
+                u(cs.deletes_out), u(cs.suppressed), u(cs.passthrough), u(cs.ticks), u(cp.packets),
+                u(conflated.recovery().counters().requests.load()), u(conflated.recovery().counters().snapshots.load()));
+    std::printf("conflated state digest %s\n", conflated.recovery().state().book().hex_state_digest().c_str());
+  }
   std::printf("book digest %s\n", recovery.state().book().hex_digest().c_str());
   return 0;
 }

@@ -38,6 +38,7 @@
 #include "adsb/feed/publisher.hpp"
 #include "adsb/feed/conflated_feed.hpp"
 #include "adsb/feed/recovery.hpp"
+#include "adsb/feed/shm_ring.hpp"
 #include "adsb/ingest/beast_tcp.hpp"
 #include "adsb/record/recording.hpp"
 #include "adsb/state/track_engine.hpp"
@@ -77,6 +78,9 @@ void on_signal(int) { g_stop.store(true); }
                "  --retransmit-port P   UDP retransmit server (default 41901)\n"
                "  --snapshot-port P     TCP snapshot server (default 41902)\n"
                "  --session ID          session id, up to 10 characters (default: from the clock)\n"
+               "  --shm NAME            also publish on a shared-memory ring for subscribers on this host\n"
+               "                        (e.g. /adsb-feed; read it with adsb-shm-cli). Works without --publish.\n"
+               "  --shm-slots N         ring size in messages, a power of two (default 65536)\n"
                "conflated feed (README_UPDATES.md §10.2; latest state per aircraft at a fixed rate):\n"
                "  --conflate GROUP:PORT also publish the conflated feed on this group (e.g. 239.19.0.3:41910)\n"
                "  --conflate-hz N       ticks per second (default 10)\n"
@@ -99,7 +103,10 @@ struct Shared {
   std::atomic<std::uint64_t> overload_dropped{0}, queue_high_water{0};
 };
 
-using FeedPublisher = adsb::feed::Publisher<adsb::feed::UdpSender>;
+// UDP multicast and/or the same-host shared-memory ring (either may be absent).
+// The ring first: a ring write costs tens of ns, a UDP sendto() microseconds.
+using FeedOut = adsb::feed::DualOut<adsb::feed::ShmOut, adsb::feed::UdpSender>;
+using FeedPublisher = adsb::feed::Publisher<FeedOut>;
 
 struct CountingSink {
   Shared* shared;
@@ -137,7 +144,8 @@ int main(int argc, char** argv) {
   double duration_s = 0, stats_every_s = 10;
   bool quiet = false;
   int cpu_ingest = -1, cpu_state = -1, cpu_recorder = -1;
-  std::string publish_to, session_id;
+  std::string publish_to, session_id, shm_name;
+  std::uint64_t shm_slots = adsb::feed::kShmDefaultSlots;
   adsb::feed::UdpSender::Options send_opt;
   adsb::feed::PublisherConfig pub_cfg;
   std::string conflate_to;
@@ -182,6 +190,8 @@ int main(int argc, char** argv) {
       else if (v == "block") overload_block = true;
       else usage(2);
     } else if (a == "--max-queue") max_queue = std::strtoull(val().c_str(), nullptr, 10);
+    else if (a == "--shm") shm_name = val();
+    else if (a == "--shm-slots") shm_slots = std::strtoull(val().c_str(), nullptr, 10);
     else if (a == "--simulate-work-ns") work_ns = std::strtoull(val().c_str(), nullptr, 10);
     else if (a == "--line") src_cfg.line = static_cast<std::uint8_t>(std::strtol(val().c_str(), nullptr, 10) & 0xF);
     else if (a == "--receiver") {
@@ -227,14 +237,17 @@ int main(int argc, char** argv) {
 
   // Feed publisher and recovery servers (optional).
   std::unique_ptr<adsb::feed::UdpSender> udp;
+  adsb::feed::ShmRegion shm_region;
+  std::unique_ptr<adsb::feed::ShmOut> shm_out;
+  std::unique_ptr<FeedOut> feed_out;
   std::unique_ptr<adsb::feed::MessageLog> feed_log;
   std::unique_ptr<adsb::feed::RecoveryServer> recovery;
   std::unique_ptr<FeedPublisher> pub;
   std::atomic<bool> rec_stop{false};
   std::thread rec_thread;
-  if (!publish_to.empty()) {
+  if (!publish_to.empty() || !shm_name.empty()) {
     adsb::feed::Endpoint dest;
-    if (!adsb::feed::parse_endpoint(publish_to, dest)) usage(1);
+    if (!publish_to.empty() && !adsb::feed::parse_endpoint(publish_to, dest)) usage(1);
     if (session_id.empty()) {
       const adsb::protocol::Session s = adsb::feed::unique_session('L');
       session_id.assign(s.begin(), s.end());
@@ -242,25 +255,38 @@ int main(int argc, char** argv) {
     pub_cfg.session = adsb::protocol::make_session(session_id.c_str());
     rec_cfg.recovery.session = pub_cfg.session;
     std::string err;
-    udp = std::make_unique<adsb::feed::UdpSender>();
-    if (!udp->open(dest, send_opt, &err)) {
-      std::fprintf(stderr, "adsb-live: publish %s: %s\n", publish_to.c_str(), err.c_str());
-      return 1;
+    if (!publish_to.empty()) {
+      udp = std::make_unique<adsb::feed::UdpSender>();
+      if (!udp->open(dest, send_opt, &err)) {
+        std::fprintf(stderr, "adsb-live: publish %s: %s\n", publish_to.c_str(), err.c_str());
+        return 1;
+      }
     }
+    if (!shm_name.empty()) {
+      if (!shm_region.create(shm_name, shm_slots, pub_cfg.session, pub_cfg.first_seq, &err)) {
+        std::fprintf(stderr, "adsb-live: shm %s: %s\n", shm_name.c_str(), err.c_str());
+        return 1;
+      }
+      shm_out = std::make_unique<adsb::feed::ShmOut>(shm_region.view());
+    }
+    feed_out = std::make_unique<FeedOut>(shm_out.get(), udp.get());
     feed_log = adsb::feed::make_message_log();
     recovery = std::make_unique<adsb::feed::RecoveryServer>(rec_cfg, *feed_log);
     if (!recovery->open(&err)) {
       std::fprintf(stderr, "adsb-live: recovery servers: %s\n", err.c_str());
       return 1;
     }
-    pub = std::make_unique<FeedPublisher>(pub_cfg, *udp, feed_log.get());
+    pub = std::make_unique<FeedPublisher>(pub_cfg, *feed_out, feed_log.get());
     rec_thread = std::thread([&] {
       adsb::set_current_thread_name("adsb-recovery");
       recovery->run(rec_stop);
     });
     if (!quiet) {
-      std::fprintf(stderr, "adsb-live: publishing session %s on %s (retransmit :%u, snapshot :%u)\n",
-                   session_id.c_str(), publish_to.c_str(), recovery->retransmit_port(), recovery->snapshot_port());
+      std::fprintf(stderr, "adsb-live: publishing session %s on %s%s%s (retransmit :%u, snapshot :%u)\n",
+                   session_id.c_str(), publish_to.empty() ? "" : publish_to.c_str(),
+                   publish_to.empty() || shm_name.empty() ? "" : " and ",
+                   shm_name.empty() ? "" : ("shm " + shm_name).c_str(), recovery->retransmit_port(),
+                   recovery->snapshot_port());
     }
   }
 

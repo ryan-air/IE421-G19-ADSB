@@ -19,7 +19,7 @@ About 40% of the plan is done, and everything listed here is on `main` with CI p
 | Overload | Loss only at the input boundary and counted; publisher batching under load; tested at 0.5×, 2×, 10× saturation | [core/README.md](core/README.md#overload-semantics-workstream-f-readme_updatesmd-10) |
 | Benchmark | Fall 2025 vs. new pipeline on the same traffic: frame → map in the browser 1.1–1.6 s → about 70–90 ms (median, laptop) | [bench/results/legacy-baseline/README.md](bench/results/legacy-baseline/README.md) |
 
-Not started: the demodulator, A/B arbitration, faster transports, hardware timestamps, ITCH, and camera fusion. (The conflated feed is done.)
+Not started: the demodulator, A/B arbitration, io_uring and AF_XDP, hardware timestamps, ITCH, and camera fusion. (The shared-memory ring and the conflated feed are done.)
 
 ---
 
@@ -68,7 +68,7 @@ Plan §9.3–9.4, §10.2 and §12.
 
 | Item | Tier | Hardware | Size |
 |---|---|---|---|
-| Shared-memory broadcast ring (same-host IPC); target p99 < 500 ns | Should | None | M |
+| ~~Shared-memory broadcast ring (same-host IPC); target p99 < 500 ns~~ **Done:** p99 209 ns at 100 k msg/s on the laptop, see `core/README.md` | Should | None | M |
 | ~~Conflated feed: latest state per aircraft at about 10 Hz; the gateway subscribes to it~~ **Done:** `--conflate` on `adsb-live` / `adsb-publish`; point the gateway's `--feed` at it | Should | None | M |
 | Memory-model testing of the lock-free rings | Should | None | M |
 | AF_XDP transport (copy mode can be developed in Docker) | Should | Zero-copy needs the NIC | L |

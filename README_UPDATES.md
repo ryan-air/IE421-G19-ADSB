@@ -20,9 +20,10 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 >
 > - overload semantics for the live pipeline (§10.1, §10.3): loss only at the input boundary and counted, publisher batching while busy (1 M frames/s with publishing, up from about 300 k), tested at 0.5×, 2× and 10× saturation and through a burst (`core/scripts/check-overload.sh`, in CI).
 >
+> - the shared-memory broadcast ring (§9.3): same-host transport with lap detection and snapshot resync; write → read p50 125 ns, p99 209 ns at 100 k msg/s (laptop).
 > - the conflated feed (§10.2): latest state per aircraft at a fixed rate on its own group, with its own recovery; after every tick its book equals the main feed's by state.
 >
-> Not started: the faster transports and hardware timestamps (§9.3–9.4), the arbiter (B), the demodulator (A), and fusion (I).
+> Not started: io_uring and AF_XDP, hardware timestamps (§9.3–9.4), the arbiter (B), the demodulator (A), and fusion (I).
 
 > **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed, and own the whole path from **antenna to published decision**. We demodulate the radio samples ourselves, merge redundant A/B receiver lines, decode and maintain state on a lock-free pinned-core pipeline, and publish over kernel UDP, io_uring, AF_XDP, or shared memory. Every segment is measured in cycles and nanoseconds against hardware timestamps. We then show that the same infrastructure handles a real exchange feed (**Nasdaq ITCH 5.0**) at tens of millions of messages per second.
 

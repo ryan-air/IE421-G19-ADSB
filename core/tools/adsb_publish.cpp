@@ -27,6 +27,7 @@
 #include "adsb/feed/publisher.hpp"
 #include "adsb/feed/conflated_feed.hpp"
 #include "adsb/feed/recovery.hpp"
+#include "adsb/feed/shm_ring.hpp"
 #include "adsb/record/recording.hpp"
 #include "adsb/replay/replay.hpp"
 
@@ -66,6 +67,9 @@ void on_signal(int) { g_stop.store(true); }
                "  --reply-drop-rate P     probability a retransmit reply datagram is dropped\n"
                "  --seed N                fault injection seed (default 1)\n"
                "  --drop-only-first N     inject only into the first N feed datagrams\n"
+               "  --shm NAME              also publish on a shared-memory ring (e.g. /adsb-feed) for\n"
+               "                          subscribers on this host (adsb-shm-cli); loss injection is UDP only\n"
+               "  --shm-slots N           ring size in messages, a power of two (default 65536)\n"
                "conflated feed (README_UPDATES.md §10.2; latest state per aircraft at a fixed rate):\n"
                "  --conflate GROUP:PORT   also publish the conflated feed on this group (e.g. 239.19.0.3:41910)\n"
                "  --conflate-hz N         ticks per second, on recording time (default 10)\n"
@@ -116,7 +120,8 @@ int main(int argc, char** argv) {
   std::string path;
   Endpoint feed{"239.19.0.1", 41900};
   UdpSender::Options send_opt;
-  std::string session_id;
+  std::string session_id, shm_name;
+  std::uint64_t shm_slots = kShmDefaultSlots;
   std::string conflate_to, conflate_session;
   ConflatedFeedConfig ccfg;
   PublisherConfig pcfg;
@@ -143,6 +148,8 @@ int main(int argc, char** argv) {
     else if (a == "--heartbeat-ms") { pcfg.heartbeat_interval_ns = parse_u64(val()) * 1'000'000; if (!pcfg.heartbeat_interval_ns) usage(1); }
     else if (a == "--no-publish-ts") pcfg.stamp_publish_ts = false;
     else if (a == "--bind") rcfg.bind_host = val();
+    else if (a == "--shm") shm_name = val();
+    else if (a == "--shm-slots") shm_slots = parse_u64(val());
     else if (a == "--conflate") conflate_to = val();
     else if (a == "--conflate-hz") ccfg.hz = std::strtod(val().c_str(), nullptr);
     else if (a == "--conflate-retransmit-port") ccfg.retransmit_port = parse_port(val());
@@ -194,6 +201,18 @@ int main(int argc, char** argv) {
   }
   auto engine = std::make_unique<DefaultTrackEngine>(ecfg);
 
+  // The shm ring is created before the snapshot server starts answering, so a
+  // shm subscriber never pairs this publisher's snapshot with a previous run's
+  // ring (it checks that the ring behind the name is still the one it reads).
+  ShmRegion shm_region;
+  std::unique_ptr<ShmOut> shm_out;
+  if (!shm_name.empty()) {
+    if (!shm_region.create(shm_name, shm_slots, pcfg.session, pcfg.first_seq, &err)) {
+      std::fprintf(stderr, "adsb-publish: shm %s: %s\n", shm_name.c_str(), err.c_str());
+      return 1;
+    }
+    shm_out = std::make_unique<ShmOut>(shm_region.view());
+  }
   UdpSender udp;
   if (!udp.open(feed, send_opt, &err)) {
     std::fprintf(stderr, "adsb-publish: feed %s: %s\n", to_string(feed).c_str(), err.c_str());
@@ -216,8 +235,11 @@ int main(int argc, char** argv) {
   if (pub_cpu >= 0) pin_current_thread(pub_cpu);
 
   LossyOut<UdpSender> out(udp, feed_loss);
-  Publisher<LossyOut<UdpSender>> pub(pcfg, out, log.get());
-  PublishSink<Publisher<LossyOut<UdpSender>>> sink{&pub};
+  // The ring first: a ring write costs tens of ns, a UDP sendto() microseconds.
+  using Out = DualOut<ShmOut, LossyOut<UdpSender>>;
+  Out dual(shm_out.get(), &out);
+  Publisher<Out> pub(pcfg, dual, log.get());
+  PublishSink<Publisher<Out>> sink{&pub};
   ConflatedFeed conflated;
   if (!conflate_to.empty()) {
     if (!parse_endpoint(conflate_to, ccfg.group)) usage(1);

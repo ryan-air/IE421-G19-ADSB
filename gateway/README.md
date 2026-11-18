@@ -111,7 +111,7 @@ gateway/scripts/check-gateway.sh core/build/release # integration against the C+
 - **One process:** Node is single-threaded, so feed processing and fan-out share one core. At real-world rates (hundreds to a few thousand messages a second) this is far from the limit.
 - **Map features:** collision detection and Postgres-backed history are not provided. Trails last as long as the gateway's memory, 200 points per aircraft.
 - **Map tiles:** the Fall 2025 map's CARTO tile URL now answers "API key required". This is unrelated to the gateway, and `ads/` is not modified here.
-- **Feed choice:** the plan (§9.6) has the gateway subscribe to a conflated feed. That feed is not built yet, so the gateway subscribes to the full feed and conflates per client.
+- **Feed choice:** the gateway works on either feed. The plan (§9.6) has it subscribe to the conflated feed: publish one with `--conflate 239.19.0.3:41910` and start the gateway with `--feed 239.19.0.3:41910 --retransmit 127.0.0.1:41911 --snapshot 127.0.0.1:41912`. It conflates per client in either case. On ADS-B traffic, the 10 Hz conflated feed carries 96% of the full feed's updates, so it caps per-aircraft rates more than it saves bandwidth.
 
 An independent review found two flow-control bugs, both fixed with regression tests in `test/fanout.test.mjs`:
 - a client skipped once was not retried, so it could stall on a quiet feed;

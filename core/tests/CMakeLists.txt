@@ -20,6 +20,7 @@ set(ADSB_TEST_SOURCES
   test_feed.cpp
   test_feed_subscriber.cpp
   test_feed_net.cpp
+  test_conflate.cpp
 )
 
 add_executable(adsb_tests ${ADSB_TEST_SOURCES})

@@ -293,3 +293,22 @@ jobs:
       # constant memory, and the feed's subscriber still matches the publisher.
       - name: Run
         run: scripts/check-overload.sh build/ovl
+
+  conflate:
+    name: conflated feed (both tools -> conflated + main feeds -> subscribers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14
+      - name: Build
+        run: |
+          CXX=g++-14 cmake -S . -B build/conf -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/conf
+      # Subscribers that keep up, lose bursts, or join late, from adsb-publish
+      # and adsb-live: every conflated book must equal the main feed's state.
+      - name: Run
+        run: FEED_IFACE=127.0.0.1 scripts/check-conflate.sh build/conf

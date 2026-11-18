@@ -136,6 +136,14 @@ A subscriber buffers what arrives ahead of `expected` (16,384 messages by defaul
 | Retransmit reply (data) | Same as a multicast data packet |
 | NAK whose `seq > expected` | The gap is older than the server's ring: take a snapshot. A NAK with `seq <= expected` is stale and ignored |
 
+**The conflated feed** (README_UPDATES.md §10.2) carries only the latest state per aircraft, at a fixed rate (default 10 Hz), for slow consumers such as the gateway and camera fusion. It is an ordinary feed in every other respect:
+- **Framing and recovery:** the same messages and framing, on its own multicast group, with its own session id and sequence numbers, and its own retransmit and snapshot servers. Subscribers, including the gateway, use it unchanged.
+- **Ticks:** on each tick, every aircraft that changed since the last tick gets one `TrackUpdate` with its latest state. Its `update_mask` is the union of everything that changed since the aircraft was last sent, and `publish_ts_ns` is the conflated publisher's own time. A deleted aircraft gets a `TrackDelete`, unless it was created and deleted within one tick, in which case it is never sent.
+- **Guarantee:** right after every tick, the conflated book holds exactly the main feed's aircraft with the same state. Only `update_mask` and `publish_ts_ns` differ, which `FeedBook::state_digest()` ignores.
+- **Rate cap:** an aircraft is sent at most once per tick. On ADS-B traffic, where aircraft average about 2 updates/s, the conflated feed sends 96% of the main feed's updates at 10 Hz and about 49% at 1 Hz. At 10 Hz its value is the per-aircraft cap, not bandwidth.
+
+Publish it with `--conflate GROUP:PORT` (and `--conflate-hz N`) on `adsb-live` or `adsb-publish`.
+
 Browsers do not join the multicast group. The WebSocket gateway (`gateway/`) is a subscriber like any other, with a JavaScript port of `SubscriberCore`. It forwards the same `TrackUpdate` and `TrackDelete` bytes to browsers in conflated frames, with per-client flow control. That format is specified in [`gateway/README.md`](../gateway/README.md#protocol-gateway--browser).
 
 ---
@@ -144,5 +152,5 @@ Browsers do not join the multicast group. The WebSocket gateway (`gateway/`) is 
 
 1. **`nic` / position quality:** populate from TC 31 (operational status) once it is decoded, or replace with NUCp derived from the position type code?
 2. **Heading and airspeed:** these are decoded (velocity subtypes 3/4) but not carried. Add them in v1, at the cost of a second cache line, or as a separate `'V'` message?
-3. **Conflated feed** (README_UPDATES.md §10.2): same messages on a separate multicast group, or a dedicated compact message?
-4. **Multicast group and ports:** defaults are `239.19.0.1:41900` for the incremental feed, UDP 41901 for retransmit requests, TCP 41902 for snapshots, and `239.19.0.2` for fusion. Confirm these against the lab network.
+3. ~~**Conflated feed:** same messages on a separate multicast group, or a dedicated compact message?~~ **Decided:** the same messages on a separate group (§4, "The conflated feed"), so every subscriber and the gateway work on it unchanged. A compact message can still be added later as a new type.
+4. **Multicast group and ports:** defaults are `239.19.0.1:41900` for the incremental feed, UDP 41901 for retransmit requests, TCP 41902 for snapshots, `239.19.0.3:41910` (retransmit 41911, snapshot 41912) for the conflated feed, and `239.19.0.2` for fusion. Confirm these against the lab network.

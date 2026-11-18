@@ -58,6 +58,20 @@ std::array<std::uint8_t, 32> FeedBook::digest() const {
 
 std::string FeedBook::hex_digest() const { return Sha256::hex(digest()); }
 
+std::array<std::uint8_t, 32> FeedBook::state_digest() const {
+  Sha256 sha;
+  std::uint8_t buf[TrackUpdate::kWireSize];
+  for (TrackUpdate u : sorted()) {
+    u.update_mask = 0;
+    u.publish_ts_ns = 0;
+    protocol::write(u, buf);
+    sha.update(buf, sizeof buf);
+  }
+  return sha.finish();
+}
+
+std::string FeedBook::hex_state_digest() const { return Sha256::hex(state_digest()); }
+
 bool FeedBook::operator==(const FeedBook& other) const {
   if (tracks_.size() != other.tracks_.size()) return false;
   std::uint8_t a[TrackUpdate::kWireSize];

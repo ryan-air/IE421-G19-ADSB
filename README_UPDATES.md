@@ -15,12 +15,14 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 >
 > - live Beast ingest from readsb (`adsb-live`, §5.3);
 > - the feed over kernel UDP (§9.1–9.2, 9.5): publisher, retransmit and snapshot servers, subscriber library and `adsb-feed-cli`, with loss injection; reconstructed books are byte-identical to the publisher's;
-> - the WebSocket gateway (`gateway/`, Node): subscribes to the feed with the same recovery protocol, pushes conflated frames to browsers with per-client flow control, and serves the Fall 2025 map from memory instead of Postgres (`ads/` itself unmodified; it subscribes to the full feed, since the conflated feed of §10.2 is not built yet);
+> - the WebSocket gateway (`gateway/`, Node): subscribes to the feed with the same recovery protocol, pushes conflated frames to browsers with per-client flow control, and serves the Fall 2025 map from memory instead of Postgres (`ads/` itself unmodified; it can subscribe to the full feed or the conflated feed);
 > - the first end-to-end before/after comparison ([findings](bench/results/legacy-baseline/README.md)): frame → map in the browser about 1.1–1.6 s for the Fall 2025 system (83% of positions discarded) against about 70–90 ms for the new pipeline (median, 50–3,000 aircraft, laptop; tail percentiles still to be measured on a quiet host).
 >
 > - overload semantics for the live pipeline (§10.1, §10.3): loss only at the input boundary and counted, publisher batching while busy (1 M frames/s with publishing, up from about 300 k), tested at 0.5×, 2× and 10× saturation and through a burst (`core/scripts/check-overload.sh`, in CI).
 >
-> Not started: the faster transports and hardware timestamps (§9.3–9.4), the conflated feed (§10.2), the arbiter (B), the demodulator (A), and fusion (I).
+> - the conflated feed (§10.2): latest state per aircraft at a fixed rate on its own group, with its own recovery; after every tick its book equals the main feed's by state.
+>
+> Not started: the faster transports and hardware timestamps (§9.3–9.4), the arbiter (B), the demodulator (A), and fusion (I).
 
 > **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed, and own the whole path from **antenna to published decision**. We demodulate the radio samples ourselves, merge redundant A/B receiver lines, decode and maintain state on a lock-free pinned-core pipeline, and publish over kernel UDP, io_uring, AF_XDP, or shared memory. Every segment is measured in cycles and nanoseconds against hardware timestamps. We then show that the same infrastructure handles a real exchange feed (**Nasdaq ITCH 5.0**) at tens of millions of messages per second.
 

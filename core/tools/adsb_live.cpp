@@ -36,6 +36,7 @@
 #include "adsb/common/thread.hpp"
 #include "adsb/feed/net.hpp"
 #include "adsb/feed/publisher.hpp"
+#include "adsb/feed/conflated_feed.hpp"
 #include "adsb/feed/recovery.hpp"
 #include "adsb/ingest/beast_tcp.hpp"
 #include "adsb/record/recording.hpp"
@@ -75,7 +76,11 @@ void on_signal(int) { g_stop.store(true); }
                "                        load adds no delay; 0 = one datagram per update)\n"
                "  --retransmit-port P   UDP retransmit server (default 41901)\n"
                "  --snapshot-port P     TCP snapshot server (default 41902)\n"
-               "  --session ID          session id, up to 10 characters (default: from the clock)\n");
+               "  --session ID          session id, up to 10 characters (default: from the clock)\n"
+               "conflated feed (README_UPDATES.md §10.2; latest state per aircraft at a fixed rate):\n"
+               "  --conflate GROUP:PORT also publish the conflated feed on this group (e.g. 239.19.0.3:41910)\n"
+               "  --conflate-hz N       ticks per second (default 10)\n"
+               "  --conflate-retransmit-port P (default 41911)   --conflate-snapshot-port P (default 41912)\n");
   std::exit(code);
 }
 
@@ -98,16 +103,19 @@ using FeedPublisher = adsb::feed::Publisher<adsb::feed::UdpSender>;
 
 struct CountingSink {
   Shared* shared;
-  FeedPublisher* pub = nullptr;  // --publish
+  FeedPublisher* pub = nullptr;            // --publish
+  adsb::feed::ConflatedFeed* conf = nullptr;  // --conflate
   std::uint64_t updates = 0, deletes = 0, positions = 0;
   void on_update(const adsb::protocol::TrackUpdate& u) {
     ++updates;
     if (u.update_mask & adsb::protocol::update_mask::kPosition) ++positions;
     if (pub) pub->on_update(u);
+    if (conf) conf->on_update(u);
   }
   void on_delete(const adsb::protocol::TrackDelete& d) {
     ++deletes;
     if (pub) pub->on_delete(d);
+    if (conf) conf->on_delete(d);
   }
 };
 
@@ -132,6 +140,8 @@ int main(int argc, char** argv) {
   std::string publish_to, session_id;
   adsb::feed::UdpSender::Options send_opt;
   adsb::feed::PublisherConfig pub_cfg;
+  std::string conflate_to;
+  adsb::feed::ConflatedFeedConfig conf_cfg;
   pub_cfg.max_batch_delay_ns = 100'000;  // see --batch-us
   bool overload_block = false;           // --overload block
   std::size_t max_queue = 0;             // --max-queue (0 = the queue's capacity)
@@ -162,6 +172,10 @@ int main(int argc, char** argv) {
     else if (a == "--stats-every") stats_every_s = std::strtod(val().c_str(), nullptr);
     else if (a == "--busy-poll") src_cfg.busy_poll = true;
     else if (a == "--quiet") quiet = true;
+    else if (a == "--conflate") conflate_to = val();
+    else if (a == "--conflate-hz") conf_cfg.hz = std::strtod(val().c_str(), nullptr);
+    else if (a == "--conflate-retransmit-port") conf_cfg.retransmit_port = parse_port(val());
+    else if (a == "--conflate-snapshot-port") conf_cfg.snapshot_port = parse_port(val());
     else if (a == "--overload") {
       const std::string v = val();
       if (v == "drop") overload_block = false;
@@ -310,10 +324,29 @@ int main(int argc, char** argv) {
     ingest_done.store(true, std::memory_order_release);
   });
 
+  adsb::feed::ConflatedFeed conflated;
+  bool conf_failed = false;
+  if (!conflate_to.empty()) {
+    if (!adsb::feed::parse_endpoint(conflate_to, conf_cfg.group)) usage(1);
+    conf_cfg.send = send_opt;
+    conf_cfg.bind_host = rec_cfg.bind_host;
+    std::string err;
+    if (!conflated.open(conf_cfg, &err)) {
+      std::fprintf(stderr, "adsb-live: conflated feed %s: %s\n", conflate_to.c_str(), err.c_str());
+      conf_failed = true;
+      g_stop = true;
+    } else if (!quiet) {
+      std::fprintf(stderr, "adsb-live: conflated feed session %s on %s at %.3g Hz (retransmit :%u, snapshot :%u)\n",
+                   conflated.session_text().c_str(), conflate_to.c_str(), conf_cfg.hz,
+                   conflated.recovery().retransmit_port(), conflated.recovery().snapshot_port());
+    }
+  }
+  adsb::feed::ConflatedFeed* conf = conflate_to.empty() || g_stop.load() ? nullptr : &conflated;
+
   std::thread state([&] {
     adsb::set_current_thread_name("adsb-state");
     if (cpu_state >= 0) adsb::pin_current_thread(cpu_state);
-    CountingSink sink{&shared, pub.get()};
+    CountingSink sink{&shared, pub.get(), conf};
     auto publish = [&](std::uint64_t bad) {
       shared.tracks.store(engine->track_count(), std::memory_order_relaxed);
       shared.updates.store(sink.updates, std::memory_order_relaxed);
@@ -335,6 +368,7 @@ int main(int argc, char** argv) {
           m.line = r.line;
           engine->on_frame(r.payload, r.len, m, sink);
         }
+        if (conf) conf->poll(r.rx_ns);  // rx_ns is mono_ns() at recv: ticks keep time under load
         if (work_ns) {  // --simulate-work-ns: a slower stage, for overload tests
           const std::uint64_t until = adsb::mono_ns() + work_ns;
           while (adsb::mono_ns() < until) adsb::cpu_relax();
@@ -358,6 +392,7 @@ int main(int argc, char** argv) {
         // what is pending (no added delay at light load).
         if (pub && idle_spins == 1) pub->flush();
         if (pub && idle_spins % 64 == 0) pub->poll();
+        if (conf && idle_spins % 64 == 0) conf->poll(adsb::mono_ns());
         adsb::cpu_relax();
       }
     }
@@ -410,17 +445,22 @@ int main(int argc, char** argv) {
   ingest.join();
   state.join();
   if (recorder.joinable()) recorder.join();
-  if (pub) {
-    // End the session, then keep answering recovery requests briefly so
+  if (pub || conf) {
+    // End the session(s), then keep answering recovery requests briefly so
     // subscribers can fill the tail.
-    pub->end_session();
+    if (pub) pub->end_session();
+    if (conf) conf->end_session();
     const std::uint64_t until = adsb::mono_ns() + 1'000'000'000ULL;
     while (adsb::mono_ns() < until) {
-      pub->poll();
+      if (pub) pub->poll();
+      if (conf) conf->poll_ended();
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    rec_stop = true;
-    rec_thread.join();
+    if (pub) {
+      rec_stop = true;
+      rec_thread.join();
+    }
+    if (conf) conf->stop();
   }
   const bool rec_ok = record_path.empty() || writer.close();
 
@@ -449,7 +489,17 @@ int main(int argc, char** argv) {
                 "%llu retransmit requests, %llu snapshots\n",
                 session_id.c_str(), u(ps.messages), u(ps.packets), u(ps.heartbeats), u(ps.send_failures),
                 u(rc.requests.load()), u(rc.snapshots.load()));
+    std::printf("state digest %s\n", recovery->state().book().hex_state_digest().c_str());
     std::printf("book digest %s\n", recovery->state().book().hex_digest().c_str());
+  }
+  if (conf) {
+    const auto& cs = conf->conflator_stats();
+    std::printf("conflated   session %s: %llu updates in -> %llu out, %llu deletes out, %llu suppressed, "
+                "%llu passed through, %llu ticks, %llu datagrams; %llu retransmit requests, %llu snapshots\n",
+                conf->session_text().c_str(), u(cs.updates_in), u(cs.updates_out), u(cs.deletes_out),
+                u(cs.suppressed), u(cs.passthrough), u(cs.ticks), u(conf->publisher_stats().packets),
+                u(conf->recovery().counters().requests.load()), u(conf->recovery().counters().snapshots.load()));
+    std::printf("conflated state digest %s\n", conf->recovery().state().book().hex_state_digest().c_str());
   }
   std::printf("overload    policy %s, %llu frames dropped at the input boundary (%.4f%%), "
               "queue high water %llu of %zu\n",
@@ -461,5 +511,5 @@ int main(int argc, char** argv) {
   std::printf("latency (receive -> track state updated%s, per frame):\n", pub ? " and published" : "");
   print_hist("queue wait", *queue_wait);
   print_hist("receive -> state done", *recv_to_state);
-  return rec_ok ? 0 : 1;
+  return rec_ok && !conf_failed ? 0 : 1;
 }

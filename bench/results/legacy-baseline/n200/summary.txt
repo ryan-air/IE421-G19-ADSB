@@ -1,1 +1,2 @@
-200 aircraft: readsb p50 9 ms | DB p50 352 / p99 702 ms | API p50 356 ms | browser p50 1,359 ms | DB coverage 17% | map error p50 309 m | cpu {'readsb': 0.019, 'adsb_streamer_optimized.py': 0.034, 'server.js': 0.046}
+200 aircraft: readsb p50 9 ms | DB p50 363 / p99 722 ms | API p50 357 ms | browser p50 1,363 ms | DB coverage 17% | map error p50 312 m | cpu {'readsb': 0.025, 'adsb_streamer_optimized.py': 0.045, 'server.js': 0.062}
+  new pipeline: websocket p50 28 / p99 53 ms | API p50 78 ms | browser p50 86 ms | coverage 77% | map error p50 59 m | cpu {'readsb': 0.01, 'adsb-gateway': 0.035, 'adsb-live': 1.005}

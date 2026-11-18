@@ -1,9 +1,9 @@
-# Fall 2025 Baseline Benchmark
+# Before/After Benchmark: Fall 2025 vs. the New Pipeline
 
-Measures the Fall 2025 system, **unmodified**, as the "before" half of the project's before/after comparison (README_UPDATES.md §11.5). Results: [`bench/results/legacy-baseline/report.md`](../results/legacy-baseline/report.md).
+Measures the Fall 2025 system as delivered (the "before") and the new pipeline end to end (the "after"), on the same synthetic traffic, frame by frame against ground truth (README_UPDATES.md §11.5). Results: [`bench/results/legacy-baseline/report.md`](../results/legacy-baseline/report.md).
 
 ```bash
-bench/legacy/run.sh                                   # full sweep: 50, 200, 1000, 3000 aircraft, 120 s each (~20 min)
+bench/legacy/run.sh                                   # full sweep: 50, 200, 1000, 3000 aircraft, 120 s each, both systems (~25 min)
 SCENARIOS="6000" bench/legacy/run.sh                   # heavier load: needs ~2 GB free disk; check feeder lateness
 SCENARIOS="50 200" DURATION=60 bench/legacy/run.sh    # quick run
 ```
@@ -28,6 +28,16 @@ adsb-synth ──.adsbrec──▶ feeder.py ──Beast──▶ readsb ──S
 | Postgres 16 | Supabase | Local, SSL on: the Fall 2025 server always connects with SSL |
 | Streamer, web server | — | Run exactly as delivered: `ads-b-receiver/` and `ads/` from the git tag `fall2025-final` |
 
+**The after pass.** For each fleet size, the same recording is then fed again, in real time, to a fresh readsb, and the new pipeline runs alone:
+
+```
+feeder.py ──Beast──▶ readsb ──Beast :30005──▶ adsb-live ──multicast feed──▶ adsb-gateway ──WebSocket──▶ probe.py ws
+                                              (decode, track state,          (gap recovery,       (what the map receives)
+                                               publisher, retransmit)         conflated fan-out)  + /api/aircraft from memory
+```
+
+readsb is the same build and configuration in both passes; it stays in the "after" path as the receiver stand-in until the project's own demodulator (Workstream A) replaces it. The gateway runs on the image's Node.js, the same one that runs the Fall 2025 web server.
+
 **The Fall 2025 code comes from the git tag `fall2025-final`, not from the working tree.** The tag points at the last commit of the Fall 2025 GitLab repository (`7b52633`, 2025-12-21). `run.sh` extracts `ads/` and `ads-b-receiver/` from it with `git archive` into `bench/legacy/fall2025/` (gitignored, recreated every run), and the image, the database schema and the processes all use that copy. The working-tree `ads/` and `ads-b-receiver/` may be changed by later work, and the "before" numbers stay those of the delivered system. `environment.json` records the tag and commit measured. Override with `FALL2025_REF=<ref>` only to measure something else on purpose.
 
 The Fall 2025 code is not modified. Two database fixes are applied at startup, both as separate init scripts:
@@ -43,22 +53,25 @@ All timestamps are taken inside one container, so every probe shares one clock.
 | `probe.py sbs` | Every SBS-1 line readsb emits, with its arrival time |
 | `probe.py db` | Polls `aircraft_real` every 100 ms and logs each change of an aircraft's position |
 | `probe.py api` | Polls `GET /api/aircraft` (what the map uses) every 100 ms: changes, plus a full snapshot every second |
-| `probe.py cpu` | CPU time of readsb, the streamer, and the web server, from `/proc` |
+| `probe.py cpu` | CPU time of readsb, the streamer, and the web server (after pass: readsb, `adsb-live`, the gateway), from `/proc` |
+| `probe.py ws` | After pass: connects to the gateway's WebSocket as a browser does; logs every position change with the arrival time of its frame, and a full snapshot of the table every second |
 
 `analyze.py` matches every position shown at each stage to the **transmitted frame it came from**. Per aircraft, the source is the ground-truth position nearest the shown one: frames are at least 0.4 s apart (about 100 m at airliner speed) and CPR error is about 5 m, so the match is unambiguous. Anything farther than 50 m is counted as unmatched, not guessed. From that it computes:
-- **Latency** from frame received to visible, at each stage: readsb output, database, API, and the browser (API plus the map's uniformly distributed 0–2 s poll wait).
-- **Coverage:** the share of transmitted positions that ever reach the database.
+- **Latency** from frame received to visible, at each stage. Before: readsb output, database, API, and the browser (API plus the map's uniformly distributed 0–2 s poll wait). After: WebSocket arrival, the same API probe against the gateway, and the browser (WebSocket arrival plus the new map's render wait: uniform 0–100 ms plus one animation frame). Inside the new pipeline, `adsb-live` reports receive → track state and the gateway reports publish → book and publish → WebSocket write.
+- **Coverage:** the share of transmitted positions that ever reach the database (before) or the WebSocket (after). The generator models reception loss, so neither reaches 100%.
 - **The map view:** how old the shown position is, and how far it is from where the aircraft actually is at that moment. The browser variant holds each snapshot until the next 2 s poll.
 - **Keeping up:** median database latency early against late in the run (growth means a backlog), CPU per process, and how late the feeder delivered frames.
 - **Decoder comparison:** readsb's positions, altitudes, callsigns, and squawks against the new C++ decoder's, both checked against ground truth.
 
-The same recording is then replayed through the new pipeline (`adsb-replay --pipeline --speed 1 --busy-wait`) at the same rate, for context.
+Finally the recording is replayed through the new pipeline's core alone (`adsb-replay --pipeline --speed 1 --busy-wait`: no network, no readsb), for context.
 
 ## Caveats
 
 - **Lower bound on production latency:** Postgres is local. In production every batch crossed the internet to Supabase.
-- **Browser column:** estimated by adding the poll wait. Rendering and the map's 2 s animation are not included.
-- **Probe resolution:** about 100 ms, which adds about 50 ms on average to database and API latencies.
+- **Browser columns:** estimates, as described above. Rendering itself is not included for either system, nor the Fall 2025 map's 2 s marker animation (the new map moves markers immediately).
+- **readsb buffering is in both paths:** with default settings it batches its output, which accounts for most of the new pipeline's WebSocket latency. Removing it is Workstream A's job, not this benchmark's.
+- **Probe resolution:** about 100 ms, which adds about 50 ms on average to database and API latencies (in both passes). The WebSocket probe has no polling delay.
 - **Machine dependence:** throughput limits and CPU use depend on the machine. Rerun on the benchmark host for the final report. The latency structure (batch flush, rate limit, polling) is machine-independent.
-- **New-pipeline row:** measures frame in to track state updated only. Its publisher, gateway, and map do not exist yet, so it is not an end-to-end comparison.
+- **One system at a time:** the two passes run sequentially on the same input, so neither competes with the other for CPU. Background load on the host still affects both.
+- **CPU:** `adsb-live`'s track-state thread spins instead of sleeping, so it uses one core even at light load (a latency-for-CPU trade, as in feed handlers).
 - **Load-generator limit:** at very high load the Python feeder itself may fall behind, so check "feeder lateness" in the report. Where it is large, that run measures the feeder, not the pipeline.

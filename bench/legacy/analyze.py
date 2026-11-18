@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Analysis for the Fall 2025 baseline harness.
+"""Analysis for the before/after benchmark harness.
 
   analyze.py scenario DIR   metrics for one run -> DIR/metrics.json (+ summary on stdout)
   analyze.py report OUT     markdown report over all OUT/n*/metrics.json
 
-Every position the old system shows (readsb SBS output, database row, API
-response) is matched to the transmitted frame it came from, using the
-generator's ground truth: per aircraft, the truth point nearest the shown
+Every position either system shows (readsb SBS output, database row, API
+response, WebSocket update) is matched to the transmitted frame it came from,
+using the generator's ground truth: per aircraft, the truth point nearest the shown
 position. Frames are >= 0.4 s apart (~100 m at airliner speed) and CPR error is
 ~5 m, so the match is unambiguous; anything farther than MATCH_M is counted as
 unmatched rather than guessed.
@@ -29,6 +29,9 @@ MATCH_WINDOW_S = 60.0   # source frame must have been sent within this long befo
                         # from a previous lap and report a latency of minutes.
 WARMUP_S = 20.0         # ignore the first seconds of each run (tracks still forming)
 POLL_S = 2.0            # the Fall 2025 map polls /api/aircraft every 2 s (ads/app.js)
+STALL_MS = 1.0          # core-replay release lag p99 above this: the host paused the VM, tails unreliable
+RENDER_S = 0.100        # the new map renders at most every 100 ms after a frame (gateway/public/map-shim.js)
+FRAME_S = 1 / 60        # ...on the next animation frame
 RX_LATENCY_NS = 1_650_000  # generator: tx -> record rx (1.5 ms fixed + 0.15 ms mean jitter)
 EARTH_M_PER_DEG = 111_320.0
 
@@ -190,6 +193,104 @@ def latencies(truth, obs, t_min, per_second=None):
     return lat_ms, unmatched, matched_idx
 
 
+def map_view(truth, path, t_min, t_end, hold_s, rng):
+    """What the map shows, sampled about once a second: age of each shown
+    position, its distance from where the aircraft actually is, and that
+    distance when the browser shows it `hold_s()` seconds later."""
+    ages, errs, errs_browser = [], [], []
+    if not path.exists():
+        return None
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            t, hx = int(r["t_ns"]), r["hex"].upper()
+            if t < t_min or t > t_end:
+                continue
+            la, lo = float(r["lat"]), float(r["lon"])
+            i = truth.match(hx, t, la, lo)
+            now = truth.position_at(hx, t)
+            if i is None or now is None:
+                continue
+            ages.append((t - truth.by_hex[hx]["emit"][i]) / 1e6)
+            errs.append(float(dist_m(la, lo, now[0], now[1])))
+            later = truth.position_at(hx, t + int(hold_s() * 1e9))
+            if later is not None:
+                errs_browser.append(float(dist_m(la, lo, later[0], later[1])))
+    return {"position_age_ms": pct(ages), "position_error_m": pct(errs),
+            "browser_position_error_m": pct(errs_browser)}
+
+
+def cpu_cores(path):
+    """CPU use per process name, in cores, from /proc samples."""
+    cpu = defaultdict(list)
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            cpu[(r["name"], r["pid"])].append((int(r["t_ns"]), float(r["cpu_seconds"])))
+    usage = defaultdict(float)
+    for (name, _pid), samples in cpu.items():
+        if len(samples) >= 2:
+            (ta, ca), (tb, cb) = samples[0], samples[-1]
+            usage[name] += (cb - ca) / max(1e-9, (tb - ta) / 1e9)
+    return {k: round(v, 3) for k, v in usage.items()}
+
+
+def transmitted_airborne(truth, t_min, t_end):
+    n = 0
+    for tr in truth.by_hex.values():
+        n += int(((tr["emit"] >= t_min) & (tr["emit"] <= t_end) & (~tr["ground"])).sum())
+    return n
+
+
+def after(d, rng):
+    """The new pipeline, end to end (second pass over the same recording)."""
+    feed = json.loads((d / "new_feed.json").read_text())
+    truth = Truth(d / "truth.csv", feed)
+    t_min = feed["t0_wall_ns"] + int(WARMUP_S * 1e9)
+    t_end = feed["end_wall_ns"]
+    a = {"frames_fed": feed["sent"], "feeder_max_lateness_ms": feed["max_lateness_ms"]}
+    sent = transmitted_airborne(truth, t_min, t_end)
+    stages = {}
+    for name, file in (("websocket", "new_ws.csv"), ("api", "new_api.csv")):
+        lat, unmatched, idx = latencies(truth, load_obs(d / file), t_min)
+        shown = sum(len(v) for v in idx.values())
+        stages[name] = {"latency_ms": pct(lat), "unmatched": unmatched, "positions_shown": shown,
+                        "coverage": shown / sent if sent else None}
+        if name == "websocket":
+            ws_lat = np.array(lat)
+            q = max(1, len(lat) // 4)
+            if lat:
+                a["falling_behind"] = {"first_quarter_ms": float(np.median(lat[:q])),
+                                       "last_quarter_ms": float(np.median(lat[-q:]))}
+    # Browser: WebSocket arrival, then the shim renders within RENDER_S, on an animation frame.
+    wait = lambda n: (rng.uniform(0, RENDER_S, size=n) + rng.uniform(0, FRAME_S, size=n)) * 1000  # noqa: E731
+    browser = (ws_lat[:, None] + wait(ws_lat.size * 16).reshape(ws_lat.size, 16)).ravel() \
+        if ws_lat.size else np.array([])
+    stages["browser_estimate"] = {"latency_ms": pct(browser)}
+    a["stages"] = stages
+    a["positions_transmitted"] = sent
+    a["map_view"] = map_view(truth, d / "new_ws_snapshots.csv", t_min, t_end,
+                             lambda: rng.uniform(0, RENDER_S) + rng.uniform(0, FRAME_S), rng)
+    a["cpu_cores"] = cpu_cores(d / "new_cpu.csv")
+    # Inside the new pipeline: adsb-live (receive -> track state) and the
+    # gateway (publish -> book, publish -> WebSocket write, against the
+    # publisher's clock).
+    live = (d / "new_live.txt").read_text() if (d / "new_live.txt").exists() else ""
+    for line in live.splitlines():
+        if line.strip().startswith("receive -> state done"):
+            vals = line.split("done", 1)[1].split()
+            a["live_receive_to_state_ns"] = {k: int(v) for k, v in zip(vals[0::2], vals[1::2]) if v.isdigit()}
+    try:
+        gs = json.loads((d / "new_gateway_stats.json").read_text())
+        a["gateway"] = {"latency_us": gs["latency_us"], "clock": gs["clock"],
+                        "applied": gs["subscriber"]["applied"], "requests": gs["subscriber"]["requests"],
+                        "snapshots_loaded": gs["subscriber"]["snapshots_loaded"],
+                        "feed_dropped": gs["subscriber"]["feed_dropped"], "fanout": gs["fanout"]}
+    except (OSError, ValueError, KeyError):
+        a["gateway"] = None
+    return a
+
+
 def scenario(d):
     d = Path(d)
     feed = json.loads((d / "feed.json").read_text())
@@ -233,27 +334,10 @@ def scenario(d):
         shown = stages[name]["positions_shown"]
         stages[name]["coverage"] = shown / sent_airborne if sent_airborne else None
 
-    # What the map shows, sampled once a second: age of the shown position and
-    # its distance from where the aircraft actually is.
-    ages, errs, errs_browser = [], [], []
-    with open(d / "api_snapshots.csv") as f:
-        for r in csv.DictReader(f):
-            t, hx = int(r["t_ns"]), r["hex"].upper()
-            if t < t_min or t > t_end:
-                continue
-            la, lo = float(r["lat"]), float(r["lon"])
-            i = truth.match(hx, t, la, lo)
-            now = truth.position_at(hx, t)
-            if i is None or now is None:
-                continue
-            ages.append((t - truth.by_hex[hx]["emit"][i]) / 1e6)
-            errs.append(float(dist_m(la, lo, now[0], now[1])))
-            # In the browser the snapshot is held until the next poll.
-            later = truth.position_at(hx, t + int(rng.uniform(0, POLL_S) * 1e9))
-            if later is not None:
-                errs_browser.append(float(dist_m(la, lo, later[0], later[1])))
-    m["map_view"] = {"position_age_ms": pct(ages), "position_error_m": pct(errs),
-                     "browser_position_error_m": pct(errs_browser)}
+    # What the map shows, sampled once a second. In the browser the snapshot
+    # is held until the next poll.
+    m["map_view"] = map_view(truth, d / "api_snapshots.csv", t_min, t_end,
+                             lambda: rng.uniform(0, POLL_S), rng)
 
     # Is the old pipeline keeping up? Compare DB latency early vs late in the run.
     if db_lat:
@@ -261,17 +345,7 @@ def scenario(d):
         m["falling_behind"] = {"db_latency_first_quarter_ms": float(np.median(db_lat[:q])),
                                "db_latency_last_quarter_ms": float(np.median(db_lat[-q:]))}
 
-    # CPU use per process (cores), from /proc samples.
-    cpu = defaultdict(list)
-    with open(d / "cpu.csv") as f:
-        for r in csv.DictReader(f):
-            cpu[(r["name"], r["pid"])].append((int(r["t_ns"]), float(r["cpu_seconds"])))
-    usage = defaultdict(float)
-    for (name, _pid), samples in cpu.items():
-        if len(samples) >= 2:
-            (ta, ca), (tb, cb) = samples[0], samples[-1]
-            usage[name] += (cb - ca) / max(1e-9, (tb - ta) / 1e9)
-    m["cpu_cores"] = {k: round(v, 3) for k, v in usage.items()}
+    m["cpu_cores"] = cpu_cores(d / "cpu.csv")
 
     # New pipeline on the same recording.
     new = {}
@@ -316,6 +390,9 @@ def scenario(d):
         "aircraft_with_both_callsigns": both_cs,
     }
 
+    if (d / "new_feed.json").exists():
+        m["after"] = after(d, rng)
+
     (d / "metrics.json").write_text(json.dumps(m, indent=2))
     s = m["stages"]
     f = lambda x: "-" if x is None else f"{x:,.0f}"  # noqa: E731
@@ -324,6 +401,12 @@ def scenario(d):
           f"API p50 {f(s['api']['latency_ms']['p50'])} ms | browser p50 {f(s['browser_estimate']['latency_ms']['p50'])} ms | "
           f"DB coverage {100 * (s['database']['coverage'] or 0):.0f}% | "
           f"map error p50 {f(m['map_view']['position_error_m']['p50'])} m | cpu {m['cpu_cores']}")
+    if "after" in m:
+        a = m["after"]["stages"]
+        print(f"  new pipeline: websocket p50 {f(a['websocket']['latency_ms']['p50'])} / p99 {f(a['websocket']['latency_ms']['p99'])} ms | "
+              f"API p50 {f(a['api']['latency_ms']['p50'])} ms | browser p50 {f(a['browser_estimate']['latency_ms']['p50'])} ms | "
+              f"coverage {100 * (a['websocket']['coverage'] or 0):.0f}% | "
+              f"map error p50 {f((m['after']['map_view'] or {}).get('position_error_m', {}).get('p50'))} m | cpu {m['after']['cpu_cores']}")
 
 
 # ---------------------------------------------------------------------------
@@ -346,14 +429,76 @@ def report(out):
 
     L = []
     w = L.append
-    w("# Fall 2025 Baseline: Measured Results")
+    has_after = any("after" in r for r in runs)
+    w("# Before / After: Measured Results" if has_after else "# Fall 2025 Baseline: Measured Results")
     w("")
-    w("Generated by `bench/legacy/run.sh`. The unmodified Fall 2025 pipeline (Python streamer → Postgres → Node API → 2 s map poll) is fed synthetic traffic through readsb in real time. Every position it shows is matched to the transmitted frame it came from using the generator's ground truth. Method and caveats: [bench/legacy/README.md](../../legacy/README.md).")
+    w("Generated by `bench/legacy/run.sh`. The same synthetic traffic is played through readsb in real time, once through the Fall 2025 pipeline as delivered (git tag `fall2025-final`: Python streamer → Postgres → Node API → 2 s map poll)"
+      + (" and once through the new pipeline (`adsb-live` → multicast feed → `adsb-gateway` → WebSocket push)" if has_after else "")
+      + ". Every position shown is matched to the transmitted frame it came from using the generator's ground truth. Method and caveats: [bench/legacy/README.md](../../legacy/README.md).")
     w("")
     w(f"Environment: {env['kernel']}, {env['cpus']} CPUs (Docker), {env['python']}, Node {env['node']}, {env['readsb_version']}. "
       f"{env['duration_s']} s of traffic per run, seed {env['seed']}, repo `{env['repo_commit']}`. "
       "The first 20 s of each run are excluded as warm-up.")
     w("")
+    stalls = []
+    for r in runs:
+        lag = r["new_pipeline_latency_ns"].get("release_lag", {}).get("p99")
+        if lag is not None and lag / 1e6 > STALL_MS:
+            stalls.append(f"{r['aircraft']:,} aircraft ({lag / 1e6:,.1f} ms)")
+    if stalls:
+        w(f"> **Host stalls detected; tail percentiles (p99 and above) are unreliable for:** {', '.join(stalls)}. "
+          "The check: the new pipeline's core, replayed from a file with nothing to wait on, released frames late by that much at p99 "
+          f"(threshold {STALL_MS:g} ms; a quiet host gives a few µs). That means the host paused the container, which inflates the tails of both systems. "
+          "Medians are robust to this. Rerun on a quiet machine or the benchmark host for tail numbers.")
+        w("")
+    if has_after:
+        w("## Before vs. after: frame received → on the map")
+        w("")
+        w("Both systems get the same frames at the same times from the same readsb, run one at a time. "
+          "\"Map in browser\" adds the map's own wait: a uniform 0–2 s poll for the Fall 2025 map, a render within 100 ms (plus an animation frame) for the new one.")
+        w("")
+        w("| Aircraft | Fall 2025: map in browser (p50 / p99, est.) | **New: map in browser** (p50 / p99, est.) | New: WebSocket arrival (p50 / p99) | API `/api/aircraft` before → after (p50) | Positions shown before → after | Shown vs. true position before → after (p50, in browser) |")
+        w("|---|---|---|---|---|---|---|")
+        for r in runs:
+            if "after" not in r:
+                continue
+            b, a = r["stages"], r["after"]["stages"]
+            g = lambda st, k: st[k]["latency_ms"]  # noqa: E731
+            cov = lambda c: fmt(None if c is None else 100 * c, "%")  # noqa: E731
+            mvb = r["map_view"]["browser_position_error_m"]["p50"]
+            mva = (r["after"]["map_view"] or {}).get("browser_position_error_m", {}).get("p50")
+            w(f"| {r['aircraft']:,} | {fmt(g(b, 'browser_estimate')['p50'])} / {fmt(g(b, 'browser_estimate')['p99'])} ms "
+              f"| **{fmt(g(a, 'browser_estimate')['p50'])} / {fmt(g(a, 'browser_estimate')['p99'])} ms** "
+              f"| {fmt(g(a, 'websocket')['p50'], digits=1)} / {fmt(g(a, 'websocket')['p99'], digits=1)} ms "
+              f"| {fmt(g(b, 'api')['p50'])} → {fmt(g(a, 'api')['p50'])} ms "
+              f"| {cov(b['database']['coverage'])} → {cov(a['websocket']['coverage'])} "
+              f"| {fmt(mvb)} → {fmt(mva)} m |")
+        w("")
+        w("\"Positions shown\": the share of transmitted airborne positions that ever reach the map (Fall 2025: via the database). "
+          "The synthetic traffic models range-dependent reception loss, so no system reaches 100%: readsb itself decodes the share shown under \"readsb SBS\" coverage in metrics.json "
+          "(about 72% at 50 aircraft), and the new decoder resolves a few percent more positions than readsb from the same frames.")
+        w("")
+        w("### Inside the new pipeline")
+        w("")
+        w("| Aircraft | readsb → adsb-live: receive → track state (p50 / p99) | publish → gateway book (p50 / p99) | publish → WebSocket write (p50 / p99) | Feed recovery (requests / snapshots) | CPU: readsb | CPU: adsb-live | CPU: gateway |")
+        w("|---|---|---|---|---|---|---|---|")
+        for r in runs:
+            if "after" not in r:
+                continue
+            a = r["after"]
+            lv = a.get("live_receive_to_state_ns", {})
+            gw = a.get("gateway") or {}
+            lu = gw.get("latency_us", {})
+            us = lambda h, k: None if not h or h.get(k) is None else h[k]  # noqa: E731
+            c = a["cpu_cores"]
+            w(f"| {r['aircraft']:,} | {fmt(lv.get('p50', 0) / 1000 if lv else None, ' µs', 1)} / {fmt(lv.get('p99', 0) / 1000 if lv else None, ' µs', 1)} "
+              f"| {fmt(us(lu.get('feed_to_gateway'), 'p50_us'), ' µs')} / {fmt(us(lu.get('feed_to_gateway'), 'p99_us'), ' µs')} "
+              f"| {fmt(us(lu.get('feed_to_ws'), 'p50_us'), ' µs')} / {fmt(us(lu.get('feed_to_ws'), 'p99_us'), ' µs')} "
+              f"| {gw.get('requests', '–')} / {gw.get('snapshots_loaded', '–')} "
+              f"| {fmt(100 * c.get('readsb', 0), '%')} | {fmt(100 * c.get('adsb-live', 0), '%')} | {fmt(100 * c.get('adsb-gateway', 0), '%')} |")
+        w("")
+        w("Receive → track state is measured inside `adsb-live` from the moment `recv()` returns a Beast frame. Publish → book and publish → WebSocket write are measured by the gateway against the publisher's clock (calibrated with `adsb-clock`). The gap between these and the WebSocket arrival above is mostly readsb's own output buffering, which both systems share (see notes).")
+        w("")
     w("## Latency: frame received → visible")
     w("")
     w("| Aircraft | readsb SBS out (p50 / p99) | Database (p50 / p99) | API (p50 / p99) | **Map in browser** (p50 / p99, est.) |")
@@ -393,9 +538,9 @@ def report(out):
     w("")
     w("CPU is the share of one core.")
     w("")
-    w("## New pipeline on the same recordings (for context)")
+    w("## New pipeline core alone (replay, for context)")
     w("")
-    w("`adsb-replay --pipeline --speed 1`: the same frames at the same rate, from frame in to track state updated. The new pipeline has no publisher or map yet, so this is not yet an end-to-end comparison.")
+    w("`adsb-replay --pipeline --speed 1`: the same frames at the same rate, from frame in to track state updated, with no network and no readsb.")
     w("")
     w("| Aircraft | p50 | p99 | p99.9 | max | replay pacing lag p99 |")
     w("|---|---|---|---|---|---|")
@@ -424,8 +569,10 @@ def report(out):
     w("## Notes")
     w("")
     w("- **Lower bound on the real system:** Postgres runs locally, not on Supabase across the internet, so production latencies were higher.")
-    w("- **Browser column:** estimated by adding the map's uniformly distributed 0–2 s poll wait to the measured API latency. Browser rendering time is not included.")
-    w("- **Probe resolution:** the database and API probes poll every 100 ms, which adds about 50 ms on average.")
+    w("- **Browser columns:** estimates. Fall 2025: the measured API latency plus the map's uniformly distributed 0–2 s poll wait. New: the measured WebSocket arrival plus a uniform 0–100 ms render wait and one animation frame. Rendering itself is not included for either.")
+    w("- **Both systems include readsb** (standing in for dump1090 / the receiver), and its default output buffering adds tens of milliseconds to everything downstream of it. The new pipeline's own demodulator (Workstream A) will remove that stage.")
+    w("- **CPU of the new pipeline:** `adsb-live`'s track-state thread spins on its input queue instead of sleeping (lowest latency, as in a feed handler), so it uses one full core even when traffic is light. The Fall 2025 processes sleep between batches.")
+    w("- **Probe resolution:** the database and API probes poll every 100 ms, which adds about 50 ms on average. The WebSocket probe timestamps each frame on arrival.")
     w("- **Laptop numbers:** CPU and the throughput limit depend on the machine. Rerun on the benchmark host for the final report.")
     if buffering:
         w(f"- **readsb output buffering:** defaults, as on a stock receiver: `{' '.join(buffering.split())}`")

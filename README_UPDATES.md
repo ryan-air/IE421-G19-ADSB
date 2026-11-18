@@ -16,7 +16,7 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 > - live Beast ingest from readsb (`adsb-live`, §5.3);
 > - the feed over kernel UDP (§9.1–9.2, 9.5): publisher, retransmit and snapshot servers, subscriber library and `adsb-feed-cli`, with loss injection; reconstructed books are byte-identical to the publisher's;
 > - the WebSocket gateway (`gateway/`, Node): subscribes to the feed with the same recovery protocol, pushes conflated frames to browsers with per-client flow control, and serves the Fall 2025 map from memory instead of Postgres (`ads/` itself unmodified; it subscribes to the full feed, since the conflated feed of §10.2 is not built yet);
-> - the Fall 2025 baseline measured: about 1.1–1.6 s to the map, with 83% of positions discarded ([findings](bench/results/legacy-baseline/README.md)).
+> - the first end-to-end before/after comparison ([findings](bench/results/legacy-baseline/README.md)): frame → map in the browser about 1.1–1.6 s for the Fall 2025 system (83% of positions discarded) against about 70–90 ms for the new pipeline (median, 50–3,000 aircraft, laptop; tail percentiles still to be measured on a quiet host).
 >
 > Not started: the faster transports and hardware timestamps (§9.3–9.4), the conflated feed (§10.2), the arbiter (B), the demodulator (A), and fusion (I).
 

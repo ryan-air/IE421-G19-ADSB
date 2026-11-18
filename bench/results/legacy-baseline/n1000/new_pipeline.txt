@@ -1,13 +1,13 @@
 recording   /out/n1000/traffic.adsbrec (synthetic, 482681 records)
 build       optimized, pipeline (2 threads)
-replayed    482681 records, 120.0 s of traffic in 120.000 s (4022 records/s)
+replayed    482681 records, 120.0 s of traffic in 120.134 s (4018 records/s)
 frames      bad 1253, duplicates 0, out-of-order 0, A/P accepted 51224 / rejected 270
 positions   global 169479, local 203, unresolved 1217, rejected 0, re-anchored 0
 tracks      created 1000, expired 1000, live 0, table full 0
 output      221626 updates, 1000 deletes
 output hash bf49311db5b2d78cb66ae9ec017b2b30b2a667177d88c04992587cf6d6db837d
 latency (per record):
-  release lag    p50       25  p99     3067  p99.9    11199  p99.99  6955007  max   12697567 ns
-  queue          p50       83  p99     1167  p99.9    12671  p99.99  5849087  max   27958916 ns
-  decode+state   p50      333  p99     1667  p99.9    15423  p99.99    22015  max     114666 ns
-  total          p50      541  p99     8671  p99.9    27487  p99.99 16678911  max   27977041 ns
+  release lag    p50       65  p99  8536063  p99.9 160694271  p99.99 218103807  max  227334023 ns
+  queue          p50      125  p99  1284095  p99.9 161742847  p99.99 206569471  max 12297829383904690134 ns
+  decode+state   p50      875  p99     3835  p99.9    21151  p99.99   253951  max  180941708 ns
+  total          p50     1125  p99 14598143  p99.9 328728575  p99.99 429391871  max  438864666 ns

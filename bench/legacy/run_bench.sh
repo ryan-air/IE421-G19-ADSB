@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Runs inside the `bench` container (see docker-compose.yml). For each fleet
-# size it generates synthetic traffic, plays it through the unmodified Fall 2025
-# pipeline in real time, probes what the database and the map's API show, then
-# replays the same recording through the new C++ pipeline for comparison.
+# size it generates synthetic traffic, then plays the same recording in real
+# time through each system, one at a time, and probes what the map would show:
 #
-#   synthetic Beast --> readsb --SBS-1:30003--> Fall 2025 streamer --> Postgres
-#                                                                   --> Node server --> /api/aircraft
+#   BEFORE  synthetic Beast --> readsb --SBS-1:30003--> Fall 2025 streamer --> Postgres
+#                                                   --> Fall 2025 Node server --> /api/aircraft (polled)
+#   AFTER   synthetic Beast --> readsb --Beast:30005--> adsb-live --multicast feed--> adsb-gateway
+#                                                   --> WebSocket push (and /api/aircraft from memory)
+#
+# Finally the core of the new pipeline is replayed alone (no network) for context.
 #
 # Environment:
 #   SCENARIOS  fleet sizes to run         (default "50 200 1000 3000")
@@ -20,7 +23,7 @@ SCENARIOS="${SCENARIOS:-50 200 1000 3000}"
 DURATION="${DURATION:-120}"
 SEED="${SEED:-2025}"
 KEEP_RAW="${KEEP_RAW:-0}"
-DRAIN=8                 # seconds to let the old pipeline catch up after the last frame
+DRAIN=8                 # seconds to let each pipeline catch up after the last frame
 RX_LAT=40.0392          # Willard Airport (the generator's default receiver)
 RX_LON=-88.2781
 OUT=/out
@@ -39,6 +42,9 @@ cmake -S /repo/core -B "$WORK/core-build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build "$WORK/core-build" >/dev/null || exit 1
 SYNTH="$WORK/core-build/tools/adsb-synth"
 REPLAY="$WORK/core-build/tools/adsb-replay"
+LIVE="$WORK/core-build/tools/adsb-live"
+CLOCK="$WORK/core-build/tools/adsb-clock"
+GATEWAY=/repo/gateway/bin/adsb-gateway.mjs
 
 # The Fall 2025 code as delivered: extracted by run.sh from the git tag
 # fall2025-final into bench/legacy/fall2025/, never the working tree's ads/.
@@ -134,17 +140,57 @@ for N in $SCENARIOS; do
   sleep "$DRAIN"
   stop_all
 
-  # 7. The new pipeline on the same recording, at the same real-time rate.
+  # 7. AFTER: the new pipeline end to end, on the same recording, fed again
+  #    in real time to a fresh readsb, alone on the machine:
+  #    readsb --Beast:30005--> adsb-live (decode + track state + publisher)
+  #    --multicast feed--> adsb-gateway --WebSocket--> map (probe.py ws)
+  log "new pipeline: readsb -> adsb-live -> multicast feed -> gateway -> websocket"
+  readsb --net-only --net-bi-port 30004 --net-bo-port 30005 --lat "$RX_LAT" --lon "$RX_LON" \
+         --quiet > "$D/new_readsb.log" 2>&1 &
+  PIDS+=($!)
+  wait_for_port 127.0.0.1 30005 20 || { log "readsb did not start"; exit 1; }
+  node "$GATEWAY" --feed 239.19.0.1:41900 --interface 127.0.0.1 --retransmit 127.0.0.1:41901 \
+       --snapshot 127.0.0.1:41902 --listen 127.0.0.1:8080 --clock-helper "$CLOCK" --quiet \
+       > "$D/new_gateway.txt" 2>&1 &
+  GW_PID=$!
+  PIDS+=($GW_PID)
+  wait_for_port 127.0.0.1 8080 20 || { log "gateway did not start"; cat "$D/new_gateway.txt"; exit 1; }
+  "$LIVE" --port 30005 --receiver "$RX_LAT,$RX_LON" --stats-every 0 --quiet \
+          --publish 239.19.0.1:41900 --publish-interface 127.0.0.1 > "$D/new_live.txt" 2>&1 &
+  LIVE_PID=$!
+  PIDS+=($LIVE_PID)
+  python3 /repo/bench/legacy/probe.py ws --ws-port 8080 --out "$D/new_ws.csv" \
+          --snapshot-out "$D/new_ws_snapshots.csv" --snapshot-every 1.0 &
+  PIDS+=($!)
+  # The Fall 2025 map's own API, now answered by the gateway: same probe as above.
+  python3 /repo/bench/legacy/probe.py api --api-port 8080 --out "$D/new_api.csv" \
+          --snapshot-out "$D/new_api_snapshots.csv" --interval 0.1 --snapshot-every 1.0 &
+  PIDS+=($!)
+  python3 /repo/bench/legacy/probe.py cpu --out "$D/new_cpu.csv" --names adsb-live adsb-gateway readsb &
+  PIDS+=($!)
+  sleep 1
+  python3 /repo/bench/legacy/feeder.py "$D/traffic.adsbrec" --meta "$D/new_feed.json" | tee "$D/new_feeder.txt"
+  sleep "$DRAIN"
+  python3 -c "import urllib.request,sys; sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:8080/gateway/stats', timeout=5).read().decode())" \
+          > "$D/new_gateway_stats.json" || true
+  kill -INT "$LIVE_PID" 2>/dev/null   # adsb-live prints its latency summary on Ctrl-C
+  wait "$LIVE_PID" 2>/dev/null
+  kill -TERM "$GW_PID" 2>/dev/null    # the gateway prints its final lines on SIGTERM
+  wait "$GW_PID" 2>/dev/null
+  stop_all
+
+  # 8. The new pipeline's core alone (replay, no network), for context.
   log "new pipeline replay"
   "$REPLAY" "$D/traffic.adsbrec" --pipeline --speed 1 --busy-wait > "$D/new_pipeline.txt"
   "$REPLAY" "$D/traffic.adsbrec" --out "$D/new_updates.bin" --hash-only > /dev/null
 
-  # 8. Analyze this scenario.
+  # 9. Analyze this scenario.
   if python3 /repo/bench/legacy/analyze.py scenario "$D" > "$D/summary.txt"; then
     cat "$D/summary.txt"
     # Raw logs are large; metrics.json and summary.txt keep the results.
     if [[ "$KEEP_RAW" != "1" ]]; then
-      rm -f "$D"/{traffic.adsbrec,truth.csv,sbs.csv,db.csv,api.csv,api_snapshots.csv,new_updates.bin}
+      rm -f "$D"/{traffic.adsbrec,truth.csv,sbs.csv,db.csv,api.csv,api_snapshots.csv,new_updates.bin} \
+            "$D"/{new_ws.csv,new_ws_snapshots.csv,new_api.csv,new_api_snapshots.csv}
     fi
   else
     log "analysis failed (raw logs kept in $D)"

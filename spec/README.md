@@ -4,6 +4,9 @@ This folder holds a TLA+ model of the gap-detection and recovery protocol for th
 MoldUDP64-style feed described in `README_UPDATES.md` §9.1 (framing) and §9.5
 (gap detection and recovery). TLC checks it exhaustively for small constants.
 
+`memory-model/` holds the GenMC (C11 memory model) checks of the two lock-free
+rings; see `memory-model/README.md`.
+
 | File | Purpose |
 |---|---|
 | `FeedRecovery.tla` | The spec: publisher, lossy network, retransmit server, snapshot server, subscriber, and the properties |

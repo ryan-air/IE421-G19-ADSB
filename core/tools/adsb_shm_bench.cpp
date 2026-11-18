@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
         ++expect;
       } else if (res == RingView::Read::kLapped) {
         ++laps;
-        expect = r.next_seq();
+        expect = r.resume_after_lap(expect);
       } else {
         cpu_relax();
       }

@@ -27,6 +27,15 @@ TEST(Clock, TicksAreNonDecreasingOnOneThread) {
   }
 }
 
+TEST(Clock, TickDeltaClampsReorderedReads) {
+  // A consumer's counter read can land a few ticks before the producer's
+  // (unordered counter reads): that must count as 0, not wrap to ~2^64.
+  EXPECT_EQ(adsb::tick_delta(100, 40), 60u);
+  EXPECT_EQ(adsb::tick_delta(40, 40), 0u);
+  EXPECT_EQ(adsb::tick_delta(39, 40), 0u);
+  EXPECT_EQ(adsb::tick_delta(0, ~std::uint64_t{0}), 0u);
+}
+
 TEST(Clock, WallClockIsPlausible) {
   // After 2020-01-01 and before 2100-01-01.
   const std::uint64_t now = adsb::wall_ns();

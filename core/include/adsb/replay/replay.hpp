@@ -225,9 +225,9 @@ ReplayResult replay_pipeline(record::RecordingReader& rd, Engine& eng, const Rep
         eng.on_frame(it.rec.payload, it.rec.len, detail::meta_of(it.rec), sink);
         const std::uint64_t t_done = ticks();
         if (lat) {
-          lat->queue_ns.record(conv.to_ns(t_deq - it.t_enqueue));
-          lat->process_ns.record(conv.to_ns(t_done - t_deq));
-          lat->total_ns.record(conv.to_ns(t_done > it.t_release ? t_done - it.t_release : 0));
+          lat->queue_ns.record(conv.to_ns(tick_delta(t_deq, it.t_enqueue)));
+          lat->process_ns.record(conv.to_ns(tick_delta(t_done, t_deq)));
+          lat->total_ns.record(conv.to_ns(tick_delta(t_done, it.t_release)));
         }
         ++consumed;
       } else if (reader_done.load(std::memory_order_acquire) &&

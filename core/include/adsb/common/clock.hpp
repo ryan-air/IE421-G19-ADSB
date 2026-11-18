@@ -54,6 +54,16 @@ namespace adsb {
 #endif
 }
 
+// Ticks elapsed from `earlier` to `later`, clamped at 0. Counter reads are
+// not ordered against memory accesses (no ISB / LFENCE, by design), so a
+// timestamp taken just after popping an item from another thread can read a
+// few ns *before* the producer's timestamp for that item. Subtracting raw
+// would wrap to ~2^64 ticks and poison the histogram's max (seen in
+// adsb-replay's queue latency). Use this for any cross-thread interval.
+[[nodiscard]] constexpr std::uint64_t tick_delta(std::uint64_t later, std::uint64_t earlier) noexcept {
+  return later > earlier ? later - earlier : 0;
+}
+
 class TickConverter {
  public:
   // Calibrates by sampling ticks() and mono_ns() over `duration_ns`.

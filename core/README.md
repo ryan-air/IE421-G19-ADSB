@@ -42,17 +42,40 @@ C++20 implementation of the pipeline described in [README_UPDATES.md](../README_
 | Book and snapshot stream | [`adsb/feed/book.hpp`](include/adsb/feed/book.hpp), [`adsb/feed/snapshot.hpp`](include/adsb/feed/snapshot.hpp) | The table a feed describes (ICAO → latest `TrackUpdate`) with a SHA-256 digest over its wire bytes, and the validated snapshot stream format |
 | Sockets | [`adsb/feed/net.hpp`](include/adsb/feed/net.hpp) | IPv4 UDP multicast/unicast send and receive (group join, TTL 1, loopback), TCP listener |
 
+### Overload semantics (Workstream F, README_UPDATES.md §10)
+
+What happens when the input outruns the pipeline is defined at each boundary and tested:
+
+| Boundary | Policy | Where |
+|---|---|---|
+| Live input → decode/state (`adsb-live`) | **Drop the frame and count it** when `--max-queue` frames are already waiting (default: the queue's 65,536). The ingest thread keeps reading the socket, so the upstream receiver is never pushed back. `--overload block` restores the old behavior (stop reading; the loss then happens upstream, uncounted). | `tools/adsb_live.cpp`: the one place a frame may be lost; the report gives the count and the queue's high-water mark |
+| Decode/state → publish → recovery log | Lossless (internal). The publisher batches **only while busy**: a datagram is sent the moment the input queue runs dry, so light load adds no delay, and under load it fills up to 22 messages, at most `--batch-us` (100 µs) old. | `publisher.hpp`, `adsb_live.cpp` |
+| Publisher → network | Never blocks: a full socket buffer is a counted send failure; subscribers recover by retransmit. | `net.hpp` (non-blocking UDP) |
+| Gateway → browsers | Per-client conflation and credit flow control: a slow client gets fewer, current frames. | [`gateway/`](../gateway/README.md) |
+
+Measured on the M2 laptop with `adsb-beast-serve` (below) as the load source, 3,000-aircraft traffic:
+
+| `adsb-live` configuration | Keeps up to | Above that |
+|---|---|---|
+| Decode + track state, no publishing | ≥ 2 M frames/s (the load source's limit); core alone replays at 1.9–2.0 M frames/s | – |
+| Publishing, one datagram per update (`--batch-us 0`, the old default) | about 300 k frames/s | old policy: queue full (~210 ms waits), load source blocked for seconds |
+| Publishing, batching while busy (new default) | 1 M frames/s, queue wait p99 24 µs, max 0.4 ms, no drops | 2 M frames/s: 4.4% dropped and counted, load source on schedule |
+
+`scripts/check-overload.sh` slows the state stage to a known cost (`--simulate-work-ns 10000`, about 90 k frames/s) and checks 0.5×, 2× and 10× saturation and a 10× burst. Loss is 0%, 50% and 90%, all at the input boundary and counted. Queue wait stays under about 30–40 ms (`--max-queue 2048`), against about 700 ms with `--overload block`. The load source stays on schedule, memory stays at about 16–18 MB at every load, dropping stops when a burst ends, and the feed's subscriber still reconstructs the publisher's book byte for byte. The old blocking policy is run for contrast: no counted loss, but the load source falls more than a second behind.
+
 ### Tools and scripts
 
 | Tool | Purpose |
 |---|---|
 | `build/<preset>/tools/adsb-synth` | Generate synthetic traffic: `.adsbrec`, plus optional raw Beast stream and ground-truth CSV |
 | `build/<preset>/tools/adsb-replay` | Replay a recording through decode + track state: counters, output hash, optional pipeline latency |
-| `build/<preset>/tools/adsb-live` | Run the pipeline on a live readsb feed (ingest → track state, optional recording, optional `--publish` to the feed), with receive → state latency |
+| `build/<preset>/tools/adsb-live` | Run the pipeline on a live readsb feed (ingest → track state, optional recording, optional `--publish` to the feed), with receive → state latency and the overload counters (`--overload`, `--max-queue`) |
+| `build/<preset>/tools/adsb-beast-serve` | Serve a recording as a Beast TCP stream (like readsb's output) at a fixed rate, with optional bursts; reports whether the consumer pushed back. The load source for overload tests |
 | `build/<preset>/tools/adsb-publish` | Replay a recording through decode + track state and publish it as the feed, with the retransmit and snapshot servers; fault injection; prints the final book digest |
 | `build/<preset>/tools/adsb-feed-cli` | Subscribe: verify sequencing, recover gaps, report counters and publish → applied latency, print the reconstructed book's digest |
 | `build/<preset>/tools/adsb-clock` | Answers clock queries on stdin with `mono_ns()`, so the Node gateway can measure latency against the publisher's clock ([gateway/](../gateway/README.md)) |
 | [`scripts/check-feed.sh`](scripts/check-feed.sh) | Feed integration test: loss, small ring, late join, publisher restart; every subscriber's book must equal the publisher's and a plain replay's (CI) |
+| [`scripts/check-overload.sh`](scripts/check-overload.sh) | Overload test: 0.5×, 2×, 10× saturation and a burst; loss only at the input boundary and counted, bounded queueing delay, no upstream pushback, constant memory, feed still consistent (CI) |
 | [`scripts/check-host.sh`](scripts/check-host.sh) | Report a machine's low-latency capabilities (NIC timestamps, AF_XDP, RDT, isolation, ...) |
 | [`scripts/tune-host.sh`](scripts/tune-host.sh) | Put a Linux benchmark host into a reproducible tuned state (dry-run by default), and revert it |
 | [`scripts/check-determinism.sh`](scripts/check-determinism.sh) | Prove the determinism contract: identical output across speeds, threading, and optimized vs naive builds |
@@ -147,5 +170,6 @@ The Apple timer runs at 24 MHz, so latencies are quantized to about 42 ns. Lapto
 
 - **Decoder gaps:** TC 29/31, Comm-B (BDS), and single-bit error correction are not decoded. The GNSS-height unit question (feet vs metres, see `decoder.hpp`) awaits the readsb differential diff on real traffic.
 - **Track engine:** `nic` is not populated yet. Heading and airspeed are decoded but not carried in `TrackUpdate` v0 (an open question in `feed_spec.md`).
+- **Overload:** defined and tested for `adsb-live` (above). Not yet: the SDR → IQ ring boundary (no demodulator yet), the conflated multicast feed (§10.2), and an overload test of the replay/publish tools. `adsb-live`'s state thread spins when idle (one core), by design.
 - **Feed:** kernel UDP only. io_uring, AF_XDP and the shared-memory ring (§9.3), hardware timestamps (§9.4), and the conflated feed (§10) are not built. IPv4 only. The subscriber's snapshot fetch blocks its thread (datagrams queue in the kernel meanwhile). The snapshot server copies the whole book on the recovery thread, which delays retransmits by that long (about 20 µs per 1,000 tracks). The retransmit server answers any requester (LAN only: no rate limit against spoofed requests). If the recovery thread stalls for long enough to fill its 65,536-entry log, the publisher waits rather than lose retransmit state. A reused session id cannot be detected by subscribers, so the tools generate a unique one per start.
 - **Not yet built:** A/B arbiter stage, IQ demodulator. The WebSocket gateway (Node) is in [`gateway/`](../gateway/README.md).

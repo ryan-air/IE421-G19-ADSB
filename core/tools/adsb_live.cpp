@@ -58,11 +58,21 @@ void on_signal(int) { g_stop.store(true); }
                "  --busy-poll           spin on the socket instead of poll() (lowest latency, uses a core)\n"
                "  --cpus I,S[,R]        pin ingest, state, recorder threads (Linux only)\n"
                "  --line N              receiver line id to stamp on frames (default 0)\n"
+               "overload (README_UPDATES.md §10.1):\n"
+               "  --overload drop|block when decode/state falls behind: drop the frame at the input and\n"
+               "                        count it (default), or stop reading the socket until it catches up\n"
+               "                        (pressure then goes upstream, into TCP and readsb, uncounted)\n"
+               "  --max-queue N         drop once N frames are waiting (bounds the queueing delay;\n"
+               "                        default: the queue's capacity, 65536)\n"
+               "  --simulate-work-ns N  TESTING ONLY: spin N ns per frame in the state stage, to give the\n"
+               "                        pipeline a known saturation rate (about 1e9 / N frames/s)\n"
                "  --quiet               no connection status messages\n"
                "feed (README_UPDATES.md §9):\n"
                "  --publish HOST:PORT   publish tracks on this multicast group (or unicast address)\n"
                "  --publish-interface A multicast egress interface address (default: kernel's choice)\n"
-               "  --batch-us N          batch up to N microseconds per datagram (default 0)\n"
+               "  --batch-us N          hold a datagram at most N microseconds while busy (default 100;\n"
+               "                        it is sent at once whenever the input queue is empty, so light\n"
+               "                        load adds no delay; 0 = one datagram per update)\n"
                "  --retransmit-port P   UDP retransmit server (default 41901)\n"
                "  --snapshot-port P     TCP snapshot server (default 41902)\n"
                "  --session ID          session id, up to 10 characters (default: from the clock)\n");
@@ -78,6 +88,10 @@ struct Item {
 struct Shared {
   std::atomic<std::uint64_t> frames{0}, tracks{0}, updates{0}, deletes{0}, bad{0}, positions{0};
   std::atomic<std::uint64_t> recorded{0}, record_dropped{0};
+  // Overload at the input boundary (README_UPDATES.md §10.1): frames dropped
+  // because the decode/state stage was behind, and the deepest the input
+  // queue got. Written by the ingest thread only.
+  std::atomic<std::uint64_t> overload_dropped{0}, queue_high_water{0};
 };
 
 using FeedPublisher = adsb::feed::Publisher<adsb::feed::UdpSender>;
@@ -118,6 +132,10 @@ int main(int argc, char** argv) {
   std::string publish_to, session_id;
   adsb::feed::UdpSender::Options send_opt;
   adsb::feed::PublisherConfig pub_cfg;
+  pub_cfg.max_batch_delay_ns = 100'000;  // see --batch-us
+  bool overload_block = false;           // --overload block
+  std::size_t max_queue = 0;             // --max-queue (0 = the queue's capacity)
+  std::uint64_t work_ns = 0;             // --simulate-work-ns (overload tests only)
   adsb::feed::RecoveryServerConfig rec_cfg;
   rec_cfg.retransmit_port = 41901;
   rec_cfg.snapshot_port = 41902;
@@ -144,6 +162,13 @@ int main(int argc, char** argv) {
     else if (a == "--stats-every") stats_every_s = std::strtod(val().c_str(), nullptr);
     else if (a == "--busy-poll") src_cfg.busy_poll = true;
     else if (a == "--quiet") quiet = true;
+    else if (a == "--overload") {
+      const std::string v = val();
+      if (v == "drop") overload_block = false;
+      else if (v == "block") overload_block = true;
+      else usage(2);
+    } else if (a == "--max-queue") max_queue = std::strtoull(val().c_str(), nullptr, 10);
+    else if (a == "--simulate-work-ns") work_ns = std::strtoull(val().c_str(), nullptr, 10);
     else if (a == "--line") src_cfg.line = static_cast<std::uint8_t>(std::strtol(val().c_str(), nullptr, 10) & 0xF);
     else if (a == "--receiver") {
       const std::string v = val();
@@ -243,6 +268,9 @@ int main(int argc, char** argv) {
     adsb::set_current_thread_name("adsb-ingest");
     if (cpu_ingest >= 0) adsb::pin_current_thread(cpu_ingest);
     Item it{};
+    std::size_t high_water = 0;
+    const std::size_t queue_limit =
+        max_queue == 0 || max_queue > StateQueue::kCapacity ? StateQueue::kCapacity : max_queue;
     source.run(
         g_stop,
         [&](const adsb::record::Record& r) {
@@ -255,8 +283,24 @@ int main(int argc, char** argv) {
           }
           it.rec = r;
           it.t_ingest = adsb::ticks();
+          // Input boundary. Everything after it is lossless; this is the one
+          // place a frame may be lost, and it is counted (README_UPDATES.md
+          // §10.1). With --overload block the ingest stops reading instead.
+          const std::size_t depth = state_q->size_approx();
+          if (depth > high_water) {
+            high_water = depth;
+            shared.queue_high_water.store(depth, std::memory_order_relaxed);
+          }
+          if (!overload_block && depth >= queue_limit) {
+            shared.overload_dropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+          }
           while (!state_q->try_push(it)) {
             if (g_stop.load(std::memory_order_relaxed)) return;
+            if (!overload_block) {  // full despite the check (limit == capacity)
+              shared.overload_dropped.fetch_add(1, std::memory_order_relaxed);
+              return;
+            }
             adsb::cpu_relax();
           }
         },
@@ -291,7 +335,11 @@ int main(int argc, char** argv) {
           m.line = r.line;
           engine->on_frame(r.payload, r.len, m, sink);
         }
-        queue_wait->record(conv.to_ns(t_pop - it.t_ingest));
+        if (work_ns) {  // --simulate-work-ns: a slower stage, for overload tests
+          const std::uint64_t until = adsb::mono_ns() + work_ns;
+          while (adsb::mono_ns() < until) adsb::cpu_relax();
+        }
+        queue_wait->record(conv.to_ns(adsb::tick_delta(t_pop, it.t_ingest)));
         // rx_ns was taken right after recv() (mono_ns domain): this covers
         // parse + handoff + decode + track state, i.e. receive -> state done.
         const std::uint64_t done_ns = adsb::mono_ns();
@@ -306,6 +354,9 @@ int main(int argc, char** argv) {
           publish(engine->stats().bad_frames);
         }
         // Batches due and heartbeats while the feed is quiet.
+        // Batch only while busy: the moment the input queue runs dry, send
+        // what is pending (no added delay at light load).
+        if (pub && idle_spins == 1) pub->flush();
         if (pub && idle_spins % 64 == 0) pub->poll();
         adsb::cpu_relax();
       }
@@ -340,12 +391,14 @@ int main(int argc, char** argv) {
     if (duration_s > 0 && now - t_start >= static_cast<std::uint64_t>(duration_s * 1e9)) g_stop.store(true);
     if (stats_every_s > 0 && now >= next_report) {
       const std::uint64_t f = shared.frames.load();
-      std::printf("[%6.1f s] %llu frames (%.0f/s), %llu tracks, %llu position updates, %llu bad frames%s\n",
+      std::printf("[%6.1f s] %llu frames (%.0f/s), %llu tracks, %llu position updates, %llu bad frames, "
+                  "%llu dropped (overload)%s\n",
                   static_cast<double>(now - t_start) * 1e-9, static_cast<unsigned long long>(f),
                   static_cast<double>(f - last_frames) / (static_cast<double>(now - last_t) * 1e-9),
                   static_cast<unsigned long long>(shared.tracks.load()),
                   static_cast<unsigned long long>(shared.positions.load()),
                   static_cast<unsigned long long>(shared.bad.load()),
+                  static_cast<unsigned long long>(shared.overload_dropped.load()),
                   rec_q ? (", recorded " + std::to_string(shared.recorded.load())).c_str() : "");
       std::fflush(stdout);
       last_frames = f;
@@ -398,6 +451,12 @@ int main(int argc, char** argv) {
                 u(rc.requests.load()), u(rc.snapshots.load()));
     std::printf("book digest %s\n", recovery->state().book().hex_digest().c_str());
   }
+  std::printf("overload    policy %s, %llu frames dropped at the input boundary (%.4f%%), "
+              "queue high water %llu of %zu\n",
+              overload_block ? "block" : "drop", u(shared.overload_dropped.load()),
+              s.frames ? 100.0 * static_cast<double>(shared.overload_dropped.load()) / static_cast<double>(s.frames) : 0.0,
+              u(shared.queue_high_water.load()),
+              max_queue == 0 || max_queue > StateQueue::kCapacity ? StateQueue::kCapacity : max_queue);
   std::printf("build       %s\n", adsb::build_variant());
   std::printf("latency (receive -> track state updated%s, per frame):\n", pub ? " and published" : "");
   print_hist("queue wait", *queue_wait);

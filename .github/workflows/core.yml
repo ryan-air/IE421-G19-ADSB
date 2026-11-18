@@ -273,3 +273,23 @@ jobs:
       # every client's table must equal the publisher's book byte for byte.
       - name: Integration
         run: FEED_IFACE=127.0.0.1 ../gateway/scripts/check-gateway.sh build/gw
+
+  overload:
+    name: overload semantics (adsb-live past saturation, README_UPDATES.md §10)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14
+      - name: Build
+        run: |
+          CXX=g++-14 cmake -S . -B build/ovl -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/ovl
+      # 0.5x, 2x and 10x saturation and a 10x burst: loss only at the input
+      # boundary and counted, bounded queueing delay, no upstream pushback,
+      # constant memory, and the feed's subscriber still matches the publisher.
+      - name: Run
+        run: scripts/check-overload.sh build/ovl

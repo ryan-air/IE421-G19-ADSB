@@ -21,3 +21,7 @@ adsb_apply_compiler_options(adsb-feed-cli)
 add_executable(adsb-clock adsb_clock.cpp)
 target_link_libraries(adsb-clock PRIVATE adsb::core)
 adsb_apply_compiler_options(adsb-clock)
+
+add_executable(adsb-beast-serve adsb_beast_serve.cpp)
+target_link_libraries(adsb-beast-serve PRIVATE adsb::core)
+adsb_apply_compiler_options(adsb-beast-serve)

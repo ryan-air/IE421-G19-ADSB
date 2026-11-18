@@ -19,8 +19,9 @@
 #   * the upstream sender is never pushed back (it stays on schedule);
 #   * after a burst, dropping stops promptly;
 #   * memory does not grow with load; nothing crashes.
-# And, for contrast, the old policy (--overload block): no counted loss, but
-# the sender falls seconds behind, i.e. the loss moves upstream, uncounted.
+# And, for contrast, the old policy (--overload block) at 10x: no counted loss,
+# but unbounded queueing delay and a sender that falls far behind, i.e. the
+# loss moves upstream, uncounted.
 #
 # Environment: OVL_PORT (base port, default 43800). KEEP=1 keeps the work dir.
 
@@ -121,10 +122,16 @@ check "burst: dropping stopped within 1.5 s of the burst ending (last new drop a
       'awk "BEGIN {exit !($last_drop_t <= 5.8)}"'
 check "burst: the feed stayed consistent" '[[ "$(digest burst live)" == "$(digest burst sub)" ]]'
 
-echo "== contrast: the old policy (--overload block) at 2x =="
-run block 180000 6 -- --overload block
+echo "== contrast: the old policy (--overload block) at 10x =="
+# 10x, not 2x: at 2x the excess (~2 MB/s) can hide in the kernel's TCP buffers
+# (several MB each side on Linux) for a whole short run, so the sender is not
+# visibly pushed back on every host. The queueing delay check does not depend
+# on buffer sizes at all.
+run block 900000 6 -- --overload block
 check "block: no loss is counted ($(dropped block))" '(( $(dropped block) == 0 ))'
-check "block: the sender was pushed back instead ($(late_ms block) ms behind schedule)" '(( $(late_ms block | cut -d. -f1) > 500 ))'
+check "block: queueing delay is unbounded instead ($(qwait_ms block) ms max, vs the $BOUND_MS ms bound with drop)" \
+      '(( $(qwait_ms block | cut -d. -f1) > BOUND_MS ))'
+check "block: the sender was pushed back ($(late_ms block) ms behind schedule)" '(( $(late_ms block | cut -d. -f1) > 500 ))'
 
 if (( FAIL )); then
   for f in "$W"/*.live "$W"/*.serve "$W"/*.sub; do echo "--- $f"; cat "$f"; done

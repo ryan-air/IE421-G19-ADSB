@@ -1,0 +1,188 @@
+# Team Roles and How We Work
+
+IE 421 Group 19. Read this before you start. It covers who owns what, what is left, and how a change gets into `main`.
+
+- **The plan:** [README_UPDATES.md](README_UPDATES.md) (goals §2, priority tiers §3, timeline §19).
+- **Build and test:** [SETUP.md](SETUP.md).
+
+---
+
+## Where we are
+
+About 40% of the plan is done, and everything listed here is on `main` with CI passing.
+
+| Area | What exists | Docs |
+|---|---|---|
+| Core pipeline (C++) | Mode S / ADS-B decoder, track state engine, `.adsbrec` record and deterministic replay, synthetic traffic generator with ground truth, live ingest from readsb (`adsb-live`) | [core/README.md](core/README.md) |
+| Feed | Sequenced multicast feed (MoldUDP64-style) with retransmit and snapshot servers and a subscriber library; wire spec with generated C++/JS/Python; TLA+ model of gap recovery | [protocol/feed_spec.md](protocol/feed_spec.md), [spec/README.md](spec/README.md) |
+| Web | WebSocket gateway: pushes the feed to browsers, runs the Fall 2025 map without a database | [gateway/README.md](gateway/README.md) |
+| Overload | Loss only at the input boundary and counted; publisher batching under load; tested at 0.5×, 2×, 10× saturation | [core/README.md](core/README.md#overload-semantics-workstream-f-readme_updatesmd-10) |
+| Benchmark | Fall 2025 vs. new pipeline on the same traffic: frame → map in the browser 1.1–1.6 s → about 70–90 ms (median, laptop) | [bench/results/legacy-baseline/README.md](bench/results/legacy-baseline/README.md) |
+
+Not started: the demodulator, A/B arbitration, faster transports, hardware timestamps, the conflated feed, ITCH, and camera fusion.
+
+---
+
+## Roles
+
+The plan's tiers apply inside every role: **finish the Must items before starting Should items.** Sizes: S ≈ a few days, M ≈ 1–2 weeks, L ≈ 3+ weeks.
+
+| Role | Owner(s) | Workstreams |
+|---|---|---|
+| 1. RF and demodulation | **Aniket** (`S-Anikett`) and **Philip** (`philipwestling`) | A, B |
+| 2. Decoder, track state, exchange data | **Daniel** (`dsiegal11`) | C, D, J |
+| 3. Feed transports and verification | **Ryan** (`ryan-air`) | E, F, H |
+| 4. Measurement, isolation, UI, report | *Open until we have the benchmark hardware* | G, I, M7–M8 |
+
+### Role 1: RF and demodulation (Aniket, Philip)
+
+This is the largest open Must item: goal 1 of the plan ("own the wire") depends on it. Plan §5 and §6.
+
+| Item | Tier | Hardware | Size |
+|---|---|---|---|
+| Synthetic IQ generator with ground truth (extend `adsb-synth`, `core/include/adsb/sim/`) | Must | None | M |
+| SIMD demodulator (AVX2 / NEON) tested against the synthetic IQ; target ≤ 10 cycles/sample | Must | None | L |
+| Real IQ recordings; sensitivity ≥ 90% of readsb's on the same recording; USB transfer-size sweep | Must | RTL-SDR (the Fall 2025 Pi setup) | M |
+| SDR → IQ ring overload boundary: drop and count (see the overload table in `core/README.md`) | Must | None | S |
+| A/B line arbitration: `adsb-synth --lines 2` already simulates two receivers with independent loss | Should | None now; a second RTL-SDR for real data | M |
+
+Start with: `core/include/adsb/sim/synth.hpp` (the generator and its reception model), `core/include/adsb/modes/` (the decoder the demodulator feeds), plan §5.1–5.3.
+
+### Role 2: Decoder, track state, exchange data (Daniel)
+
+Plan §7, §8 and §14.
+
+| Item | Tier | Hardware | Size |
+|---|---|---|---|
+| Decoder gaps: TC 29/31, Comm-B (BDS), optional single-bit error correction | Must | None | M |
+| Find out why our decoder reports about 8% more positions than readsb (`bench/results/legacy-baseline/README.md`, item 7) | Must | None | S |
+| ≥ 99.9% agreement with readsb on real traffic; settle the GNSS-height unit question (`core/include/adsb/modes/decoder.hpp`) | Must | Real recordings (OpenSky or our receiver) | S–M |
+| Populate `nic`; decide heading and airspeed for feed v1 (`protocol/feed_spec.md` §5) | Must | None | S |
+| Nasdaq ITCH 5.0 L3 order book through our MoldUDP64 stack; target ≥ 20 M msg/s per core | Could | None (public sample files) | L |
+
+Start with: `core/README.md` (decoder and engine sections), `core/tests/test_decoder.cpp`, plan §7.
+
+### Role 3: Feed transports and verification (Ryan)
+
+Plan §9.3–9.4, §10.2 and §12.
+
+| Item | Tier | Hardware | Size |
+|---|---|---|---|
+| Shared-memory broadcast ring (same-host IPC); target p99 < 500 ns | Should | None | M |
+| Conflated feed: latest state per aircraft at about 10 Hz; the gateway subscribes to it | Should | None | M |
+| Memory-model testing of the lock-free rings | Should | None | M |
+| AF_XDP transport (copy mode can be developed in Docker) | Should | Zero-copy needs the NIC | L |
+| Hardware timestamps and PTP across two hosts | Should | Benchmark host and NIC | L |
+| io_uring transport; deterministic simulation testing | Could | None | M each |
+
+Start with: `core/include/adsb/feed/`, `protocol/feed_spec.md`, `spec/`.
+
+### Role 4: Measurement, isolation, UI, report (open)
+
+Most of this waits for the benchmark host. Until then, anyone with spare time can take the items marked "None".
+
+| Item | Tier | Hardware | Size |
+|---|---|---|---|
+| Set up and tune the benchmark host (`core/scripts/tune-host.sh`); rerun every benchmark there (laptop tail latencies are unreliable) | Must | Benchmark host | M |
+| Full benchmark report: 10,000-aircraft load, tail analysis (explain every p99.9 outlier class), PGO and ablation table | Must | Benchmark host | L |
+| Fold the gateway's map shim into `ads/app.js` (the Fall 2025 code may now be edited; the benchmark measures the tag `fall2025-final`), fix the map tiles' API key, update `README.md` and `PROJECT_REPORT.md` | Should | None | S–M |
+| Noisy-neighbor isolation matrix (CAT/MBA) | Should | A CPU with RDT | M |
+| Minimal camera fusion (plan §13) | Should | Camera and a site | M–L |
+| Final report, demo video, reproducible-run instructions | Must | None | M |
+
+### Shared
+
+- **Feed spec:** review `protocol/feed_spec.md`, especially the open questions in §5, then freeze it as v1.
+- **Everyone:** run `core/scripts/check-host.sh --json` and share the output.
+- **Waiting on Prof. Lariviere** (asked on Discord):
+  - the benchmark Linux host with a hardware-timestamping NIC;
+  - OpenSky research access;
+  - exchange pcaps;
+  - whether he has an ADS-B receiver.
+
+  Roles 3 and 4 depend most on these.
+
+---
+
+## How to contribute
+
+**Nobody pushes to `main` directly.** Every change goes through a pull request, which **all three other teammates review**. After everyone has approved and CI is green, **a reviewer (not the author) merges it.**
+
+### 1. Start from an up-to-date `main`
+
+```bash
+git checkout main
+git pull origin main
+git checkout -b demod/synthetic-iq          # role/topic, short and descriptive
+```
+
+Branch names: `<area>/<topic>`, for example `demod/synthetic-iq`, `decoder/tc31`, `feed/shm-ring`, `report/tail-analysis`.
+
+### 2. Make the change, with tests
+
+- **Code changes need tests:**
+  - decoder changes need test vectors;
+  - feed or engine changes need unit tests, plus an end-to-end check where it applies.
+- **Run the checks** from [SETUP.md](SETUP.md) before pushing:
+  - the C++ tests in at least the `debug` and `asan` presets;
+  - the gateway tests if you touched `gateway/`;
+  - `python3 protocol/gen.py --check` if you touched the protocol.
+- **CI builds with GCC and Clang at `-Werror`.** GCC catches warnings Clang does not, so if you develop on a Mac, expect CI to flag a few.
+- **Feed format changes:** edit `protocol/schema/feed_v0.json` only, then run `python3 protocol/gen.py`. Never edit the generated files.
+- **Never commit** secrets, `.env` files, large recordings, or build output.
+
+### 3. Commit
+
+Small, focused commits with a message that says what changed and why:
+
+```bash
+git add -p                                   # review each hunk you stage
+git commit -m "Add a synthetic IQ generator with ground truth" -m "Generates 2 MS/s IQ for Mode S frames from adsb-synth traffic ..."
+```
+
+The first line is a short summary in the imperative ("Add …", "Fix …"). After a blank line, explain what changed and why: what you measured, and what you checked.
+
+### 4. Push and open a pull request
+
+```bash
+git push -u origin demod/synthetic-iq
+gh pr create --base main --fill             # or open it on github.com
+```
+
+In the PR description, include:
+- what changed and why;
+- how you tested it (commands, results, numbers with their caveats);
+- anything reviewers should look at closely, and anything not done yet.
+
+Request a review from all three other teammates.
+
+### 5. Review
+
+- **Everyone else reviews every PR,** within about two days if possible. Read the diff, run it locally if it touches something you know, and either approve or leave specific comments.
+- **The author answers every comment,** pushes fixes to the same branch, and re-requests review.
+- **Approve when:**
+  - the change does what the description says;
+  - it has tests;
+  - CI is green;
+  - you would be comfortable maintaining it.
+
+### 6. Merge
+
+- **Who merges:** once **all three reviewers have approved** and **CI is green**, one of the reviewers merges, never the author.
+- **How:** use **"Squash and merge"** for most PRs, so `main` gets one clean commit per change.
+- **After merging:** delete the branch.
+
+If `main` moved while your PR was open, update your branch before the merge:
+
+```bash
+git checkout demod/synthetic-iq
+git fetch origin
+git rebase origin/main                       # fix any conflicts, rerun the tests
+git push --force-with-lease
+```
+
+### Rules of thumb
+
+- **Keep PRs small.** One feature or fix per PR is much easier to review than a month of work at once.
+- **Ask before taking work in someone else's role.** If you are blocked on another role, say so in the PR or on Discord.
+- **Report numbers honestly:** say where they were measured (laptop or benchmark host) and what they leave out.

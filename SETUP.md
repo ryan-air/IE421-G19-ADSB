@@ -2,6 +2,8 @@
 
 How to get the new low-latency code (`core/`) building and tested on your machine. For *what* we are building and *why*, see [README_UPDATES.md](README_UPDATES.md). For the technical details of each component, see [core/README.md](core/README.md).
 
+**Before you change anything, read [TEAM.md](TEAM.md):** who owns which role, what is left, and how changes reach `main` (a branch and a pull request that all three other teammates review; a reviewer merges, never the author).
+
 ---
 
 ## 1. What exists today
@@ -26,7 +28,7 @@ Implemented, tested, and running in CI (details in [core/README.md](core/README.
 | WebSocket gateway (Node): feed → browsers, serves the Fall 2025 map from memory | `gateway/`, `gateway/scripts/check-gateway.sh` |
 | Host capability check / host tuning | `core/scripts/check-host.sh`, `core/scripts/tune-host.sh` |
 
-**Next up** (open for owners): the new pipeline inside the Fall 2025 benchmark harness (first end-to-end before/after numbers), the A/B arbiter (B), and the IQ demodulator (A). The feed spec v0 also needs the team's review (§5 of `protocol/feed_spec.md`).
+**What is left, and who owns it:** see [TEAM.md](TEAM.md). The feed spec v0 also needs the team's review (§5 of `protocol/feed_spec.md`).
 
 ---
 

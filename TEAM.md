@@ -19,7 +19,7 @@ About 40% of the plan is done, and everything listed here is on `main` with CI p
 | Overload | Loss only at the input boundary and counted; publisher batching under load; tested at 0.5×, 2×, 10× saturation | [core/README.md](core/README.md#overload-semantics-workstream-f-readme_updatesmd-10) |
 | Benchmark | Fall 2025 vs. new pipeline on the same traffic: frame → map in the browser 1.1–1.6 s → about 70–90 ms (median, laptop) | [bench/results/legacy-baseline/README.md](bench/results/legacy-baseline/README.md) |
 
-Not started: the demodulator, A/B arbitration, io_uring and AF_XDP, hardware timestamps, ITCH, and camera fusion. (The shared-memory ring and the conflated feed are done.)
+Not started: the demodulator, A/B arbitration, AF_XDP, hardware timestamps, ITCH, and camera fusion. (The shared-memory ring, the conflated feed, memory-model testing and the io_uring transport are done.)
 
 ---
 
@@ -73,7 +73,7 @@ Plan §9.3–9.4, §10.2 and §12.
 | ~~Memory-model testing of the lock-free rings~~ **Done:** GenMC models of both rings with 20 mutants, `adsb-ring-stress` on x86 and ARM in CI, see `spec/memory-model/README.md` | Should | None | M |
 | AF_XDP transport (copy mode can be developed in Docker) | Should | Zero-copy needs the NIC | L |
 | Hardware timestamps and PTP across two hosts | Should | Benchmark host and NIC | L |
-| io_uring transport; deterministic simulation testing | Could | None | M each |
+| ~~io_uring transport~~ **Done:** `--transport uring` on `adsb-publish` / `adsb-live`, `adsb-tx-bench`, see `core/README.md`; deterministic simulation testing | Could | None | M each |
 
 Start with: `core/include/adsb/feed/`, `protocol/feed_spec.md`, `spec/`.
 

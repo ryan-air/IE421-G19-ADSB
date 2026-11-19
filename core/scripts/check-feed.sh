@@ -21,7 +21,9 @@
 #
 # Environment: FEED_GROUP (default 239.19.0.7), FEED_IFACE (default
 # 127.0.0.1; use 0.0.0.0 where loopback multicast is unavailable), FEED_PORT
-# (base port, default 42900). Exits nonzero if any check fails.
+# (base port, default 42900), FEED_TRANSPORT (the publisher's UDP transport:
+# kernel (default), uring, uring-nosqpoll; with io_uring every publisher must
+# also report 0 reordered completions). Exits nonzero if any check fails.
 
 set -uo pipefail
 BUILD="${1:?usage: check-feed.sh BUILD_DIR}"
@@ -43,8 +45,9 @@ check() {  # description, condition
 digest() { grep -E '^book digest' "$1" | awk '{print $3}'; }
 field() { grep -E "^$2" "$1" | head -1; }
 
+TRANSPORT="${FEED_TRANSPORT:-kernel}"
 PUB_COMMON=(--feed "$GROUP:$PORT" --interface "$IFACE" --retransmit-port "$RTX" --snapshot-port "$SNAP"
-            --bind 127.0.0.1 --no-flush --no-publish-ts --heartbeat-ms 50)
+            --bind 127.0.0.1 --no-flush --no-publish-ts --heartbeat-ms 50 --transport "$TRANSPORT")
 SUB_COMMON=(--feed "$GROUP:$PORT" --interface "$IFACE" --retransmit "127.0.0.1:$RTX"
             --snapshot "127.0.0.1:$SNAP" --quiet)
 
@@ -97,6 +100,15 @@ check "subscriber followed the restart ($CHANGES session change)" '[[ "$CHANGES"
 check "its book == the second run's book"                      '[[ "$(digest "$W/R.txt")" == "$(digest "$W/P2.txt")" ]]'
 check "and differs from the first run's"                       '[[ "$(digest "$W/R.txt")" != "$(digest "$W/P1.txt")" ]]'
 check "session RUNB000002 reached its end"                     'grep -q "RUNB000002, ended" "$W/R.txt"'
+
+if [[ $TRANSPORT != kernel ]]; then
+  echo "== io_uring ($TRANSPORT) =="
+  for f in P P1 P2; do
+    line=$(grep '^io_uring' "$W/$f.txt")
+    check "publisher $f sent through io_uring, 0 reordered, 0 failed: ${line#io_uring    }" \
+      '[[ -n "$line" ]] && grep -q " 0 failed" <<<"$line" && grep -q " 0 reordered" <<<"$line"'
+  done
+fi
 
 if (( FAIL )); then
   for f in P A B C P1 P2 R; do echo "--- $f"; cat "$W/$f.txt"; done

@@ -22,8 +22,10 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 >
 > - the shared-memory broadcast ring (§9.3): same-host transport with lap detection and snapshot resync; write → read p50 125 ns, p99 209 ns at 100 k msg/s (laptop).
 > - the conflated feed (§10.2): latest state per aircraft at a fixed rate on its own group, with its own recovery; after every tick its book equals the main feed's by state.
+> - memory-model testing of both lock-free rings (§12): GenMC model checking with mutants, plus stress runs on x86 and ARM in CI; it found a lap-resume bug, fixed.
+> - the io_uring transport (§9.3): publisher sends through io_uring with SQPOLL, no syscall per datagram; the hot thread's send call p50 208 ns against 1,459 ns for `sendto()` (laptop VM), at the cost of a polling core.
 >
-> Not started: io_uring and AF_XDP, hardware timestamps (§9.3–9.4), the arbiter (B), the demodulator (A), and fusion (I).
+> Not started: AF_XDP, hardware timestamps (§9.3–9.4), the arbiter (B), the demodulator (A), and fusion (I).
 
 > **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed, and own the whole path from **antenna to published decision**. We demodulate the radio samples ourselves, merge redundant A/B receiver lines, decode and maintain state on a lock-free pinned-core pipeline, and publish over kernel UDP, io_uring, AF_XDP, or shared memory. Every segment is measured in cycles and nanoseconds against hardware timestamps. We then show that the same infrastructure handles a real exchange feed (**Nasdaq ITCH 5.0**) at tens of millions of messages per second.
 
@@ -316,7 +318,7 @@ Other message types: `TrackDelete` (16 B), `FusionMatch` / `UnidentifiedObject` 
 | Transport | Implementation notes |
 |---|---|
 | **Kernel UDP** | `sendmsg`/`recvmmsg` with `SO_BUSY_POLL`. This is the baseline. |
-| **io_uring** | `IORING_SETUP_SQPOLL`, so a kernel thread polls submissions and no syscall is made per packet. Registered buffers. |
+| **io_uring** | `IORING_SETUP_SQPOLL`, so a kernel thread polls submissions and no syscall is made per packet. Registered socket; a fixed buffer pool (registered buffers only pay off for zero-copy sends, which cost more than a copy for datagrams this small). Built: `--transport uring`, see `core/README.md`. |
 | **AF_XDP** | Publisher: an XSK socket in TX mode, building Ethernet, IPv4, and UDP headers ourselves (multicast MAC `01:00:5e` plus the low 23 bits of the group address). Subscriber: a small XDP/eBPF program redirects our UDP port into the XSK map and passes everything else to the kernel. **Zero-copy needs driver support** (Intel `igc` / `i40e` / `ice`, Mellanox `mlx5`). The Pi 5's NIC runs in copy mode only, and we report both. |
 | **Shared-memory broadcast ring** | For subscribers on the same host: a single-producer, multi-consumer log on `/dev/shm` backed by huge pages (Aeron / LMAX Disruptor style). Each consumer keeps its own cursor. A consumer that falls a full lap behind detects it from the sequence number and recovers from a snapshot. |
 

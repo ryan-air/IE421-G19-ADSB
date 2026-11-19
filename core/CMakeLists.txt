@@ -55,6 +55,7 @@ add_library(adsb_core STATIC
   src/feed/subscriber.cpp
   src/feed/shm_ring.cpp
   src/feed/shm_subscriber.cpp
+  src/feed/uring_sender.cpp
   src/record/recording.cpp
   src/sim/synth.cpp
 )
@@ -66,6 +67,27 @@ adsb_apply_compiler_options(adsb_core)
 
 find_package(Threads REQUIRED)
 target_link_libraries(adsb_core PUBLIC Threads::Threads)
+
+# io_uring feed transport (§9.3): Linux with liburing. AUTO builds it when
+# liburing is found; ON makes a missing liburing an error; OFF compiles the
+# stub (UringSender::built() == false).
+set(ADSB_IO_URING AUTO CACHE STRING "io_uring transport: AUTO, ON, OFF")
+set(ADSB_HAVE_IO_URING 0)
+if(NOT ADSB_IO_URING STREQUAL "OFF" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LIBURING QUIET IMPORTED_TARGET liburing>=2.2)
+  endif()
+  if(LIBURING_FOUND)
+    set(ADSB_HAVE_IO_URING 1)
+    target_link_libraries(adsb_core PRIVATE PkgConfig::LIBURING)
+  endif()
+endif()
+if(ADSB_IO_URING STREQUAL "ON" AND NOT ADSB_HAVE_IO_URING)
+  message(FATAL_ERROR "ADSB_IO_URING=ON but liburing (>= 2.2) was not found (apt install liburing-dev pkg-config)")
+endif()
+target_compile_definitions(adsb_core PUBLIC ADSB_HAVE_IO_URING=${ADSB_HAVE_IO_URING})
+message(STATUS "adsb: io_uring transport ${ADSB_HAVE_IO_URING} (ADSB_IO_URING=${ADSB_IO_URING})")
 if(ADSB_NAIVE)
   target_compile_definitions(adsb_core PUBLIC ADSB_NAIVE=1)
   message(STATUS "adsb: NAIVE baseline build (mutex queues, std::unordered_map)")

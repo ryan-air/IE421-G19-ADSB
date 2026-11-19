@@ -23,7 +23,8 @@
 # but unbounded queueing delay and a sender that falls far behind, i.e. the
 # loss moves upstream, uncounted.
 #
-# Environment: OVL_PORT (base port, default 43800). KEEP=1 keeps the work dir.
+# Environment: OVL_PORT (base port, default 43800), FEED_TRANSPORT (adsb-live's
+# feed transport: kernel (default), uring, uring-nosqpoll). KEEP=1 keeps the work dir.
 
 set -uo pipefail
 # Empty arrays are expanded as ${a[@]+"${a[@]}"}: macOS ships bash 3.2, where
@@ -61,7 +62,7 @@ run() {
   local SV=$!
   sleep 0.3
   "$T/adsb-live" --port "$P" --quiet --stats-every 0.5 --simulate-work-ns "$WORK_NS" \
-      --publish "127.0.0.1:$F" --retransmit-port $((F + 1)) --snapshot-port $((F + 2)) \
+      --publish "127.0.0.1:$F" --transport "${FEED_TRANSPORT:-kernel}" --retransmit-port $((F + 1)) --snapshot-port $((F + 2)) \
       ${live_args[@]+"${live_args[@]}"} > "$W/$name.live" 2>&1 &
   local LV=$!
   local rss_max=0

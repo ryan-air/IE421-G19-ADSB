@@ -37,3 +37,7 @@ adsb_apply_compiler_options(adsb-shm-bench)
 add_executable(adsb-ring-stress adsb_ring_stress.cpp)
 target_link_libraries(adsb-ring-stress PRIVATE adsb::core)
 adsb_apply_compiler_options(adsb-ring-stress)
+
+add_executable(adsb-tx-bench adsb_tx_bench.cpp)
+target_link_libraries(adsb-tx-bench PRIVATE adsb::core)
+adsb_apply_compiler_options(adsb-tx-bench)

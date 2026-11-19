@@ -28,6 +28,7 @@
 #include "adsb/feed/conflated_feed.hpp"
 #include "adsb/feed/recovery.hpp"
 #include "adsb/feed/shm_ring.hpp"
+#include "adsb/feed/tx.hpp"
 #include "adsb/record/recording.hpp"
 #include "adsb/replay/replay.hpp"
 
@@ -61,6 +62,10 @@ void on_signal(int) { g_stop.store(true); }
                "  --busy-wait             pace by spinning (precise timing, uses a core)\n"
                "  --no-flush              do not expire the remaining tracks at the end\n"
                "  --cpus P,R              pin publisher and recovery threads (Linux only)\n"
+               "  --transport T           feed UDP transport: kernel (sendto, default), uring (io_uring with a\n"
+               "                          kernel submission thread: no syscall per datagram), uring-nosqpoll\n"
+               "  --uring-sq-cpu N        pin io_uring's submission thread to CPU N (Linux)\n"
+               "  --uring-in-flight N     io_uring sends in flight at most (buffer pool, default 64)\n"
                "fault injection:\n"
                "  --drop-rate P           probability a feed drop burst starts at a datagram\n"
                "  --drop-burst N          datagrams per drop burst (default 1)\n"
@@ -120,6 +125,8 @@ int main(int argc, char** argv) {
   std::string path;
   Endpoint feed{"239.19.0.1", 41900};
   UdpSender::Options send_opt;
+  Transport transport = Transport::kKernel;
+  UringSender::Options uring_opt;
   std::string session_id, shm_name;
   std::uint64_t shm_slots = kShmDefaultSlots;
   std::string conflate_to, conflate_session;
@@ -168,6 +175,9 @@ int main(int argc, char** argv) {
       if (v != "max" && speed <= 0.0) usage(1);
     } else if (a == "--busy-wait") busy_wait = true;
     else if (a == "--no-flush") flush_at_end = false;
+    else if (a == "--transport") { if (!parse_transport(val(), transport)) usage(1); }
+    else if (a == "--uring-sq-cpu") uring_opt.sq_cpu = std::atoi(val().c_str());
+    else if (a == "--uring-in-flight") uring_opt.max_in_flight = static_cast<unsigned>(parse_u64(val()));
     else if (a == "--cpus") { if (std::sscanf(val().c_str(), "%d,%d", &pub_cpu, &rec_cpu) != 2) usage(1); }
     else if (a == "--drop-rate") feed_loss.drop_rate = parse_prob(val());
     else if (a == "--drop-burst") feed_loss.drop_burst = static_cast<std::uint32_t>(parse_u64(val()));
@@ -213,8 +223,8 @@ int main(int argc, char** argv) {
     }
     shm_out = std::make_unique<ShmOut>(shm_region.view());
   }
-  UdpSender udp;
-  if (!udp.open(feed, send_opt, &err)) {
+  FeedTx udp;
+  if (!udp.open(feed, transport, send_opt, uring_opt, &err)) {
     std::fprintf(stderr, "adsb-publish: feed %s: %s\n", to_string(feed).c_str(), err.c_str());
     return 1;
   }
@@ -234,9 +244,9 @@ int main(int argc, char** argv) {
   });
   if (pub_cpu >= 0) pin_current_thread(pub_cpu);
 
-  LossyOut<UdpSender> out(udp, feed_loss);
+  LossyOut<FeedTx> out(udp, feed_loss);
   // The ring first: a ring write costs tens of ns, a UDP sendto() microseconds.
-  using Out = DualOut<ShmOut, LossyOut<UdpSender>>;
+  using Out = DualOut<ShmOut, LossyOut<FeedTx>>;
   Out dual(shm_out.get(), &out);
   Publisher<Out> pub(pcfg, dual, log.get());
   PublishSink<Publisher<Out>> sink{&pub};
@@ -260,6 +270,7 @@ int main(int argc, char** argv) {
                 conflated.recovery().retransmit_port(), rcfg.bind_host.c_str(), conflated.recovery().snapshot_port());
   }
 
+  std::printf("transport   %s\n", transport_name(transport));
   std::printf("session     %s  feed %s  retransmit %s:%u  snapshot %s:%u\n", session_id.c_str(),
               to_string(feed).c_str(), rcfg.bind_host.c_str(), recovery.retransmit_port(),
               rcfg.bind_host.c_str(), recovery.snapshot_port());
@@ -312,6 +323,7 @@ int main(int argc, char** argv) {
   rec_stop = true;
   rec_thread.join();
   if (sink.conf) conflated.stop();
+  (void)udp.drain();
 
   auto u = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
   const auto& ps = pub.stats();
@@ -322,6 +334,7 @@ int main(int argc, char** argv) {
   std::printf("engine      %llu updates, %llu deletes\n", u(sink.updates), u(sink.deletes));
   std::printf("published   %llu messages in %llu datagrams (%llu bytes), %llu heartbeats, last seq %llu\n",
               u(ps.messages), u(ps.packets), u(ps.bytes), u(ps.heartbeats), u(pub.next_seq() - 1));
+  if (const std::string rep = udp.report(); !rep.empty()) std::printf("%s\n", rep.c_str());
   std::printf("faults      %llu feed datagrams dropped, %llu replies dropped, %llu send failures\n",
               u(out.dropped()), u(rc.replies_dropped.load()), u(ps.send_failures));
   std::printf("recovery    %llu requests, %llu messages retransmitted, %llu NAKs, %llu snapshots, ring %zu\n",

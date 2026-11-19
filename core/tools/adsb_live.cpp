@@ -73,10 +73,7 @@ void on_signal(int) { g_stop.store(true); }
                "feed (README_UPDATES.md §9):\n"
                "  --publish HOST:PORT   publish tracks on this multicast group (or unicast address)\n"
                "  --publish-interface A multicast egress interface address (default: kernel's choice)\n"
-               "  --transport T         feed UDP transport: kernel (sendto, default), uring (io_uring with a\n"
-               "                        kernel submission thread: no syscall per datagram), uring-nosqpoll\n"
-               "  --uring-sq-cpu N      pin io_uring's submission thread to CPU N (Linux)\n"
-               "  --uring-in-flight N   io_uring sends in flight at most (buffer pool, default 64)\n"
+               ADSB_TX_OPTIONS_HELP
                "  --batch-us N          hold a datagram at most N microseconds while busy (default 100;\n"
                "                        it is sent at once whenever the input queue is empty, so light\n"
                "                        load adds no delay; 0 = one datagram per update)\n"
@@ -153,7 +150,7 @@ int main(int argc, char** argv) {
   std::uint64_t shm_slots = adsb::feed::kShmDefaultSlots;
   adsb::feed::UdpSender::Options send_opt;
   adsb::feed::Transport transport = adsb::feed::Transport::kKernel;
-  adsb::feed::UringSender::Options uring_opt;
+  adsb::feed::TxOptions tx_opt;
   adsb::feed::PublisherConfig pub_cfg;
   std::string conflate_to;
   adsb::feed::ConflatedFeedConfig conf_cfg;
@@ -210,9 +207,7 @@ int main(int argc, char** argv) {
       if (std::sscanf(v.c_str(), "%d,%d,%d", &cpu_ingest, &cpu_state, &cpu_recorder) < 2) usage(1);
     } else if (a == "--publish") publish_to = val();
     else if (a == "--publish-interface") send_opt.interface_host = val();
-    else if (a == "--transport") { if (!adsb::feed::parse_transport(val(), transport)) usage(1); }
-    else if (a == "--uring-sq-cpu") uring_opt.sq_cpu = std::atoi(val().c_str());
-    else if (a == "--uring-in-flight") uring_opt.max_in_flight = static_cast<unsigned>(std::strtoul(val().c_str(), nullptr, 10));
+    else if (adsb::feed::is_tx_flag(a)) { if (!adsb::feed::apply_tx_flag(a, val(), transport, tx_opt)) usage(1); }
     else if (a == "--batch-us") pub_cfg.max_batch_delay_ns = std::strtoull(val().c_str(), nullptr, 10) * 1000;
     else if (a == "--retransmit-port") rec_cfg.retransmit_port = parse_port(val());
     else if (a == "--snapshot-port") rec_cfg.snapshot_port = parse_port(val());
@@ -267,7 +262,7 @@ int main(int argc, char** argv) {
     std::string err;
     if (!publish_to.empty()) {
       udp = std::make_unique<adsb::feed::FeedTx>();
-      if (!udp->open(dest, transport, send_opt, uring_opt, &err)) {
+      if (!udp->open(dest, transport, send_opt, tx_opt, &err)) {
         std::fprintf(stderr, "adsb-live: publish %s: %s\n", publish_to.c_str(), err.c_str());
         return 1;
       }

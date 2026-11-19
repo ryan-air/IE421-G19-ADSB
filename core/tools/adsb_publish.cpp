@@ -62,10 +62,7 @@ void on_signal(int) { g_stop.store(true); }
                "  --busy-wait             pace by spinning (precise timing, uses a core)\n"
                "  --no-flush              do not expire the remaining tracks at the end\n"
                "  --cpus P,R              pin publisher and recovery threads (Linux only)\n"
-               "  --transport T           feed UDP transport: kernel (sendto, default), uring (io_uring with a\n"
-               "                          kernel submission thread: no syscall per datagram), uring-nosqpoll\n"
-               "  --uring-sq-cpu N        pin io_uring's submission thread to CPU N (Linux)\n"
-               "  --uring-in-flight N     io_uring sends in flight at most (buffer pool, default 64)\n"
+               ADSB_TX_OPTIONS_HELP
                "fault injection:\n"
                "  --drop-rate P           probability a feed drop burst starts at a datagram\n"
                "  --drop-burst N          datagrams per drop burst (default 1)\n"
@@ -126,7 +123,7 @@ int main(int argc, char** argv) {
   Endpoint feed{"239.19.0.1", 41900};
   UdpSender::Options send_opt;
   Transport transport = Transport::kKernel;
-  UringSender::Options uring_opt;
+  TxOptions tx_opt;
   std::string session_id, shm_name;
   std::uint64_t shm_slots = kShmDefaultSlots;
   std::string conflate_to, conflate_session;
@@ -175,9 +172,7 @@ int main(int argc, char** argv) {
       if (v != "max" && speed <= 0.0) usage(1);
     } else if (a == "--busy-wait") busy_wait = true;
     else if (a == "--no-flush") flush_at_end = false;
-    else if (a == "--transport") { if (!parse_transport(val(), transport)) usage(1); }
-    else if (a == "--uring-sq-cpu") uring_opt.sq_cpu = std::atoi(val().c_str());
-    else if (a == "--uring-in-flight") uring_opt.max_in_flight = static_cast<unsigned>(parse_u64(val()));
+    else if (is_tx_flag(a)) { if (!apply_tx_flag(a, val(), transport, tx_opt)) usage(1); }
     else if (a == "--cpus") { if (std::sscanf(val().c_str(), "%d,%d", &pub_cpu, &rec_cpu) != 2) usage(1); }
     else if (a == "--drop-rate") feed_loss.drop_rate = parse_prob(val());
     else if (a == "--drop-burst") feed_loss.drop_burst = static_cast<std::uint32_t>(parse_u64(val()));
@@ -224,7 +219,7 @@ int main(int argc, char** argv) {
     shm_out = std::make_unique<ShmOut>(shm_region.view());
   }
   FeedTx udp;
-  if (!udp.open(feed, transport, send_opt, uring_opt, &err)) {
+  if (!udp.open(feed, transport, send_opt, tx_opt, &err)) {
     std::fprintf(stderr, "adsb-publish: feed %s: %s\n", to_string(feed).c_str(), err.c_str());
     return 1;
   }

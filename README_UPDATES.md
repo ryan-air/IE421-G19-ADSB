@@ -24,8 +24,9 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 > - the conflated feed (§10.2): latest state per aircraft at a fixed rate on its own group, with its own recovery; after every tick its book equals the main feed's by state.
 > - memory-model testing of both lock-free rings (§12): GenMC model checking with mutants, plus stress runs on x86 and ARM in CI; it found a lap-resume bug, fixed.
 > - the io_uring transport (§9.3): publisher sends through io_uring with SQPOLL, no syscall per datagram; the hot thread's send call p50 208 ns against 1,459 ns for `sendto()` (laptop VM), at the cost of a polling core.
+> - the AF_XDP transport, publisher side (§9.3): our own Ethernet/IPv4/UDP frames on an XSK TX ring, copy or zero-copy; in copy mode over a veth pair it matches kernel UDP (send call p50 750 ns both), so the gain waits for a zero-copy NIC.
 >
-> Not started: AF_XDP, hardware timestamps (§9.3–9.4), the arbiter (B), the demodulator (A), and fusion (I).
+> Not started: the AF_XDP subscriber side (XDP redirect program), AF_XDP zero-copy numbers, hardware timestamps (§9.3–9.4), the arbiter (B), the demodulator (A), and fusion (I).
 
 > **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed, and own the whole path from **antenna to published decision**. We demodulate the radio samples ourselves, merge redundant A/B receiver lines, decode and maintain state on a lock-free pinned-core pipeline, and publish over kernel UDP, io_uring, AF_XDP, or shared memory. Every segment is measured in cycles and nanoseconds against hardware timestamps. We then show that the same infrastructure handles a real exchange feed (**Nasdaq ITCH 5.0**) at tens of millions of messages per second.
 
@@ -115,7 +116,7 @@ The existing Kalman filter ([ads/kalman-filter.js](ads/kalman-filter.js)), proba
 | **Sample-to-wire** (preamble sample → NIC TX timestamp) | p99 < 5 ms, versus ~50–150 ms through default readsb | p99 < 8 ms |
 | Decode + state update, per frame | p99 < 300 ns | p99 < 2 µs |
 | Frame ready → `sendmsg` returns (kernel UDP) | p99 < 10 µs | p99 < 40 µs |
-| AF_XDP versus kernel UDP | ≥ 2× lower p99 TX latency | measured (copy mode only, see §9.3) |
+| AF_XDP versus kernel UDP | ≥ 2× lower p99 TX latency | measured (copy mode only, see §9.3; on a veth pair copy mode equals kernel UDP) |
 | Shared-memory IPC (same host) | p99 < 500 ns publish → consumer read | p99 < 2 µs |
 | Pipeline throughput under replay | ≥ 2 M frames/s | ≥ 200 k frames/s |
 | ITCH L3 book build (Workstream J) | ≥ 20 M msg/s per core (stretch: 50 M) | n/a |
@@ -319,7 +320,7 @@ Other message types: `TrackDelete` (16 B), `FusionMatch` / `UnidentifiedObject` 
 |---|---|
 | **Kernel UDP** | `sendmsg`/`recvmmsg` with `SO_BUSY_POLL`. This is the baseline. |
 | **io_uring** | `IORING_SETUP_SQPOLL`, so a kernel thread polls submissions and no syscall is made per packet. Registered socket; a fixed buffer pool (registered buffers only pay off for zero-copy sends, which cost more than a copy for datagrams this small). Built: `--transport uring`, see `core/README.md`. |
-| **AF_XDP** | Publisher: an XSK socket in TX mode, building Ethernet, IPv4, and UDP headers ourselves (multicast MAC `01:00:5e` plus the low 23 bits of the group address). Subscriber: a small XDP/eBPF program redirects our UDP port into the XSK map and passes everything else to the kernel. **Zero-copy needs driver support** (Intel `igc` / `i40e` / `ice`, Mellanox `mlx5`). The Pi 5's NIC runs in copy mode only, and we report both. |
+| **AF_XDP** | Publisher: an XSK socket in TX mode, building Ethernet, IPv4, and UDP headers ourselves (multicast MAC `01:00:5e` plus the low 23 bits of the group address). Subscriber: a small XDP/eBPF program redirects our UDP port into the XSK map and passes everything else to the kernel. **Zero-copy needs driver support** (Intel `igc` / `i40e` / `ice`, Mellanox `mlx5`). The Pi 5's NIC runs in copy mode only, and we report both. Built (publisher side): `--transport xdp`, raw `<linux/if_xdp.h>` (no XDP program needed for TX), copy/zero-copy/auto; copy mode over veth measured equal to kernel UDP, see `core/README.md`. |
 | **Shared-memory broadcast ring** | For subscribers on the same host: a single-producer, multi-consumer log on `/dev/shm` backed by huge pages (Aeron / LMAX Disruptor style). Each consumer keeps its own cursor. A consumer that falls a full lap behind detects it from the sequence number and recovers from a snapshot. |
 
 ### 9.4 Hardware timestamps and clock sync

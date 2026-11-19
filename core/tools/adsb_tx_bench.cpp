@@ -1,12 +1,18 @@
 // adsb-tx-bench: the feed's UDP transports compared on identical histograms
 // (README_UPDATES.md §9.3): kernel sendto() vs io_uring with and without a
-// kernel submission thread (SQPOLL).
+// kernel submission thread (SQPOLL) vs AF_XDP.
 //
-//   adsb-tx-bench [--transport kernel|uring|uring-nosqpoll|all] [--rate N] [--seconds S]
-//                 [--size B] [--rounds N] [--cpus S,R] [--sq-cpu N] [--in-flight N]
+//   adsb-tx-bench [--transport all|T[,T...]] [--rate N] [--seconds S] [--size B]
+//                 [--rounds N] [--cpus S,R] [--interface ADDR --dest ADDR [--rx-netns NS]]
+//                 [transport flags: --uring-sq-cpu N, --uring-in-flight N, --xdp-mode M, ...]
 //
 // A sender thread sends B-byte datagrams at a fixed rate (busy-wait pacing)
-// to a receiver thread on the loopback interface. Per transport it reports:
+// to a receiver thread, by default over loopback. AF_XDP needs a real device:
+// --interface is the sending device's address, --dest the receiver's. With
+// --rx-netns the receiver's socket is created in that network namespace
+// (e.g. the far end of a veth pair), so every transport crosses the same
+// device; otherwise kernel UDP to a local address would short-cut through
+// the loopback device. Per transport it reports:
 //   send()      time the hot thread spends in the transport's send call;
 //   send->recv  send call start to the receiver's recv() return (same clock);
 //   cores       CPU time / wall time, for the sender thread (always about 1:
@@ -21,10 +27,18 @@
 // delivers each datagram on the sender's CPU. Use the benchmark host (and
 // hardware timestamps, §9.4) for TX-to-wire latency.
 
+#include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <unistd.h>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,14 +61,17 @@ using namespace adsb::feed;
 [[noreturn]] void usage(int code) {
   std::fprintf(code ? stderr : stdout,
                "usage: adsb-tx-bench [options]\n"
-               "  --transport T   kernel, uring, uring-nosqpoll, or all (default all)\n"
+               "  --transport T   all (default: kernel, uring, uring-nosqpoll, and xdp with --interface)\n"
+               "                  or a comma-separated list of kernel, uring, uring-nosqpoll, xdp\n"
                "  --rate N        datagrams per second (default 100000)\n"
                "  --seconds S     per transport and round (default 3)\n"
                "  --size B        datagram bytes, 16..2048 (default 1200)\n"
                "  --rounds N      with all: alternate the transports N times (default 1)\n"
                "  --cpus S,R      pin the sender and receiver threads (Linux)\n"
-               "  --sq-cpu N      pin io_uring's submission thread (Linux)\n"
-               "  --in-flight N   io_uring sends in flight at most (default 64)\n");
+               "  --interface A   the sending device's address (needed for xdp)\n"
+               "  --dest A        the receiver's address (default 127.0.0.1)\n"
+               "  --rx-netns NS   create the receiver socket in network namespace NS (Linux)\n"
+               "transport flags (as in adsb-publish):\n" ADSB_TX_OPTIONS_HELP);
   std::exit(code);
 }
 
@@ -79,16 +96,66 @@ struct Result {
   std::string report;
 };
 
-void run(Result& res, double rate, double seconds, std::size_t size, int cpu_s, int cpu_r,
-         const UringSender::Options& uopt) {
+// A receiver socket, created in network namespace `netns` if given (a socket
+// stays in the namespace it was created in, whichever thread uses it).
+int open_receiver(const std::string& host, const std::string& netns, std::string* err) {
+  if (netns.empty()) return open_udp(host, 0, 16 << 20, err);
+#if defined(__linux__)
+  int fd = -1;
+  std::thread t([&] {
+    const int ns = ::open(("/var/run/netns/" + netns).c_str(), O_RDONLY | O_CLOEXEC);
+    if (ns < 0 || ::setns(ns, CLONE_NEWNET) != 0) {
+      *err = "enter netns " + netns + ": " + std::strerror(errno);
+      if (ns >= 0) ::close(ns);
+      return;
+    }
+    ::close(ns);
+    fd = open_udp(host, 0, 16 << 20, err);
+  });
+  t.join();
+  return fd;
+#else
+  *err = "--rx-netns is Linux only";
+  return -1;
+#endif
+}
+
+struct Setup {
+  double rate = 100'000, seconds = 3;
+  std::size_t size = 1200;
+  int cpu_s = -1, cpu_r = -1;
+  std::string iface, dest = "127.0.0.1", netns;
+  TxOptions txo;
+};
+
+void run(Result& res, const Setup& st) {
+  const double rate = st.rate, seconds = st.seconds;
+  const std::size_t size = st.size;
+  const int cpu_s = st.cpu_s, cpu_r = st.cpu_r;
   std::string err;
-  const int rfd = open_udp("127.0.0.1", 0, 16 << 20, &err);
+  const int rfd = open_receiver(st.dest, st.netns, &err);
   if (rfd < 0) {
     std::fprintf(stderr, "adsb-tx-bench: receiver: %s\n", err.c_str());
     std::exit(1);
   }
+  const Endpoint to{st.dest, local_port(rfd)};
+  UdpSender::Options udp;
+  if (!st.iface.empty()) udp.interface_host = st.iface;
+  if (res.t == Transport::kXdp && st.txo.xdp.dst_mac.empty()) {
+    // Make sure the kernel has resolved the receiver's MAC (ARP).
+    UdpSender probe;
+    InterfaceInfo dev;
+    MacAddress mac{};
+    if (probe.open(Endpoint{st.dest, 9}, udp, nullptr) && interface_for_address(st.iface, dev)) {
+      const std::uint8_t b[1] = {0};
+      for (int i = 0; i < 100 && !arp_lookup(st.dest, dev.name, mac); ++i) {
+        (void)probe.send(b);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+  }
   FeedTx tx;
-  if (!tx.open(Endpoint{"127.0.0.1", local_port(rfd)}, res.t, {}, uopt, &err)) {
+  if (!tx.open(to, res.t, udp, st.txo, &err)) {
     std::fprintf(stderr, "adsb-tx-bench: %s: %s\n", transport_name(res.t), err.c_str());
     std::exit(1);
   }
@@ -157,10 +224,12 @@ void run(Result& res, double rate, double seconds, std::size_t size, int cpu_s, 
 
 int main(int argc, char** argv) {
   std::string which = "all";
-  double rate = 100'000, seconds = 3;
-  std::size_t size = 1200;
-  int rounds = 1, cpu_s = -1, cpu_r = -1;
-  UringSender::Options uopt;
+  Setup st;
+  double& rate = st.rate;
+  double& seconds = st.seconds;
+  std::size_t& size = st.size;
+  int rounds = 1;
+  Transport ignored{};
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto val = [&]() -> std::string {
@@ -173,21 +242,33 @@ int main(int argc, char** argv) {
     else if (a == "--seconds") seconds = std::atof(val().c_str());
     else if (a == "--size") size = std::strtoul(val().c_str(), nullptr, 10);
     else if (a == "--rounds") rounds = std::atoi(val().c_str());
-    else if (a == "--sq-cpu") uopt.sq_cpu = std::atoi(val().c_str());
-    else if (a == "--in-flight") uopt.max_in_flight = static_cast<unsigned>(std::strtoul(val().c_str(), nullptr, 10));
+    else if (a == "--interface") st.iface = val();
+    else if (a == "--dest") st.dest = val();
+    else if (a == "--rx-netns") st.netns = val();
+    else if (is_tx_flag(a)) { if (!apply_tx_flag(a, val(), ignored, st.txo)) usage(1); }
     else if (a == "--cpus") {
-      if (std::sscanf(val().c_str(), "%d,%d", &cpu_s, &cpu_r) != 2) usage(1);
+      if (std::sscanf(val().c_str(), "%d,%d", &st.cpu_s, &st.cpu_r) != 2) usage(1);
     } else usage(1);
   }
   if (rate <= 0 || seconds <= 0 || size < 16 || size > UringSender::kBufferBytes || rounds < 1) usage(1);
   std::vector<Transport> ts;
   if (which == "all") {
-    ts = {Transport::kKernel, Transport::kUring, Transport::kUringNoSqpoll};
-    if (!UringSender::built()) ts = {Transport::kKernel};
+    ts = {Transport::kKernel};
+    if (UringSender::built()) ts.insert(ts.end(), {Transport::kUring, Transport::kUringNoSqpoll});
+    if (XdpSender::built() && !st.iface.empty()) ts.push_back(Transport::kXdp);
   } else {
-    Transport t{};
-    if (!parse_transport(which, t)) usage(1);
-    ts = {t};
+    std::size_t from = 0;
+    while (from <= which.size()) {
+      const std::size_t comma = std::min(which.find(',', from), which.size());
+      Transport t{};
+      if (!parse_transport(which.substr(from, comma - from), t)) usage(1);
+      ts.push_back(t);
+      from = comma + 1;
+    }
+  }
+  if (std::find(ts.begin(), ts.end(), Transport::kXdp) != ts.end() && st.iface.empty()) {
+    std::fprintf(stderr, "adsb-tx-bench: xdp needs --interface (the sending device's address) and --dest\n");
+    return 1;
   }
 
   std::vector<Result> all(ts.size());
@@ -197,7 +278,7 @@ int main(int argc, char** argv) {
     for (Result& res : all) {
       Result one;
       one.t = res.t;
-      run(one, rate, seconds, size, cpu_s, cpu_r, uopt);
+      run(one, st);
       res.call.merge(one.call);
       res.e2e.merge(one.e2e);
       res.sent += one.sent;
@@ -210,8 +291,10 @@ int main(int argc, char** argv) {
       res.report = one.report;
     }
   }
-  std::printf("rate        %.0f datagrams/s of %zu bytes, %.1f s x %d round(s) per transport, cpus %d,%d, sq cpu %d\n",
-              rate, size, seconds, rounds, cpu_s, cpu_r, uopt.sq_cpu);
+  std::printf("rate        %.0f datagrams/s of %zu bytes, %.1f s x %d round(s) per transport, cpus %d,%d, sq cpu %d, "
+              "to %s%s%s\n",
+              rate, size, seconds, rounds, st.cpu_s, st.cpu_r, st.txo.uring.sq_cpu, st.dest.c_str(),
+              st.netns.empty() ? "" : " in netns ", st.netns.c_str());
   for (const Result& res : all) {
     const double wall = seconds * rounds;
     std::printf("%-15s send() p50 %llu p99 %llu p99.9 %llu max %llu ns | send->recv p50 %llu p99 %llu p99.9 %llu ns | "

@@ -125,6 +125,14 @@ TEST(ShmRing, ASlotBeingWrittenReadsAsEmptyAndALaterBusyOneAsLapped) {
   EXPECT_EQ(r.view.read(2, buf, len), Read::kEmpty);
   slot[2].seq.store(kShmBusy | 6, std::memory_order_relaxed);
   EXPECT_EQ(r.view.read(2, buf, len), Read::kLapped);
+  // The lap was seen through the busy marker, but next_seq is still 2 (on
+  // weak memory a reader can see exactly this; the GenMC model found it).
+  // Resuming at next_seq() would retry the lost message forever-ish; the
+  // helper moves forward.
+  EXPECT_EQ(r.view.next_seq(), 2u);
+  EXPECT_EQ(r.view.resume_after_lap(2), 3u);
+  for (std::uint64_t s = 2; s <= 9; ++s) r.view.write(s, pattern(s).data(), 64);
+  EXPECT_EQ(r.view.resume_after_lap(2), 10u) << "normally the head";
 }
 
 TEST(ShmRing, EndOfSessionIsVisible) {
@@ -166,7 +174,7 @@ TEST(ShmRing, NoTornReadsUnderConcurrencyAndLapsAreDetected) {
           if (t == 2 && counts[t].ok % 1000 == 0) std::this_thread::sleep_for(1ms);
         } else if (res == Read::kLapped) {
           ++counts[t].laps;
-          expect = r.view.next_seq();  // resync at the head
+          expect = r.view.resume_after_lap(expect);  // resync at the head
           if (expect > kMessages) break;
         } else if (r.view.next_seq() > kMessages && expect >= r.view.next_seq()) {
           break;
@@ -255,7 +263,7 @@ TEST(ShmRegion, AnotherProcessReadsWhatThisOneWrites) {
         ++ok;
         ++expect;
       } else if (res == Read::kLapped) {
-        expect = rd.view().next_seq();
+        expect = rd.view().resume_after_lap(expect);
       }
     }
     ::_exit(ok > kN / 10 ? 0 : 12);

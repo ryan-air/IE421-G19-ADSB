@@ -70,7 +70,7 @@ Plan §9.3–9.4, §10.2 and §12.
 |---|---|---|---|
 | ~~Shared-memory broadcast ring (same-host IPC); target p99 < 500 ns~~ **Done:** p99 209 ns at 100 k msg/s on the laptop, see `core/README.md` | Should | None | M |
 | ~~Conflated feed: latest state per aircraft at about 10 Hz; the gateway subscribes to it~~ **Done:** `--conflate` on `adsb-live` / `adsb-publish`; point the gateway's `--feed` at it | Should | None | M |
-| Memory-model testing of the lock-free rings | Should | None | M |
+| ~~Memory-model testing of the lock-free rings~~ **Done:** GenMC models of both rings with 20 mutants, `adsb-ring-stress` on x86 and ARM in CI, see `spec/memory-model/README.md` | Should | None | M |
 | AF_XDP transport (copy mode can be developed in Docker) | Should | Zero-copy needs the NIC | L |
 | Hardware timestamps and PTP across two hosts | Should | Benchmark host and NIC | L |
 | io_uring transport; deterministic simulation testing | Could | None | M each |

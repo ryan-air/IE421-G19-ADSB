@@ -332,3 +332,52 @@ jobs:
       # publisher's byte for byte.
       - name: Run
         run: scripts/check-shm.sh build/shm
+
+  memory-model:
+    name: GenMC model check (SPSC ring, shm slot protocol, mutants)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        id: genmc
+        with:
+          path: spec/.tools/genmc-v0.20.0
+          key: genmc-v0.20.0-llvm19-ubuntu24.04-${{ runner.arch }}
+      # The cached build still needs LLVM 19's runtime (GenMC compiles the
+      # models with clang-19 at run time).
+      - name: Install LLVM 19
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-19 llvm-19 llvm-19-dev libffi-dev
+      - name: Build GenMC
+        run: echo "GENMC=$(bash spec/memory-model/build-genmc.sh)" >> "$GITHUB_ENV"
+      # Every correct model verifies; every mutant (an ordering weakened, a
+      # protocol step removed) is caught.
+      - run: bash spec/memory-model/run.sh
+
+  ring-stress:
+    name: ring stress (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14
+      - name: Build
+        run: |
+          CXX=g++-14 cmake -S . -B build/stress -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/stress --target adsb-ring-stress
+      # Real hardware, both memory models (x86 TSO, ARM weak): every message
+      # exactly once, in order, intact; laps reported. Longer runs: see
+      # spec/memory-model/README.md.
+      - run: build/stress/tools/adsb-ring-stress --seconds 60 --seed ${{ github.run_number }}

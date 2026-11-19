@@ -198,6 +198,16 @@ class RingView {
   [[nodiscard]] std::uint64_t next_seq() const noexcept {
     return header_->next_seq.load(std::memory_order_acquire);
   }
+  // Where a reader resumes after read(seq) reported kLapped. next_seq() alone
+  // can lag behind the lap the reader just saw, even below seq: a lap seen
+  // through the writer's busy marker (or the re-check after the copy) does not
+  // synchronize with the writer's next_seq store. The GenMC model
+  // (spec/memory-model/shm_slot.c) found this. Message seq is gone in either
+  // case, so never move backwards: at least seq + 1.
+  [[nodiscard]] std::uint64_t resume_after_lap(std::uint64_t seq) const noexcept {
+    const std::uint64_t n = next_seq();
+    return n > seq ? n : seq + 1;
+  }
   [[nodiscard]] std::uint64_t ended() const noexcept { return header_->ended.load(std::memory_order_acquire); }
   // Oldest message that can still be in the ring (it may already be overwritten
   // by the time it is read; read() reports that).

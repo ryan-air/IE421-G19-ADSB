@@ -41,6 +41,8 @@ This is the largest open Must item: goal 1 of the plan ("own the wire") depends 
 | Item | Tier | Hardware | Size |
 |---|---|---|---|
 | Synthetic IQ generator with ground truth (extend `adsb-synth`, `core/include/adsb/sim/`) | Must | None | M |
+| **Professor's request (plan §22.4):** grow the IQ generator into a scenario generator for testing SDRs: many aircraft at different altitudes and positions, Doppler, multipath, refraction, per-aircraft transmitter frequency offset and drift, colliding replies; IQ in cu8/cs8/cs16/cf32 with SigMF truth; checked against readsb and MATLAB's ADS-B receiver | Must | None | L |
+| Transponder frequency-stability study (plan §22.5): per-message frequency estimate, Doppler and receiver error removed, grouped by aircraft and type | Should | RTL-SDR at ≥ 2.4 MS/s, ideally a GPS-disciplined reference | M |
 | SIMD demodulator (AVX2 / NEON) tested against the synthetic IQ; target ≤ 10 cycles/sample | Must | None | L |
 | Real IQ recordings; sensitivity ≥ 90% of readsb's on the same recording; USB transfer-size sweep | Must | RTL-SDR (the Fall 2025 Pi setup) | M |
 | SDR → IQ ring overload boundary: drop and count (see the overload table in `core/README.md`) | Must | None | S |
@@ -99,6 +101,8 @@ Most of this waits for the benchmark host. Until then, anyone with spare time ca
   - OpenSky research access;
   - exchange pcaps;
   - whether he has an ADS-B receiver.
+
+  Asked again on 2026-11-19 together with the reply to his feedback (plan §22). Hardware and data list: plan §22.6.
 
   Roles 3 and 4 depend most on these.
 

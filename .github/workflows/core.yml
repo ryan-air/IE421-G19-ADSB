@@ -25,6 +25,9 @@ concurrency:
 
 defaults:
   run:
+    # Explicit bash runs steps with -eo pipefail (the default shell has no
+    # pipefail, so `ctest ... | tee` would hide a failing test).
+    shell: bash
     working-directory: core
 
 jobs:

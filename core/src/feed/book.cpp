@@ -58,6 +58,30 @@ std::array<std::uint8_t, 32> FeedBook::digest() const {
 
 std::string FeedBook::hex_digest() const { return Sha256::hex(digest()); }
 
+std::uint64_t FeedBook::track_fingerprint(const TrackUpdate& u) noexcept {
+  std::uint8_t buf[TrackUpdate::kWireSize];
+  protocol::write(u, buf);
+  // splitmix64 finalizer over each 8-byte word, chained.
+  std::uint64_t h = 0x9E3779B97F4A7C15ull;
+  for (std::size_t i = 0; i < sizeof buf; i += 8) {
+    std::uint64_t w;
+    std::memcpy(&w, buf + i, 8);
+    h ^= w + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    h ^= h >> 30;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 27;
+    h *= 0x94D049BB133111EBull;
+    h ^= h >> 31;
+  }
+  return h;
+}
+
+std::uint64_t FeedBook::fingerprint() const noexcept {
+  std::uint64_t sum = 0;
+  for (const auto& kv : tracks_) sum += track_fingerprint(kv.second);
+  return sum;
+}
+
 std::array<std::uint8_t, 32> FeedBook::state_digest() const {
   Sha256 sha;
   std::uint8_t buf[TrackUpdate::kWireSize];

@@ -42,6 +42,11 @@ SubscriberCore::SubscriberCore(const SubscriberConfig& cfg, SubscriberIo* io,
     : cfg_(cfg), io_(io), handler_(handler) {
   cfg_.window = round_up_pow2(cfg_.window);
   if (cfg_.max_request == 0) cfg_.max_request = 1;
+  // Never ask for more than the window can buffer: reply packets can arrive
+  // out of order, and every one ahead of `expected` but past the window is
+  // thrown away, so an oversized request advances by one packet per timeout
+  // (found by deterministic simulation: window 8, requests of 256).
+  if (cfg_.max_request > cfg_.window) cfg_.max_request = static_cast<std::uint16_t>(cfg_.window);
   pending_.resize(cfg_.window);
   mask_ = cfg_.window - 1;
 }
@@ -85,6 +90,7 @@ void SubscriberCore::new_session(const protocol::Session& s) {
   gap_open_ = false;
   snap_due_ = false;
   snap_anchor_ = 0;
+  confirm_ = false;
   if (handler_) handler_->on_reset();
 }
 
@@ -119,10 +125,28 @@ void SubscriberCore::on_datagram(std::span<const std::uint8_t> dgram, Source src
       return;
     }
     // The publisher (re)started. State "as of 0" is empty, so a subscriber
-    // that sees the session from its first sequence number needs nothing
-    // else; one that joins later takes a snapshot.
+    // that sees its first session from sequence number 1 needs nothing else;
+    // one that joins later takes a snapshot.
+    //
+    // A *change* of session at sequence 1 is also confirmed with the
+    // snapshot server, in the background: around a restart a late packet of
+    // the old session can arrive after the new session's first packets, and
+    // a subscriber that never saw the old session cannot tell it is older
+    // (ids are opaque). Unconfirmed, it would stay on the dead session and
+    // ignore the live one forever (found by deterministic simulation). The
+    // server is the live publisher: if its snapshot is of another session,
+    // on_snapshot switches to it. The subscriber stays live meanwhile, so a
+    // slow or refused confirmation (many subscribers restart at once; the
+    // server takes 16 snapshot clients) delays nothing and cannot keep it
+    // from reaching the end of the session.
+    const bool change = has_session_;
     new_session(h.session);
-    if (h.seq != 1) enter_snapshot();
+    if (h.seq != 1) {
+      enter_snapshot();
+    } else if (change) {
+      confirm_ = true;
+      snap_due_ = true;
+    }
   }
 
   switch (pv->kind) {
@@ -150,6 +174,24 @@ void SubscriberCore::on_datagram(std::span<const std::uint8_t> dgram, Source src
     case PacketKind::kData:
       known_next_ = std::max(known_next_, h.seq + h.count);
       pv->for_each([&](std::uint64_t seq, std::span<const std::uint8_t> msg) { accept(seq, msg); });
+      // The server fills reply packets until the next message would not fit,
+      // so a reply packet with room for another message is the last of its
+      // answer. If we applied through its end and the request still is not
+      // complete, the server truncated it (its per-request cap, or messages
+      // it has not logged yet): ask for the rest now rather than after the
+      // retransmit timeout (found by deterministic simulation: with a cap
+      // below max_request, recovery crawled at one capped reply per timeout).
+      // Only an answer to the current request counts, and only when it
+      // brought us exactly to its end: a reordered middle packet (expected
+      // behind its end) or a duplicate of an earlier answer (it starts
+      // before the current request) must not, or duplicated requests and
+      // replies would feed a request storm (the simulation found that too).
+      if (src == Source::kRetransmit && req_active_ && expected_ < req_to_ && h.seq >= req_from_ &&
+          expected_ == h.seq + h.count &&
+          dgram.size() + 2 + kMaxMessageBytes <= protocol::PacketBuilder::kCapacity) {
+        req_to_ = expected_;  // answered: maybe_request() sends the next request
+        ++stats_.truncated_replies;
+      }
       break;
   }
   maybe_request(now_ns);
@@ -245,6 +287,7 @@ void SubscriberCore::maybe_request(std::uint64_t now_ns) {
   r.count = static_cast<std::uint16_t>(hi - expected_);
   io_->send_request(r);
   req_active_ = true;
+  req_from_ = expected_;
   req_to_ = hi;
   req_sent_ns_ = now_ns;
   ++stats_.requests;
@@ -254,7 +297,7 @@ void SubscriberCore::maybe_request(std::uint64_t now_ns) {
 void SubscriberCore::poll(std::uint64_t now_ns) { maybe_request(now_ns); }
 
 bool SubscriberCore::take_snapshot_request(std::uint64_t now_ns) {
-  if (mode_ != Mode::kSnapshot) return false;
+  if (mode_ != Mode::kSnapshot && !confirm_) return false;
   if (!snap_due_ && now_ns - snap_last_ns_ < cfg_.snapshot_retry_ns) return false;
   snap_due_ = false;
   snap_last_ns_ = now_ns;
@@ -269,14 +312,28 @@ void SubscriberCore::on_snapshot_failed(std::uint64_t now_ns) {
 }
 
 void SubscriberCore::on_snapshot(const SnapshotData& snap, std::uint64_t now_ns) {
-  if (mode_ != Mode::kSnapshot) return;  // not asked for (already recovered)
+  if (mode_ != Mode::kSnapshot) {
+    if (!confirm_) return;  // not asked for (already recovered)
+    if (has_session_ && snap.session == session_) {
+      confirm_ = false;  // the server agrees: keep our state
+      ++stats_.sessions_confirmed;
+      return;
+    }
+    // The server is in another session: ours came from a late packet of a
+    // dead one. Adopt the server's, as for any snapshot below.
+  }
   if (!has_session_ || snap.session != session_) {
-    // A snapshot from a session we left is normally stale (requested before
-    // a restart, answered after). But if we asked for it from the current
+    // A snapshot of another session. If we asked for it from the current
     // session, the server -- the publisher itself -- is telling us its live
-    // session: the current one came from a stray packet. Adopt it then, or
-    // we would never recover.
-    if (is_retired(snap.session) && snap_req_session_ != session_) {
+    // session: the current one came from a stray or late packet. Adopt it
+    // then, or we would never recover. An answer to a request made before
+    // we changed session is stale whatever session it carries: it reflects
+    // the server at some earlier moment, possibly a server that has died
+    // since (found by deterministic simulation: an async fetch, requested
+    // in session 1, answered by session 2's server, which then died,
+    // arrived after session 3 began and put the subscriber on session 2 for
+    // good). The rejected fetch is retried at once if one is due.
+    if (snap_req_session_ != session_) {
       on_snapshot_failed(now_ns);
       return;
     }
@@ -293,6 +350,7 @@ void SubscriberCore::on_snapshot(const SnapshotData& snap, std::uint64_t now_ns)
     if (handler_) handler_->on_snapshot_loaded();
   }
   known_next_ = std::max(known_next_, snap.as_of_seq + 1);
+  confirm_ = false;  // the server's own session
   mode_ = Mode::kLive;
   snap_anchor_ = 0;
   ++stats_.snapshots_loaded;

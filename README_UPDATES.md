@@ -25,6 +25,7 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 > - memory-model testing of both lock-free rings (§12): GenMC model checking with mutants, plus stress runs on x86 and ARM in CI; it found a lap-resume bug, fixed.
 > - the io_uring transport (§9.3): publisher sends through io_uring with SQPOLL, no syscall per datagram; the hot thread's send call p50 208 ns against 1,459 ns for `sendto()` (laptop VM), at the cost of a polling core.
 > - the AF_XDP transport, publisher side (§9.3): our own Ethernet/IPv4/UDP frames on an XSK TX ring, copy or zero-copy; in copy mode over a veth pair it matches kernel UDP (send call p50 750 ns both), so the gain waits for a zero-copy NIC.
+> - deterministic simulation testing (§12): the real publisher, recovery side and subscribers on a simulated network and clock, a random world per seed, invariants after every step; hundreds of thousands of seeds pass, 40,000 new ones per CI run and a nightly sweep. It found four subscriber defects (two ways a subscriber could end up permanently on a dead session after a restart, and two recovery-throughput problems), fixed in C++ and JS.
 >
 > Not started: the AF_XDP subscriber side (XDP redirect program), AF_XDP zero-copy numbers, hardware timestamps (§9.3–9.4), the arbiter (B), the demodulator (A), and fusion (I).
 
@@ -409,7 +410,7 @@ Every p99.9 and max value is explained, not just reported. Tools: `perf record` 
 |---|---|---|
 | **TLA+ model plus TLC model checking** | Sequenced feed, retransmit, snapshot, and session restart, under loss, duplication, and reordering | Safety: every message is applied exactly once, in sequence order. Liveness: a subscriber that keeps receiving packets eventually matches the publisher's state. Checked within bounded model sizes. |
 | **Memory-model testing** | SPSC ring and shared-memory broadcast ring | ThreadSanitizer, multi-hour stress runs on **ARM** (the Pi 5, where weak memory ordering exposes bugs x86 hides) and on x86, plus **GenMC** model checking of the ring core written with C11 atomics |
-| **Deterministic simulation testing** | Publisher, retransmit/snapshot servers, and subscribers in one process, with simulated network and clock | Millions of seeded fault schedules in nightly CI. Any failure replays exactly from its seed. |
+| **Deterministic simulation testing** | Publisher, retransmit/snapshot servers, and subscribers in one process, with simulated network and clock | Millions of seeded fault schedules in nightly CI. Any failure replays exactly from its seed. Built: `adsb-dst` (`core/include/adsb/feed/dst.hpp`), CI jobs `dst` and `dst-nightly`. |
 | **Fuzzing** (libFuzzer + ASan/UBSan) | Beast parser, Mode S decoder, demodulator, ITCH parser | No crashes, no out-of-bounds reads, no invalid frames emitted |
 | **Differential oracles** | Demodulator against readsb (IQ), decoder against readsb and pyModeS, ITCH book against a reference implementation (§14) | Agreement within documented tolerances |
 | **Determinism hash** | Full pipeline replay | Byte-identical output across runs |
@@ -636,9 +637,7 @@ On `main`, with CI passing:
 - the shared-memory ring;
 - the conflated feed;
 - the TLA+ and GenMC models;
-- the before/after benchmark: frame → map in the browser about 1.1–1.6 s for the Fall 2025 system against about 70–90 ms for the new pipeline (median, laptop).
-
-In review:
+- the before/after benchmark: frame → map in the browser about 1.1–1.6 s for the Fall 2025 system against about 70–90 ms for the new pipeline (median, laptop);
 - io_uring and AF_XDP (copy mode) publisher transports;
 - deterministic simulation testing of the feed. Millions of seeded fault schedules found and fixed four recovery bugs in the subscriber.
 

@@ -1,0 +1,42 @@
+name: dst-nightly
+
+# Deterministic simulation testing of the feed, nightly (README_UPDATES.md
+# §12: millions of seeded fault schedules). Each night sweeps new seeds:
+# about 25 minutes of quick worlds, then 15 of deep ones. A failure prints
+# the seed and the command that replays it exactly (adsb-dst --seed N).
+
+on:
+  schedule:
+    - cron: "17 7 * * *"   # 07:17 UTC, about 01:17 in Champaign
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: core
+    # bash -eo pipefail: a failing command before a pipe (`... | tee`) fails
+    # the step (the default `bash -e` would only see tee's status).
+    shell: bash
+
+jobs:
+  sweep:
+    name: nightly seed sweep (quick and deep worlds)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14
+      - name: Build
+        run: |
+          CXX=g++-14 cmake -S . -B build/dst -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/dst --target adsb-dst
+      - name: Quick worlds (25 min)
+        run: |
+          build/dst/tools/adsb-dst --profile quick --seeds 100000000 \
+            --start $(( ${{ github.run_number }} * 100000000 )) --time-limit 1500 --keep-going
+      - name: Deep worlds (15 min)
+        run: |
+          build/dst/tools/adsb-dst --profile deep --seeds 100000000 \
+            --start $(( ${{ github.run_number }} * 100000000 )) --time-limit 900 --keep-going

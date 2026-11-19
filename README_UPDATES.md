@@ -52,6 +52,7 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 19. [Timeline and Milestones](#19-timeline-and-milestones)
 20. [Risks and Mitigations](#20-risks-and-mitigations)
 21. [Open Decisions](#21-open-decisions)
+22. [Professor Feedback and Progress (November 2026)](#22-professor-feedback-and-progress-november-2026)
 
 ---
 
@@ -606,6 +607,110 @@ These are team and hardware questions to settle in Week 1:
 6. **FPGA board availability** through the course.
 7. **ITCH data:** confirm access to and storage for full-day Nasdaq sample files.
 8. **Large recordings:** Git LFS or external storage?
+
+---
+
+## 22. Professor Feedback and Progress (November 2026)
+
+### 22.1 What Prof. Lariviere asked for
+
+From his message of 2026-11-19:
+
+1. He especially likes the **ADS-B signal generator**. It could be very useful for testing more advanced software-defined radios.
+2. **Check whether MATLAB has something similar.**
+3. The generator should simulate **many aircraft at different altitudes and locations**, with **atmospheric effects, multipath, and especially Doppler shift**.
+4. A study he is curious about: **the frequency stability of the 1090 MHz transmitters on different aircraft types.**
+
+This raises the synthetic IQ generator (already a Must item in Workstream A, §5) from a test fixture for our demodulator to a deliverable of its own, and adds a measurement study to the plan.
+
+### 22.2 Progress so far
+
+On `main`, with CI passing:
+- the core pipeline (decoder, track state, record/replay, synthetic traffic, live ingest from readsb);
+- the sequenced feed over kernel UDP with retransmit and snapshot recovery;
+- the WebSocket gateway serving the Fall 2025 map without a database;
+- overload semantics;
+- the shared-memory ring;
+- the conflated feed;
+- the TLA+ and GenMC models;
+- the before/after benchmark: frame → map in the browser about 1.1–1.6 s for the Fall 2025 system against about 70–90 ms for the new pipeline (median, laptop).
+
+In review:
+- io_uring and AF_XDP (copy mode) publisher transports;
+- deterministic simulation testing of the feed. Millions of seeded fault schedules found and fixed four recovery bugs in the subscriber.
+
+Not started: the demodulator and the IQ generator (A), A/B arbitration (B), hardware timestamps (§9.4), ITCH (J), and camera fusion (I).
+
+### 22.3 What MATLAB offers
+
+Nothing like the generator described above.
+
+| MATLAB resource | What it does | What it lacks |
+|---|---|---|
+| Communications Toolbox example *Airplane Tracking Using ADS-B Signals* (and its Simulink version) | Receives and decodes ADS-B from captured IQ or a live SDR (12 MS/s processing) | Receive side only; no traffic or channel simulation |
+| SoC Blockset example *HW/SW Co-Design Implementation of ADS-B Transmitter and Receiver* (AD9361/AD9364) | Generates one ADS-B waveform on an FPGA-based radio | One transmitter, no aircraft geometry, Doppler, or multipath; tied to that hardware |
+| General channel blocks (frequency offset, fading channels) | Building blocks that could be assembled by hand | No ADS-B scenario model |
+
+MATLAB is still useful to us as an **independent oracle**: its receiver example should decode the IQ files our generator writes (§22.4).
+
+### 22.4 IQ scenario generator (Workstream A)
+
+**Owner:** Role 1 (it extends the existing Must item "Synthetic IQ generator with ground truth"). Who builds which part is to be agreed in the team.
+
+**Scenario.** Reuse `adsb-synth`'s traffic and ground truth. Each aircraft has a position, altitude, velocity, transmit power class, and its own transmitter frequency model. The receiver has a location, an antenna pattern, and a model of its own impairments.
+
+**Signal chain per transmission:**
+
+| Effect | Model |
+|---|---|
+| Waveform | Mode S pulse-position modulation: 8 µs preamble, 56 or 112 bits of 1 µs, from the frames `adsb-synth` already encodes |
+| Geometry | Free-space path loss, propagation delay, elevation-dependent antenna gain |
+| **Doppler** | Shift from the radial velocity: up to about ±0.9 kHz at 250 m/s and ±1.1 kHz at 300 m/s, changing as an aircraft passes the receiver |
+| Transmitter frequency | Per-aircraft offset within the ±1 MHz tolerance, plus drift and jitter models (this feeds §22.5) |
+| Multipath | Two-ray ground reflection (delay and strength from the geometry) plus optional fixed reflectors such as buildings |
+| Atmosphere | Refraction (4/3-Earth radius) for the radio horizon, so aircraft fade out realistically; gaseous absorption is tiny at 1 GHz (under 0.01 dB/km) and rain is negligible at L band. Optional ducting for anomalous range |
+| Collisions | Overlapping replies from different aircraft add together, as in busy airspace (the main cause of lost messages) |
+| Receiver | Thermal noise, its own frequency error (ppm), 8-bit quantization and clipping, DC offset, IQ imbalance |
+
+**Outputs:**
+- IQ files in the common formats: `cu8` for RTL-SDR and readsb `--ifile`, `cs8`, `cs16` and `cf32`, at configurable rates (2.0, 2.4 and 12 MS/s and more);
+- **SigMF** metadata with per-message truth annotations: sample index, aircraft, SNR, frequency offset, and whether it collided.
+
+**Validation:**
+- readsb and the MATLAB receiver example both decode the files;
+- decode rates follow the truth (SNR, collisions);
+- our demodulator (§5) is scored against the same truth.
+
+**Safety and legality:** generated files may be played into an SDR receiver only **by cable through attenuators, or inside a shielded enclosure**. Transmitting on 1090 MHz over the air is illegal and could interfere with air traffic control.
+
+### 22.5 Transponder frequency-stability study
+
+**Question:** how far is each aircraft's transmitter from 1090 MHz, how much does it drift within a flight and between days, and does that depend on the aircraft or transponder type? The standard allows ±1 MHz (ITU-R M.2413). The only field measurement we found is a 1972 MIT Lincoln Laboratory study of about 550 transponders.
+
+**Method:**
+1. **Estimate the carrier frequency of every decoded message** from the IQ samples: phase slope across the pulses, refined with the known bit pattern once the message is decoded.
+2. **Subtract the Doppler**, computed from the aircraft's own decoded position and velocity. It is at most about 1 kHz, small next to the offsets but larger than the drift we want to see.
+3. **Subtract the receiver's own frequency error.** Use a GPS-disciplined SDR, or calibrate an RTL-SDR against a reference signal or the average over many aircraft.
+4. **Group the results:**
+   - by aircraft (ICAO address);
+   - by type, from a public aircraft database and the ADS-B emitter category;
+   - over time, within a flight and across days (Allan deviation).
+
+**Needs:**
+- a receiver sampling at 2.4 MS/s or more, so that offsets up to ±1 MHz stay in band;
+- long IQ recordings;
+- ideally a GPS-disciplined reference.
+
+**Before the hardware:** the generator (§22.4) tests the whole method on synthetic aircraft whose true offsets and drift we know.
+
+### 22.6 Hardware and data we still need
+
+| Need | For |
+|---|---|
+| Benchmark Linux host (≥ 8 cores, root, ideally Intel RDT) with a **hardware-timestamping NIC with AF_XDP zero-copy** (Intel i210/i226, X710 or E810), two if possible | Headline latency numbers, PTP, zero-copy AF_XDP, noisy-neighbor experiments |
+| **ADS-B receiver:** RTL-SDR (v4) with a 1090 MHz antenna, or a better SDR; ideally a **GPS-disciplined reference** | Real IQ recordings, demodulator sensitivity, the frequency study |
+| **OpenSky Network research access** | Real traffic for decoder agreement and large replays |
+| **Exchange data:** Nasdaq ITCH 5.0 files or pcaps | Workstream J |
 
 ---
 

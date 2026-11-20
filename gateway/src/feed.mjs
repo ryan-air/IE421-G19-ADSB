@@ -22,6 +22,7 @@ import {
   TrackUpdateSize,
   kEndOfSessionCount,
   kHeartbeatCount,
+  kMaxUdpPayload,
   kSessionLength,
 } from '../../protocol/generated/feed_messages.mjs';
 
@@ -280,9 +281,11 @@ function newStats() {
     gaps: 0,
     requests: 0,
     request_retries: 0,
+    truncated_replies: 0,
     naks: 0,
     snapshot_requests: 0,
     snapshots_loaded: 0,
+    sessions_confirmed: 0,
     snapshot_failures: 0,
     session_changes: 0,
     stale_packets: 0,
@@ -298,6 +301,9 @@ export class SubscriberCore {
     this.cfg.window = roundUpPow2(this.cfg.window);
     if (!(this.cfg.maxRequest >= 1)) this.cfg.maxRequest = 1;
     this.cfg.maxRequest = Math.min(this.cfg.maxRequest, 0xffff);
+    // Never ask for more than the window can buffer (C++ SubscriberCore:
+    // reordered reply packets past the window are thrown away).
+    this.cfg.maxRequest = Math.min(this.cfg.maxRequest, this.cfg.window);
     this.io = io;
     this.handler = handler;
     this.book = new FeedBook();
@@ -316,6 +322,7 @@ export class SubscriberCore {
     this.eosSeq = 0;
 
     this.reqActive = false;
+    this.reqFrom = 0;
     this.reqTo = 0;
     this.reqSentNs = 0;
     this.gapOpen = false;
@@ -323,7 +330,12 @@ export class SubscriberCore {
     this.snapDue = false;
     this.snapLastNs = -Infinity;
     this.snapAnchor = 0;
-    this.snapReqSession = '';
+    // Session changes so far, and their count when the last fetch was
+    // requested: an answer is current only if no change happened since (an
+    // id comparison misses a switch away and back).
+    this.sessionEpoch = 0;
+    this.snapReqEpoch = 0;
+    this.confirming = false; // live, but a session change awaits the server's word
 
     this.stats = newStats();
   }
@@ -353,6 +365,7 @@ export class SubscriberCore {
       this.stats.session_changes++;
     }
     this.unretire(s);
+    this.sessionEpoch++;
     this.session = s;
     this.hasSession = true;
     this.book.clear();
@@ -367,6 +380,7 @@ export class SubscriberCore {
     this.gapOpen = false;
     this.snapDue = false;
     this.snapAnchor = 0;
+    this.confirming = false;
     this.handler?.onReset?.();
   }
 
@@ -400,9 +414,19 @@ export class SubscriberCore {
         this.stats.stale_packets++;
         return;
       }
-      // The publisher (re)started. Joining at seq 1 needs nothing else.
+      // The publisher (re)started. Joining the first session at seq 1 needs
+      // nothing else. A *change* of session at seq 1 is confirmed with the
+      // snapshot server in the background, staying live (C++ SubscriberCore:
+      // a late packet of the old session can arrive after the new session's
+      // first packets; unconfirmed, the subscriber would stay on the dead one).
+      const change = this.hasSession;
       this.newSession(p.session);
-      if (p.seq !== 1) this.enterSnapshot();
+      if (p.seq !== 1) {
+        this.enterSnapshot();
+      } else if (change) {
+        this.confirming = true;
+        this.snapDue = true;
+      }
     }
 
     switch (p.kind) {
@@ -430,6 +454,21 @@ export class SubscriberCore {
         for (let i = 0; i < p.blocks.length; i++) {
           const [off, len] = p.blocks[i];
           this.accept(p.seq + i, buf.subarray(off, off + len));
+        }
+        // A reply packet with room for another message is the last of its
+        // answer; if it answered the current request and brought us exactly
+        // to its end without completing it, the server truncated the request:
+        // ask for the rest now, not after the timeout (C++ SubscriberCore).
+        if (
+          src === Source.kRetransmit &&
+          this.reqActive &&
+          this.expected < this.reqTo &&
+          p.seq >= this.reqFrom &&
+          this.expected === p.seq + p.count &&
+          buf.length + 2 + kMaxMessageBytes <= kMaxUdpPayload
+        ) {
+          this.reqTo = this.expected;
+          this.stats.truncated_replies++;
         }
         break;
     }
@@ -520,6 +559,7 @@ export class SubscriberCore {
     }
     this.io.sendRequest(this.session, this.expected, hi - this.expected);
     this.reqActive = true;
+    this.reqFrom = this.expected;
     this.reqTo = hi;
     this.reqSentNs = nowNs;
     this.stats.requests++;
@@ -533,11 +573,11 @@ export class SubscriberCore {
   // True when the caller should fetch a snapshot now (then call onSnapshot or
   // onSnapshotFailed). Rate-limited by snapshotRetryNs.
   takeSnapshotRequest(nowNs) {
-    if (this.mode !== Mode.kSnapshot) return false;
+    if (this.mode !== Mode.kSnapshot && !this.confirming) return false;
     if (!this.snapDue && nowNs - this.snapLastNs < this.cfg.snapshotRetryNs) return false;
     this.snapDue = false;
     this.snapLastNs = nowNs;
-    this.snapReqSession = this.session;
+    this.snapReqEpoch = this.sessionEpoch;
     this.stats.snapshot_requests++;
     return true;
   }
@@ -549,14 +589,26 @@ export class SubscriberCore {
 
   // snap: { session, asOfSeq, tracks: [Buffer(64)] } (SnapshotParser.data)
   onSnapshot(snap, nowNs) {
-    if (this.mode !== Mode.kSnapshot) return;
-    if (!this.hasSession || snap.session !== this.session) {
-      // Stale unless we asked from the current session: then the publisher is
-      // telling us its live session, and ours came from a stray packet.
-      if (this.isRetired(snap.session) && this.snapReqSession !== this.session) {
-        this.onSnapshotFailed(nowNs);
+    if (this.mode !== Mode.kSnapshot && !this.confirming) return; // not asked for
+    // An answer to a request made before a session change is stale whatever
+    // session it carries: a server that died since may have answered it, and
+    // a switch away and back makes the ids match again (C++ SubscriberCore).
+    if (this.hasSession && this.snapReqEpoch !== this.sessionEpoch) {
+      this.onSnapshotFailed(nowNs);
+      return;
+    }
+    if (this.mode !== Mode.kSnapshot) {
+      if (this.hasSession && snap.session === this.session) {
+        this.confirming = false; // the server agrees: keep our state
+        this.stats.sessions_confirmed++;
         return;
       }
+      // The server is in another session: adopt it, as below.
+    }
+    if (!this.hasSession || snap.session !== this.session) {
+      // Asked for from the current session (checked above), so the server
+      // -- the publisher -- is telling us its live session: ours came from a
+      // stray or late packet.
       this.newSession(snap.session);
       this.mode = Mode.kSnapshot;
     }
@@ -568,6 +620,7 @@ export class SubscriberCore {
       this.handler?.onSnapshotLoaded?.();
     }
     this.knownNext = Math.max(this.knownNext, snap.asOfSeq + 1);
+    this.confirming = false;
     this.mode = Mode.kLive;
     this.snapAnchor = 0;
     this.stats.snapshots_loaded++;

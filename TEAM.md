@@ -75,7 +75,7 @@ Plan §9.3–9.4, §10.2 and §12.
 | ~~Memory-model testing of the lock-free rings~~ **Done:** GenMC models of both rings with 20 mutants, `adsb-ring-stress` on x86 and ARM in CI, see `spec/memory-model/README.md` | Should | None | M |
 | ~~AF_XDP transport, publisher~~ **Done:** `--transport xdp` (copy, zero-copy, auto), tested over a veth pair in CI, see `core/README.md`. Still open: the subscriber's XDP redirect program, and zero-copy numbers on the benchmark NIC | Should | Zero-copy needs the NIC | L |
 | Hardware timestamps and PTP across two hosts | Should | Benchmark host and NIC | L |
-| ~~io_uring transport~~ **Done:** `--transport uring` on `adsb-publish` / `adsb-live`, `adsb-tx-bench`, see `core/README.md`; deterministic simulation testing | Could | None | M each |
+| ~~io_uring transport~~ **Done:** `--transport uring` on `adsb-publish` / `adsb-live`, `adsb-tx-bench`, see `core/README.md`; ~~deterministic simulation testing~~ **Done:** `adsb-dst`, per-push and nightly sweeps in CI, see `core/README.md` | Could | None | M each |
 
 Start with: `core/include/adsb/feed/`, `protocol/feed_spec.md`, `spec/`.
 

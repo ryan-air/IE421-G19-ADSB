@@ -164,13 +164,52 @@ TEST(Subscriber, RetriesAfterTheTimeoutFromWhereItGot) {
   ASSERT_EQ(f.io.reqs.size(), 1u);  // [2, 10)
   f.sub.poll(999);
   EXPECT_EQ(f.io.reqs.size(), 1u);
-  f.reply(packet(kS1, 2, 3), 500);  // partial: 2..4 (the rest of the reply was lost)
-  EXPECT_EQ(f.io.reqs.size(), 1u);
-  f.sub.poll(1000);
+  f.sub.poll(1000);                 // no answer at all: retried at the timeout
   ASSERT_EQ(f.io.reqs.size(), 2u);
-  EXPECT_EQ(f.io.reqs[1].seq, 5u);
-  EXPECT_EQ(f.io.reqs[1].count, 5u);
+  EXPECT_EQ(f.io.reqs[1].seq, 2u);
+  EXPECT_EQ(f.io.reqs[1].count, 8u);
   EXPECT_EQ(f.sub.stats().request_retries, 1u);
+  f.reply(packet(kS1, 2, 3), 1500);  // a short answer: 2..4 only
+  ASSERT_EQ(f.io.reqs.size(), 3u) << "the rest is asked for at once, not after another timeout";
+  EXPECT_EQ(f.io.reqs[2].seq, 5u);
+  EXPECT_EQ(f.io.reqs[2].count, 5u);
+  EXPECT_EQ(f.sub.stats().request_retries, 1u);
+  EXPECT_EQ(f.sub.stats().truncated_replies, 1u);
+}
+
+// The server fills reply packets; a short one is the last of its answer. A
+// truncated answer (server cap below our request) is followed up at once,
+// but neither a full packet nor a duplicate of an earlier answer triggers a
+// request (duplicates would otherwise feed a request storm).
+TEST(Subscriber, ATruncatedAnswerIsFollowedUpAtOnceButDuplicatesAreNot) {
+  SubscriberConfig cfg;
+  cfg.max_request = 100;
+  Fixture f(cfg);
+  f.feed(packet(kS1, 1, 1), 0);
+  f.feed(heartbeat(kS1, 101), 0);
+  ASSERT_EQ(f.io.reqs.size(), 1u);  // [2, 101)
+  f.reply(packet(kS1, 2, 22), 10);  // a full packet: the answer goes on
+  EXPECT_EQ(f.io.reqs.size(), 1u);
+  f.reply(packet(kS1, 24, 10), 20);  // short: the server stopped at 33 (its cap)
+  ASSERT_EQ(f.io.reqs.size(), 2u);
+  EXPECT_EQ(f.io.reqs[1].seq, 34u);
+  f.reply(packet(kS1, 24, 10), 30);  // the same answer again (duplicated on the way)
+  f.reply(packet(kS1, 2, 22), 30);
+  EXPECT_EQ(f.io.reqs.size(), 2u) << "duplicates of an earlier answer do not ask again";
+  f.reply(packet(kS1, 40, 5), 40);   // reordered: ahead of expected, not the end of an answer
+  EXPECT_EQ(f.io.reqs.size(), 2u);
+  EXPECT_EQ(f.sub.stats().truncated_replies, 1u);
+}
+
+TEST(Subscriber, NeverRequestsMoreThanTheWindowHolds) {
+  SubscriberConfig cfg;
+  cfg.window = 8;
+  cfg.max_request = 256;
+  Fixture f(cfg);
+  f.feed(packet(kS1, 1, 1));
+  f.feed(heartbeat(kS1, 1001));
+  ASSERT_EQ(f.io.reqs.size(), 1u);
+  EXPECT_EQ(f.io.reqs[0].count, 8u) << "reply packets past the window would be thrown away";
 }
 
 TEST(Subscriber, LargeGapIsRequestedInChunks) {
@@ -181,7 +220,10 @@ TEST(Subscriber, LargeGapIsRequestedInChunks) {
   f.feed(heartbeat(kS1, 1001));
   ASSERT_EQ(f.io.reqs.size(), 1u);
   EXPECT_EQ(f.io.reqs[0].count, 100u);
-  for (std::uint64_t q = 2; q < 102; q += 20) f.reply(packet(kS1, q, 20));
+  // Full reply packets (22 TrackUpdates each), as the server builds them.
+  for (std::uint64_t q = 2; q < 102; q += 22) {
+    f.reply(packet(kS1, q, static_cast<std::uint16_t>(std::min<std::uint64_t>(22, 102 - q))));
+  }
   ASSERT_EQ(f.io.reqs.size(), 2u) << "the next chunk is requested as soon as one completes";
   EXPECT_EQ(f.io.reqs[1].seq, 102u);
 }
@@ -288,6 +330,14 @@ TEST(Subscriber, PublisherRestartClearsTheBookAndDropsStalePackets) {
   EXPECT_EQ(f.sub.expected(), 4u);
   EXPECT_TRUE(f.sub.book() == reference(3)) << "nothing from the old session survives";
   EXPECT_EQ(f.h.resets, 2) << "first session, then the restart";
+  EXPECT_TRUE(f.sub.confirming()) << "a session change is confirmed with the server, in the background";
+  ASSERT_TRUE(f.sub.take_snapshot_request(0));
+  f.sub.on_snapshot(snapshot_as_of(kS2, 2), 0);  // the server agrees (its snapshot may lag)
+  EXPECT_FALSE(f.sub.confirming());
+  EXPECT_EQ(f.sub.expected(), 4u) << "a confirmation does not replace our state";
+  EXPECT_TRUE(f.sub.book() == reference(3));
+  EXPECT_EQ(f.sub.stats().sessions_confirmed, 1u);
+  EXPECT_EQ(f.h.snapshots, 0);
   f.feed(packet(kS1, 21, 5));  // delayed packet from the old session
   f.reply(packet(kS1, 21, 5));
   EXPECT_EQ(f.sub.session(), kS2);
@@ -327,6 +377,8 @@ TEST(Subscriber, PacketFromTwoSessionsAgoIsStale) {
   f.feed(packet(kS1, 1, 3));
   f.feed(packet(kS2, 1, 3));
   f.feed(packet(s3, 1, 3));
+  ASSERT_TRUE(f.sub.take_snapshot_request(0));  // confirms the change to s3
+  f.sub.on_snapshot(snapshot_as_of(s3, 3), 0);
   f.feed(packet(kS1, 4, 1));  // very late, from two sessions back
   f.feed(packet(kS2, 4, 1));
   EXPECT_EQ(f.sub.session(), s3);
@@ -352,6 +404,100 @@ TEST(Subscriber, StrayUnknownSessionIsUndoneByTheServersSnapshot) {
   EXPECT_TRUE(f.sub.book() == reference(5));
   f.feed(packet(junk, 78, 1));
   EXPECT_EQ(f.sub.session(), kS2) << "the stray session is now retired";
+}
+
+// Found by deterministic simulation (adsb-dst seed 71): around a restart, a
+// late packet of the old session can arrive after the first packets of the
+// new one. A subscriber that never saw the old session cannot tell it is
+// older (session ids are opaque) and switches to it; the live session is
+// then "retired" and its packets ignored forever. Every session change is
+// therefore confirmed with the snapshot server, which is the live publisher.
+TEST(Subscriber, LateOldSessionPacketAfterARestartIsUndoneByTheServersSnapshot) {
+  Fixture f;
+  f.feed(packet(kS2, 1, 3));                     // joins at the start of S2: no snapshot needed
+  EXPECT_EQ(f.sub.mode(), Mode::kLive);
+  EXPECT_EQ(f.sub.stats().snapshot_requests, 0u);
+  f.feed(heartbeat(kS1, 1, /*eos=*/true));       // S1's end marker, delayed past S2's start
+  ASSERT_EQ(f.sub.session(), kS1);
+  EXPECT_TRUE(f.sub.confirming()) << "a session change must be confirmed";
+  ASSERT_TRUE(f.sub.take_snapshot_request(0));
+  f.sub.on_snapshot(snapshot_as_of(kS2, 3), 0);  // the server: S2 is live
+  EXPECT_EQ(f.sub.session(), kS2);
+  EXPECT_EQ(f.sub.mode(), Mode::kLive);
+  f.feed(packet(kS2, 4, 2));
+  EXPECT_EQ(f.sub.expected(), 6u);
+  EXPECT_TRUE(f.sub.book() == reference(5));
+  f.feed(heartbeat(kS1, 1, true));
+  EXPECT_EQ(f.sub.session(), kS2) << "S1 is retired now";
+}
+
+// The confirmation runs in the background: while the server is busy (it
+// takes 16 snapshot clients; a restart makes every subscriber ask at once)
+// or gone (the publisher ended and exited), gaps are still recovered and the
+// end of the session is still reached.
+TEST(Subscriber, AnUnconfirmedSessionChangeStillRecoversAndEnds) {
+  Fixture f;
+  f.feed(packet(kS1, 1, 3));
+  f.feed(packet(kS2, 1, 2));
+  ASSERT_TRUE(f.sub.confirming());
+  ASSERT_TRUE(f.sub.take_snapshot_request(0));
+  f.sub.on_snapshot_failed(0);                   // refused
+  f.feed(packet(kS2, 5, 1), 1);                  // a gap: 3..4
+  ASSERT_EQ(f.io.reqs.size(), 1u) << "retransmit requests go out while unconfirmed";
+  EXPECT_EQ(f.io.reqs[0].seq, 3u);
+  f.reply(packet(kS2, 3, 2), 2);
+  f.feed(heartbeat(kS2, 6, /*eos=*/true), 3);
+  EXPECT_TRUE(f.sub.ended()) << "the end is reached without the confirmation";
+  EXPECT_TRUE(f.sub.book() == reference(5));
+  EXPECT_TRUE(f.sub.confirming());
+  EXPECT_FALSE(f.sub.take_snapshot_request(1)) << "retried only after snapshot_retry_ns";
+}
+
+// An async fetch (the gateway's) can be answered after a session change, by
+// a server that has died since: its session is unknown but not newer.
+TEST(Subscriber, ASnapshotRequestedBeforeASessionChangeIsNeverAdopted) {
+  const auto s3 = protocol::make_session("SESSION003");
+  Fixture f;
+  f.feed(packet(kS1, 50, 1));                    // late join to S1: snapshot mode
+  ASSERT_TRUE(f.sub.take_snapshot_request(0));   // asked in S1
+  f.feed(packet(s3, 1, 2));                      // S3 begins (change at seq 1: live, confirming)
+  ASSERT_EQ(f.sub.session(), s3);
+  f.sub.on_snapshot(snapshot_as_of(kS2, 9), 0);  // the answer: S2's server, gone by now
+  EXPECT_EQ(f.sub.session(), s3) << "never adopted: it was asked for in S1";
+  EXPECT_EQ(f.sub.expected(), 3u);
+  EXPECT_EQ(f.sub.stats().snapshot_failures, 1u);
+  ASSERT_TRUE(f.sub.take_snapshot_request(0)) << "the confirmation is asked for again at once";
+  f.sub.on_snapshot(snapshot_as_of(s3, 2), 0);
+  EXPECT_FALSE(f.sub.confirming());
+  EXPECT_EQ(f.sub.session(), s3);
+}
+
+// Found by deterministic simulation (adsb-dst seed 40013996): two quick
+// restarts; the subscriber, still fetching S1's snapshot, sees S3's packets
+// first, then a late packet of S2 (which it never saw) and moves to S2,
+// retiring S3. The S1-era fetch is then answered by S2's server, which has
+// died since. It carries the session the subscriber is now in, but was asked
+// for before two session changes: rejected, and the next fetch, answered by
+// the live server, brings the subscriber to S3.
+TEST(Subscriber, AStaleAnswerIsRejectedEvenWhenItMatchesTheCurrentSession) {
+  const auto s3 = protocol::make_session("SESSION003");
+  Fixture f;
+  f.feed(packet(kS1, 50, 1));                   // late join to S1: snapshot mode
+  ASSERT_TRUE(f.sub.take_snapshot_request(0));  // asked in S1
+  f.feed(heartbeat(s3, 2, true));               // S3's end of session (one message)
+  ASSERT_EQ(f.sub.session(), s3);
+  f.feed(packet(kS2, 2, 1));                    // late, from the session between
+  ASSERT_EQ(f.sub.session(), kS2);
+  f.sub.on_snapshot(snapshot_as_of(kS2, 4), 0);  // the S1-era fetch, answered by S2's server
+  EXPECT_EQ(f.sub.mode(), Mode::kSnapshot) << "not loaded: asked for two session changes ago";
+  EXPECT_EQ(f.sub.stats().snapshot_failures, 1u);
+  ASSERT_TRUE(f.sub.take_snapshot_request(0)) << "asked again at once";
+  f.sub.on_snapshot(snapshot_as_of(s3, 1), 0);  // the live server
+  EXPECT_EQ(f.sub.session(), s3);
+  EXPECT_EQ(f.sub.mode(), Mode::kLive);
+  f.feed(heartbeat(s3, 2, true));
+  EXPECT_TRUE(f.sub.ended());
+  EXPECT_TRUE(f.sub.book() == reference(1));
 }
 
 TEST(Subscriber, SnapshotRequestedBeforeARestartIsRejected) {

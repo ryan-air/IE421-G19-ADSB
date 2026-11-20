@@ -95,12 +95,41 @@ test('retries after the timeout from where it got', () => {
   assert.equal(f.reqs.length, 1);
   f.sub.poll(999);
   assert.equal(f.reqs.length, 1);
-  f.reply(packet(S1, 2, 3), 500);
-  assert.equal(f.reqs.length, 1);
-  f.sub.poll(1000);
+  f.sub.poll(1000); // no answer at all: retried at the timeout
   assert.equal(f.reqs.length, 2);
-  assert.deepEqual(f.reqs[1], { session: S1, seq: 5, count: 5 });
+  assert.deepEqual(f.reqs[1], { session: S1, seq: 2, count: 8 });
   assert.equal(f.sub.stats.request_retries, 1);
+  f.reply(packet(S1, 2, 3), 1500); // a short answer: the rest at once
+  assert.equal(f.reqs.length, 3);
+  assert.deepEqual(f.reqs[2], { session: S1, seq: 5, count: 5 });
+  assert.equal(f.sub.stats.request_retries, 1);
+  assert.equal(f.sub.stats.truncated_replies, 1);
+});
+
+test('a truncated answer is followed up at once but duplicates are not', () => {
+  const f = new Fixture({ maxRequest: 100 });
+  f.feed(packet(S1, 1, 1), 0);
+  f.feed(heartbeat(S1, 101), 0);
+  assert.equal(f.reqs.length, 1);
+  f.reply(packet(S1, 2, 22), 10); // full packet
+  assert.equal(f.reqs.length, 1);
+  f.reply(packet(S1, 24, 10), 20); // short: the server stopped at 33
+  assert.equal(f.reqs.length, 2);
+  assert.equal(f.reqs[1].seq, 34);
+  f.reply(packet(S1, 24, 10), 30); // duplicates of the earlier answer
+  f.reply(packet(S1, 2, 22), 30);
+  assert.equal(f.reqs.length, 2);
+  f.reply(packet(S1, 40, 5), 40); // reordered, ahead of expected
+  assert.equal(f.reqs.length, 2);
+  assert.equal(f.sub.stats.truncated_replies, 1);
+});
+
+test('never requests more than the window holds', () => {
+  const f = new Fixture({ window: 8, maxRequest: 256 });
+  f.feed(packet(S1, 1, 1));
+  f.feed(heartbeat(S1, 1001));
+  assert.equal(f.reqs.length, 1);
+  assert.equal(f.reqs[0].count, 8);
 });
 
 test('large gap is requested in chunks', () => {
@@ -109,7 +138,8 @@ test('large gap is requested in chunks', () => {
   f.feed(heartbeat(S1, 1001));
   assert.equal(f.reqs.length, 1);
   assert.equal(f.reqs[0].count, 100);
-  for (let q = 2; q < 102; q += 20) f.reply(packet(S1, q, 20));
+  // Full reply packets (22 TrackUpdates each), as the server builds them.
+  for (let q = 2; q < 102; q += 22) f.reply(packet(S1, q, Math.min(22, 102 - q)));
   assert.equal(f.reqs.length, 2);
   assert.equal(f.reqs[1].seq, 102);
 });
@@ -211,6 +241,14 @@ test('publisher restart clears the book and drops stale packets', () => {
   assert.equal(f.sub.expected, 4);
   assert.ok(f.bookIs(3));
   assert.equal(f.resets, 2);
+  assert.ok(f.sub.confirming, 'a session change is confirmed with the server, in the background');
+  assert.ok(f.sub.takeSnapshotRequest(0));
+  f.sub.onSnapshot(snapshotAsOf(S2, 2), 0);
+  assert.equal(f.sub.confirming, false);
+  assert.equal(f.sub.expected, 4, 'a confirmation does not replace our state');
+  assert.ok(f.bookIs(3));
+  assert.equal(f.sub.stats.sessions_confirmed, 1);
+  assert.equal(f.snapshots, 0);
   f.feed(packet(S1, 21, 5));
   f.reply(packet(S1, 21, 5));
   assert.equal(f.sub.session, S2);
@@ -260,6 +298,8 @@ test('packet from two sessions ago is stale', () => {
   f.feed(packet(S1, 1, 3));
   f.feed(packet(S2, 1, 3));
   f.feed(packet(S3, 1, 3));
+  assert.ok(f.sub.takeSnapshotRequest(0)); // confirms the change to S3
+  f.sub.onSnapshot(snapshotAsOf(S3, 3), 0);
   f.feed(packet(S1, 4, 1));
   f.feed(packet(S2, 4, 1));
   assert.equal(f.sub.session, S3);
@@ -267,6 +307,46 @@ test('packet from two sessions ago is stale', () => {
   assert.equal(f.sub.stats.stale_packets, 2);
   f.feed(packet(S3, 4, 1));
   assert.equal(f.sub.expected, 5);
+});
+
+// Found by deterministic simulation of the C++ SubscriberCore (adsb-dst seed
+// 71): a late packet of the old session, arriving after the new session's
+// first packets, must not leave the subscriber on the dead session.
+test("a late old-session packet after a restart is undone by the server's snapshot", () => {
+  const f = new Fixture();
+  f.feed(packet(S2, 1, 3));
+  assert.equal(f.sub.mode, Mode.kLive);
+  assert.equal(f.sub.stats.snapshot_requests, 0);
+  f.feed(heartbeat(S1, 1, true));
+  assert.equal(f.sub.session, S1);
+  assert.ok(f.sub.confirming, 'a session change must be confirmed');
+  assert.ok(f.sub.takeSnapshotRequest(0));
+  f.sub.onSnapshot(snapshotAsOf(S2, 3), 0);
+  assert.equal(f.sub.session, S2);
+  assert.equal(f.sub.mode, Mode.kLive);
+  f.feed(packet(S2, 4, 2));
+  assert.equal(f.sub.expected, 6);
+  assert.ok(f.bookIs(5));
+  f.feed(heartbeat(S1, 1, true));
+  assert.equal(f.sub.session, S2, 'S1 is retired now');
+});
+
+test('an unconfirmed session change still recovers and ends', () => {
+  const f = new Fixture();
+  f.feed(packet(S1, 1, 3));
+  f.feed(packet(S2, 1, 2));
+  assert.ok(f.sub.confirming);
+  assert.ok(f.sub.takeSnapshotRequest(0));
+  f.sub.onSnapshotFailed(0);
+  f.feed(packet(S2, 5, 1), 1);
+  assert.equal(f.reqs.length, 1, 'retransmit requests go out while unconfirmed');
+  assert.equal(f.reqs[0].seq, 3);
+  f.reply(packet(S2, 3, 2), 2);
+  f.feed(heartbeat(S2, 6, true), 3);
+  assert.ok(f.sub.ended, 'the end is reached without the confirmation');
+  assert.ok(f.bookIs(5));
+  assert.ok(f.sub.confirming);
+  assert.equal(f.sub.takeSnapshotRequest(1), false);
 });
 
 test("stray unknown session is undone by the server's snapshot", () => {
@@ -285,6 +365,46 @@ test("stray unknown session is undone by the server's snapshot", () => {
   assert.ok(f.bookIs(5));
   f.feed(packet(junk, 78, 1));
   assert.equal(f.sub.session, S2);
+});
+
+test('a snapshot requested before a session change is never adopted', () => {
+  const f = new Fixture();
+  f.feed(packet(S1, 50, 1));
+  assert.ok(f.sub.takeSnapshotRequest(0));
+  f.feed(packet(S3, 1, 2));
+  assert.equal(f.sub.session, S3);
+  f.sub.onSnapshot(snapshotAsOf(S2, 9), 0);
+  assert.equal(f.sub.session, S3, 'never adopted: it was asked for in S1');
+  assert.equal(f.sub.expected, 3);
+  assert.equal(f.sub.stats.snapshot_failures, 1);
+  assert.ok(f.sub.takeSnapshotRequest(0));
+  f.sub.onSnapshot(snapshotAsOf(S3, 2), 0);
+  assert.equal(f.sub.confirming, false);
+  assert.equal(f.sub.session, S3);
+});
+
+// Found by deterministic simulation of the C++ SubscriberCore (adsb-dst seed
+// 40013996): S1 -> S3 (newest packets first) -> S2 (a late packet of the
+// session between); the S1-era fetch, answered by S2's dead server, matches
+// the current session but is stale.
+test('a stale answer is rejected even when it matches the current session', () => {
+  const f = new Fixture();
+  f.feed(packet(S1, 50, 1));
+  assert.ok(f.sub.takeSnapshotRequest(0));
+  f.feed(heartbeat(S3, 2, true));
+  assert.equal(f.sub.session, S3);
+  f.feed(packet(S2, 2, 1));
+  assert.equal(f.sub.session, S2);
+  f.sub.onSnapshot(snapshotAsOf(S2, 4), 0);
+  assert.equal(f.sub.mode, Mode.kSnapshot, 'not loaded: asked for two session changes ago');
+  assert.equal(f.sub.stats.snapshot_failures, 1);
+  assert.ok(f.sub.takeSnapshotRequest(0));
+  f.sub.onSnapshot(snapshotAsOf(S3, 1), 0);
+  assert.equal(f.sub.session, S3);
+  assert.equal(f.sub.mode, Mode.kLive);
+  f.feed(heartbeat(S3, 2, true));
+  assert.ok(f.sub.ended);
+  assert.equal(f.sub.book.hexDigest(), reference(1).hexDigest());
 });
 
 test('snapshot requested before a restart is rejected', () => {

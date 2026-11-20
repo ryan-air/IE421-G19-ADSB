@@ -23,6 +23,7 @@ set(ADSB_TEST_SOURCES
   test_conflate.cpp
   test_shm_ring.cpp
   test_uring.cpp
+  test_dst.cpp
 )
 
 add_executable(adsb_tests ${ADSB_TEST_SOURCES})

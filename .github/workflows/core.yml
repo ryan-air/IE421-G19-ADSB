@@ -467,3 +467,30 @@ jobs:
           sudo ip -n rx link set vb1 up
           sudo build/xdp/tools/adsb-tx-bench --transport kernel,xdp --interface 10.12.0.1 --dest 10.12.0.2 \
             --rx-netns rx --xdp-mode copy --seconds 2 --rounds 2
+
+  dst:
+    name: deterministic simulation (seed sweep, GCC and Clang must agree)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 clang-18
+      - name: Build (GCC and Clang)
+        run: |
+          CXX=g++-14 cmake -S . -B build/dst-gcc -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/dst-gcc --target adsb-dst
+          CXX=clang++-18 cmake -S . -B build/dst-clang -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/dst-clang --target adsb-dst
+      # New seeds on every run (the start depends on the run number), the
+      # same seeds for both compilers. A failure prints the seed, its world
+      # and the replay command. Equal sweep hashes: a seed is the same run
+      # whichever compiler built it.
+      - name: Sweep
+        run: |
+          START=$(( ${{ github.run_number }} * 1000000 ))
+          build/dst-gcc/tools/adsb-dst --seeds 40000 --start $START | tee gcc.txt
+          build/dst-clang/tools/adsb-dst --seeds 40000 --start $START | tee clang.txt
+          test "$(grep '^sweep hash' gcc.txt)" = "$(grep '^sweep hash' clang.txt)"

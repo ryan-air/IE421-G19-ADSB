@@ -18,9 +18,13 @@
 //                 messages <= S, apply the contiguous rest
 //
 // Beyond the model: sessions. A packet from an unknown session means the
-// publisher restarted: the book is cleared, and unless the packet starts at
-// sequence 1 (state "as of 0" is empty) a snapshot is taken. Late packets
-// from the previous session are dropped.
+// publisher restarted: the book is cleared and, unless the packet starts at
+// sequence 1 (state "as of 0" is empty), a snapshot is taken. A change of
+// session at sequence 1 is confirmed with the snapshot server in the
+// background (confirming()), while the subscriber stays live: a late packet
+// of the old session can arrive after the new session's first packets, and
+// opaque ids cannot tell which is newer; the server, the live publisher,
+// can. Late packets from sessions already left are dropped.
 //
 // SubscriberClient wraps the core with real sockets: the feed (multicast or
 // unicast UDP), a unicast UDP socket for retransmit requests and replies, and
@@ -48,7 +52,7 @@ namespace adsb::feed {
 struct SubscriberConfig {
   static constexpr std::uint32_t kMaxWindow = 1u << 20;  // ~84 MB of buffer
   std::uint32_t window = 1u << 14;                   // messages buffered ahead of `expected` (rounded up to a power of two, at most kMaxWindow)
-  std::uint16_t max_request = 1024;                  // messages per retransmit request
+  std::uint16_t max_request = 1024;                  // messages per retransmit request (at most `window`)
   std::uint64_t retransmit_timeout_ns = 10'000'000;  // re-request after this long without progress
   std::uint64_t snapshot_retry_ns = 500'000'000;     // retry a failed snapshot after this long
 };
@@ -66,9 +70,11 @@ struct SubscriberStats {
   std::uint64_t gaps = 0;               // times a new gap was detected
   std::uint64_t requests = 0;
   std::uint64_t request_retries = 0;    // re-sent after the timeout
+  std::uint64_t truncated_replies = 0;  // answer ended short of the request: the rest asked at once
   std::uint64_t naks = 0;
   std::uint64_t snapshot_requests = 0;
   std::uint64_t snapshots_loaded = 0;
+  std::uint64_t sessions_confirmed = 0; // the server's snapshot agreed with a session change
   std::uint64_t snapshot_failures = 0;
   std::uint64_t session_changes = 0;
   std::uint64_t stale_packets = 0;      // previous session, or a reply for another session
@@ -126,6 +132,9 @@ class SubscriberCore {
     return eos_ && mode_ == Mode::kLive && expected_ >= eos_seq_;
   }
   [[nodiscard]] bool request_outstanding() const noexcept { return req_active_; }
+  // A change of session waits for the snapshot server's confirmation
+  // (take_snapshot_request() asks for it; the subscriber stays live).
+  [[nodiscard]] bool confirming() const noexcept { return confirm_; }
   [[nodiscard]] const SubscriberStats& stats() const noexcept { return stats_; }
 
  private:
@@ -169,15 +178,21 @@ class SubscriberCore {
   std::uint64_t eos_seq_ = 0;
 
   bool req_active_ = false;
+  std::uint64_t req_from_ = 0;  // first message of the outstanding request
   std::uint64_t req_to_ = 0;
   std::uint64_t req_sent_ns_ = 0;
 
   bool gap_open_ = false;
 
   bool snap_due_ = false;              // fetch as soon as possible
+  bool confirm_ = false;               // live, but the session change awaits the server's word
   std::uint64_t snap_last_ns_ = 0;     // time of the last fetch attempt
   std::uint64_t snap_anchor_ = 0;      // first seq buffered in snapshot mode (0 = none yet)
-  protocol::Session snap_req_session_{};  // session we were in when the last fetch was requested
+  // Session changes so far, and their count when the last fetch was
+  // requested: an answer is current only if no change happened since (an
+  // id comparison misses a switch away and back).
+  std::uint64_t session_epoch_ = 0;
+  std::uint64_t snap_req_epoch_ = 0;
 
   SubscriberStats stats_;
 };

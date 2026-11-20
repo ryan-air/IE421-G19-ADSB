@@ -130,7 +130,8 @@ A subscriber buffers what arrives ahead of `expected` (16,384 messages by defaul
 | `seq < expected < seq + count` | Overlap: skip the first `expected − seq` messages, apply the rest |
 | `seq > expected` | Gap: buffer this packet. Send a `RetransmitRequest` for `[expected, seq)`; if the server no longer holds that range, take a snapshot |
 | Heartbeat with `seq > expected` | Gap at the tail: request `[expected, seq)` |
-| New `session` | Discard state. If the packet starts at `seq` 1, nothing else is needed (the state as of 0 is empty); otherwise take a snapshot |
+| New `session` | Discard state. If the packet starts at `seq` 1, nothing else is needed for the data (the state as of 0 is empty); otherwise take a snapshot. A *change* of session at `seq` 1 is also confirmed with the snapshot server in the background, staying live meanwhile: around a restart a late packet of the old session can arrive after the new session's first packets, and session ids are opaque, so without the check a subscriber could switch to the dead session and drop the live one as stale. The snapshot server is the live publisher: if its snapshot is of another session, the subscriber switches to that one (found by deterministic simulation, `core/include/adsb/feed/dst.hpp`) |
+| Snapshot answer | Use it only if no change of session happened since it was requested; otherwise it is stale whatever session it carries (it may come from a server that has died since, and after a switch away and back the session can even match). A snapshot of another session that passes this check is adopted with its session: the server is the live publisher |
 | Packet from the previous session (after the switch) | Stale (UDP reordering): drop |
 | End of session | Like a heartbeat: recover any gap before it. The session is complete once every message before its `seq` is applied |
 | Retransmit reply (data) | Same as a multicast data packet |

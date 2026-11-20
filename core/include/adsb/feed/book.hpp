@@ -60,6 +60,13 @@ class FeedBook {
   [[nodiscard]] std::array<std::uint8_t, 32> state_digest() const;
   [[nodiscard]] std::string hex_state_digest() const;
 
+  // A fast 64-bit fingerprint, independent of insertion order: the sum of
+  // track_fingerprint() over every track. Not cryptographic; it lets the
+  // deterministic simulation compare books after every step (digest() sorts
+  // and hashes everything). Equal books always have equal fingerprints.
+  [[nodiscard]] std::uint64_t fingerprint() const noexcept;
+  [[nodiscard]] static std::uint64_t track_fingerprint(const protocol::TrackUpdate& u) noexcept;
+
   [[nodiscard]] bool operator==(const FeedBook& other) const;
 
  private:

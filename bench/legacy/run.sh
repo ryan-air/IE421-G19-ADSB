@@ -12,7 +12,8 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-RESULTS="$ROOT/bench/results/legacy-baseline"
+# RESULTS_DIR: where the summary goes (bench/lab/run.sh points it at its run).
+RESULTS="${RESULTS_DIR:-$ROOT/bench/results/legacy-baseline}"
 cd "$HERE"
 REF="${FALL2025_REF:-fall2025-final}"
 # Extract the original code into fall2025/ (gitignored, recreated every run).

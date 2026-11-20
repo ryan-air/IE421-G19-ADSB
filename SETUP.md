@@ -186,7 +186,7 @@ Then open http://127.0.0.1:8080/. Tests: `cd gateway && node --test test/*.test.
 bench/legacy/run.sh
 ```
 
-It takes about 20 minutes and needs about 2 GB of free disk.
+It takes about 20 minutes and needs about 2 GB of free disk. On the benchmark host, `bench/lab/run.sh` runs this together with every other benchmark and collects the results in one directory ([bench/lab/README.md](bench/lab/README.md)).
 
 ---
 

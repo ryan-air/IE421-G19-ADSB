@@ -73,7 +73,7 @@ Plan §9.3–9.4, §10.2 and §12.
 | ~~Shared-memory broadcast ring (same-host IPC); target p99 < 500 ns~~ **Done:** p99 209 ns at 100 k msg/s on the laptop, see `core/README.md` | Should | None | M |
 | ~~Conflated feed: latest state per aircraft at about 10 Hz; the gateway subscribes to it~~ **Done:** `--conflate` on `adsb-live` / `adsb-publish`; point the gateway's `--feed` at it | Should | None | M |
 | ~~Memory-model testing of the lock-free rings~~ **Done:** GenMC models of both rings with 20 mutants, `adsb-ring-stress` on x86 and ARM in CI, see `spec/memory-model/README.md` | Should | None | M |
-| ~~AF_XDP transport~~ **Done, both sides:** publisher `--transport xdp`; subscriber `--rx xdp` (an XDP program, loaded without libbpf, redirects the feed into an XSK: send → recv p50 1.13 µs vs 1.71 µs through the kernel socket, veth copy mode); tested over a veth pair in CI, see `core/README.md`. Still open: zero-copy numbers on a NIC that supports it (perhaps the lab machine) | Should | Zero-copy needs the NIC | L |
+| ~~AF_XDP transport~~ **Done, both sides:** publisher `--transport xdp`; subscriber `--rx xdp` (an XDP program, loaded without libbpf, redirects the feed into an XSK: send → recv p50 1.13 µs vs 1.71 µs through the kernel socket, veth copy mode); tested over a veth pair in CI, see `core/README.md`. Still open: zero-copy numbers on a NIC that supports it (perhaps the lab machine: `bench/lab/run.sh --steps xdp`, see `bench/lab/README.md`) | Should | Zero-copy needs the NIC | L |
 | Hardware timestamps and PTP across two hosts | Should | Benchmark host and NIC | L |
 | ~~io_uring transport~~ **Done:** `--transport uring` on `adsb-publish` / `adsb-live`, `adsb-tx-bench`, see `core/README.md`; ~~deterministic simulation testing~~ **Done:** `adsb-dst`, per-push and nightly sweeps in CI, see `core/README.md` | Could | None | M each |
 
@@ -85,7 +85,7 @@ Most of this waits for the benchmark host. Until then, anyone with spare time ca
 
 | Item | Tier | Hardware | Size |
 |---|---|---|---|
-| Set up and tune the benchmark host (`core/scripts/tune-host.sh`); rerun every benchmark there (laptop tail latencies are unreliable) | Must | Benchmark host | M |
+| Set up and tune the benchmark host (`core/scripts/tune-host.sh`); rerun every benchmark there (laptop tail latencies are unreliable). The whole suite is one command: `bench/lab/run.sh` (see `bench/lab/README.md`) | Must | Benchmark host | M |
 | Full benchmark report: 10,000-aircraft load, tail analysis (explain every p99.9 outlier class), PGO and ablation table | Must | Benchmark host | L |
 | Fold the gateway's map shim into `ads/app.js` (the Fall 2025 code may now be edited; the benchmark measures the tag `fall2025-final`), fix the map tiles' API key, update `README.md` and `PROJECT_REPORT.md` | Should | None | S–M |
 | Noisy-neighbor isolation matrix (CAT/MBA) | Should | A CPU with RDT | M |

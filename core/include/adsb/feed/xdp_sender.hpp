@@ -30,10 +30,9 @@
 // loopback copy, so subscribers on the publishing host receive nothing
 // (they use the shared-memory ring). Needs CAP_NET_RAW.
 //
-// Publisher side only: subscribers receive with recv(). The subscriber side
-// of the plan (an XDP program redirecting the feed port into an XSK) is not
-// built. Linux only (ADSB_HAVE_AF_XDP); elsewhere open() fails with a
-// message. The frame builder below is portable and tested everywhere.
+// Publisher side; the subscriber side is XdpReceiver (xdp_receiver.hpp).
+// Linux only (ADSB_HAVE_AF_XDP); elsewhere open() fails with a message. The
+// frame builder below is portable and tested everywhere.
 
 #include <array>
 #include <cstddef>

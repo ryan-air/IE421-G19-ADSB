@@ -383,7 +383,26 @@ bool SubscriberClient::open(std::string* error) {
   feed_fd_ = open_feed_receiver(cfg_.feed, cfg_.interface_host, cfg_.rcvbuf, error);
   if (feed_fd_ < 0) return false;
   req_fd_ = open_udp("0.0.0.0", 0, cfg_.rcvbuf, error);
-  return req_fd_ >= 0;
+  if (req_fd_ < 0) return false;
+  if (cfg_.rx == SubscriberClientConfig::Rx::kXdp) {
+    XdpReceiver::Options o = cfg_.xdp;
+    if (o.interface_host.empty()) o.interface_host = cfg_.interface_host;
+    if (o.interface_host.empty() || o.interface_host == "0.0.0.0") {
+      if (error) *error = "AF_XDP reception needs the receiving device's address (--interface)";
+      return false;
+    }
+    // The program matches the port the kernel socket is bound to (the
+    // configured one, or the one picked for port 0).
+    Endpoint feed = cfg_.feed;
+    feed.port = local_port(feed_fd_);
+    if (!xdp_.open(feed, o, error)) return false;
+  }
+  return true;
+}
+
+void SubscriberClient::on_feed(std::span<const std::uint8_t> dgram) {
+  if (loss_.drop()) return;
+  core_.on_datagram(dgram, SubscriberCore::Source::kFeed, mono_ns());
 }
 
 void SubscriberClient::send_request(const protocol::RetransmitRequest& req) {
@@ -404,19 +423,21 @@ void SubscriberClient::handle_snapshot(std::uint64_t now) {
 }
 
 void SubscriberClient::run(const std::atomic<bool>& stop, bool stop_at_end) {
-  pollfd fds[2] = {{feed_fd_, POLLIN, 0}, {req_fd_, POLLIN, 0}};
+  // A negative fd is ignored by poll(): the XSK slot is unused without AF_XDP.
+  pollfd fds[3] = {{feed_fd_, POLLIN, 0}, {req_fd_, POLLIN, 0}, {xdp_.fd(), POLLIN, 0}};
   std::uint8_t buf[2048];
-  constexpr int kMaxPerPass = 256;  // interleave the two sockets under load
+  constexpr int kMaxPerPass = 256;  // interleave the sockets under load
+  auto from_xsk = [this](std::span<const std::uint8_t> p) { on_feed(p); };
   while (!stop.load(std::memory_order_relaxed)) {
     if (stop_at_end && core_.ended()) break;
-    const int rc = ::poll(fds, 2, 1);
+    const int rc = ::poll(fds, 3, 1);
     if (rc > 0) {
+      if (xdp_.is_open()) (void)xdp_.receive(from_xsk, kMaxPerPass);
       for (int i = 0; i < kMaxPerPass; ++i) {
         const ssize_t n = ::recv(feed_fd_, buf, sizeof buf, 0);
         if (n < 0) break;
-        if (loss_.drop()) continue;
-        core_.on_datagram(std::span<const std::uint8_t>(buf, static_cast<std::size_t>(n)),
-                          SubscriberCore::Source::kFeed, mono_ns());
+        ++via_kernel_;
+        on_feed(std::span<const std::uint8_t>(buf, static_cast<std::size_t>(n)));
       }
       for (int i = 0; i < kMaxPerPass; ++i) {
         sockaddr_in from{};

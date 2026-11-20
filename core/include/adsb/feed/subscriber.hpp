@@ -43,6 +43,7 @@
 
 #include "adsb/feed/book.hpp"
 #include "adsb/feed/net.hpp"
+#include "adsb/feed/xdp_receiver.hpp"
 #include "adsb/feed/publisher.hpp"
 #include "adsb/feed/snapshot.hpp"
 #include "adsb/protocol/moldudp64.hpp"
@@ -208,6 +209,14 @@ struct SubscriberClientConfig {
   std::uint32_t snapshot_timeout_ms = 3000;
   LossConfig feed_loss;  // fault injection on received feed datagrams
   SubscriberConfig core;
+  // Feed reception: the kernel socket, or AF_XDP (xdp_receiver.hpp: an XDP
+  // program redirects the feed into an XSK). With AF_XDP the kernel socket
+  // stays open: it holds the group membership (the NIC's multicast filter)
+  // and receives feed frames the program passes on (another queue, IP
+  // options, fragments). Retransmit replies always use the kernel.
+  enum class Rx : std::uint8_t { kKernel, kXdp };
+  Rx rx = Rx::kKernel;
+  XdpReceiver::Options xdp;  // empty interface_host = interface_host above
 };
 
 class SubscriberClient : private SubscriberIo {
@@ -229,6 +238,11 @@ class SubscriberClient : private SubscriberIo {
   [[nodiscard]] SubscriberCore& core() noexcept { return core_; }
   [[nodiscard]] const SubscriberCore& core() const noexcept { return core_; }
   [[nodiscard]] std::uint64_t feed_dropped() const noexcept { return loss_.dropped(); }
+  // Feed datagrams by path (before fault injection).
+  [[nodiscard]] std::uint64_t feed_via_kernel() const noexcept { return via_kernel_; }
+  [[nodiscard]] std::uint64_t feed_via_xdp() const noexcept { return xdp_.stats().received; }
+  [[nodiscard]] XdpReceiver& xdp() noexcept { return xdp_; }
+  [[nodiscard]] const XdpReceiver& xdp() const noexcept { return xdp_; }
   [[nodiscard]] const std::string& last_snapshot_error() const noexcept { return snap_error_; }
 
   // Fetches one snapshot over TCP (blocking, with timeouts).
@@ -238,12 +252,15 @@ class SubscriberClient : private SubscriberIo {
  private:
   void send_request(const protocol::RetransmitRequest& req) override;
   void handle_snapshot(std::uint64_t now);
+  void on_feed(std::span<const std::uint8_t> dgram);
 
   SubscriberClientConfig cfg_;
   SubscriberCore core_;
   LossInjector loss_;
+  XdpReceiver xdp_;
   int feed_fd_ = -1;
   int req_fd_ = -1;
+  std::uint64_t via_kernel_ = 0;
   sockaddr_in rtx_addr_{};
   std::string snap_error_;
 };

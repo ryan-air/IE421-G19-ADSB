@@ -168,7 +168,7 @@ Both print a `book digest` line at the end, and they must be identical. To publi
 
 ### The map, fed by the gateway
 
-`gateway/` subscribes to the feed and pushes it to browsers over WebSockets. It serves the Fall 2025 map from `ads/` (unmodified) with no database. It needs Node 22 and has no dependencies. From the repository root:
+`gateway/` subscribes to the feed and pushes it to browsers over WebSockets. It serves the map from `ads/` with no database; the page takes the live feed over the WebSocket. It needs Node 22 and has no dependencies. From the repository root:
 
 ```bash
 core/build/release/tools/adsb-synth -o /tmp/demo.adsbrec --aircraft 150 --duration 900 --receiver 41.88,-87.63

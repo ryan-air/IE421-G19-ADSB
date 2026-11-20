@@ -30,7 +30,7 @@ MATCH_WINDOW_S = 60.0   # source frame must have been sent within this long befo
 WARMUP_S = 20.0         # ignore the first seconds of each run (tracks still forming)
 POLL_S = 2.0            # the Fall 2025 map polls /api/aircraft every 2 s (ads/app.js)
 STALL_MS = 1.0          # core-replay release lag p99 above this: the host paused the VM, tails unreliable
-RENDER_S = 0.100        # the new map renders at most every 100 ms after a frame (gateway/public/map-shim.js)
+RENDER_S = 0.100        # the new map renders at most every 100 ms after a frame (the live feed in ads/app.js)
 FRAME_S = 1 / 60        # ...on the next animation frame
 RX_LATENCY_NS = 1_650_000  # generator: tx -> record rx (1.5 ms fixed + 0.15 ms mean jitter)
 EARTH_M_PER_DEG = 111_320.0
@@ -262,7 +262,7 @@ def after(d, rng):
             if lat:
                 a["falling_behind"] = {"first_quarter_ms": float(np.median(lat[:q])),
                                        "last_quarter_ms": float(np.median(lat[-q:]))}
-    # Browser: WebSocket arrival, then the shim renders within RENDER_S, on an animation frame.
+    # Browser: WebSocket arrival, then the map renders within RENDER_S, on an animation frame.
     wait = lambda n: (rng.uniform(0, RENDER_S, size=n) + rng.uniform(0, FRAME_S, size=n)) * 1000  # noqa: E731
     browser = (ws_lat[:, None] + wait(ws_lat.size * 16).reshape(ws_lat.size, 16)).ravel() \
         if ws_lat.size else np.array([])

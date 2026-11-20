@@ -12,7 +12,7 @@ import { test } from 'node:test';
 
 import { FrameFlags, FrameKind, TrackTable, decodeFrame } from '../public/gateway_protocol.mjs';
 import { bookDigest } from '../src/feed.mjs';
-import { Gateway, injectShim } from '../src/gateway.mjs';
+import { Gateway } from '../src/gateway.mjs';
 import { NetPublisher, RawClient, maskedFrame, sleep, waitFor } from './net_fixture.mjs';
 import { Rng, S1, S2, trackDelete, trackUpdate } from './helpers.mjs';
 
@@ -440,14 +440,15 @@ test('Fall 2025 REST endpoints are served from memory', async () => {
   }
 });
 
-test('static files: shim injected, dotfiles and traversal refused', async () => {
+test('static files: served as they are, dotfiles and traversal refused', async () => {
   const { port, cleanup } = await setup();
   try {
     const index = await get(port, '/');
     assert.equal(index.status, 200);
-    assert.match(index.body, /app\.js"><\/script>\n<script src="\/gateway\/map-shim.js"><\/script>\n<\/body>/);
+    // The page is served unchanged: app.js itself takes the live feed.
+    assert.doesNotMatch(index.body, /map-shim/);
     assert.equal((await get(port, '/app.js')).status, 200);
-    assert.equal((await get(port, '/gateway/map-shim.js')).status, 200);
+    assert.equal((await get(port, '/gateway/map-shim.js')).status, 404);
     assert.equal((await get(port, '/gateway/gateway_protocol.mjs')).status, 200);
     // Each target exists and has a served file type, so only the path rules stop it.
     for (const bad of ['/.env', '/%2eenv', '/.hidden.json', '/%2ehidden.json', '/../secret.json', '/%2e%2e/secret.json', '/..%2fsecret.json', '/%2e%2e%5csecret.json', '/x.exe', '/%E0%A4%A']) {
@@ -460,7 +461,3 @@ test('static files: shim injected, dotfiles and traversal refused', async () => 
   }
 });
 
-test('injectShim places the script before </body>, or appends it', () => {
-  assert.equal(injectShim('<body>x</body>'), '<body>x<script src="/gateway/map-shim.js"></script>\n</body>');
-  assert.equal(injectShim('x'), 'x<script src="/gateway/map-shim.js"></script>\n');
-});

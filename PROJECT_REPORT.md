@@ -1,8 +1,8 @@
 # ADS-B Aircraft Tracking System - Technical Project Report
 
-> ⚠️ **To be updated:** This document describes the Fall 2025 system and needs to be updated for the current project extension. See [README_UPDATES.md](README_UPDATES.md) for the new plan.
+> **The Fall 2025 report.** This is the technical report of the system this project extends, kept as it was (apart from this note). The current project is described in [README.md](README.md) and [README_UPDATES.md](README_UPDATES.md); its measurements are in [bench/results/](bench/results/), and its own report comes with the benchmark-host results.
 
-**Authors:** Saksham Gupta & Apoorv Sagar Pitta *(To be updated)*  
+**Authors:** Saksham Gupta & Apoorv Sagar Pitta  
 **Course:** IE 421 - University of Illinois Urbana-Champaign  
 **Advisor:** Professor David Lariviere  
 **Date:** December 2025

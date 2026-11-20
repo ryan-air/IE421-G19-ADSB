@@ -4,6 +4,7 @@
 //   adsb-feed-cli [--feed 239.19.0.1:41900] [--interface ADDR]
 //                 [--retransmit HOST:PORT] [--snapshot HOST:PORT]
 //                 [--until-end] [--duration S] [--drop-rate P] ...
+//                 [--rx kernel|xdp] [--xdp-queue N] [--xdp-mode M] [--xdp-attach A]
 //
 // The last line printed is the digest of the reconstructed book; after a
 // complete session it equals the publisher's "book digest" line.
@@ -45,6 +46,14 @@ void on_signal(int) { g_stop.store(true); }
                "  --drop-burst N          datagrams per drop burst (default 1)\n"
                "  --seed N                fault injection seed (default 1)\n"
                "  --drop-only-first N     inject only into the first N feed datagrams\n"
+               "  --rx kernel|xdp         feed reception: kernel socket (default) or AF_XDP (an XDP program\n"
+               "                          redirects the feed into an XSK on --interface's device; needs\n"
+               "                          CAP_NET_ADMIN, CAP_BPF, CAP_NET_RAW; while it runs no other local\n"
+               "                          socket on that device receives the feed: one per device)\n"
+               "  --xdp-queue N           with --rx xdp: the device RX queue to bind (default 0)\n"
+               "  --xdp-mode M            with --rx xdp: auto, copy or zerocopy (default auto)\n"
+               "  --xdp-attach A          with --rx xdp: auto, driver or generic (default auto)\n"
+               "  --xdp-frames N          with --rx xdp: UMEM frames, power of two (default 2048)\n"
                "  --quiet                 only the final report\n");
   std::exit(code);
 }
@@ -115,7 +124,7 @@ class Report : public SubscriberHandler {
 int main(int argc, char** argv) {
   SubscriberClientConfig cfg;
   double duration_s = 0.0, stats_every_s = 0.0;
-  bool until_end = false, quiet = false;
+  bool until_end = false, quiet = false, xdp_flags = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto val = [&]() -> std::string {
@@ -143,10 +152,33 @@ int main(int argc, char** argv) {
     else if (a == "--drop-burst") cfg.feed_loss.drop_burst = static_cast<std::uint32_t>(parse_u64(val()));
     else if (a == "--seed") cfg.feed_loss.seed = parse_u64(val());
     else if (a == "--drop-only-first") cfg.feed_loss.only_first = parse_u64(val());
+    else if (a == "--rx") {
+      const std::string v = val();
+      if (v == "kernel") cfg.rx = SubscriberClientConfig::Rx::kKernel;
+      else if (v == "xdp") cfg.rx = SubscriberClientConfig::Rx::kXdp;
+      else usage(1);
+    } else if (a.rfind("--xdp-", 0) == 0) {
+      xdp_flags = true;
+      if (a == "--xdp-queue") {
+        const std::uint64_t q = parse_u64(val());
+        if (q > 1023) usage(1);
+        cfg.xdp.queue = static_cast<unsigned>(q);
+      } else if (a == "--xdp-mode") { if (!XdpSender::parse_mode(val(), cfg.xdp.mode)) usage(1); }
+      else if (a == "--xdp-attach") { if (!XdpReceiver::parse_attach(val(), cfg.xdp.attach)) usage(1); }
+      else if (a == "--xdp-frames") {
+        const std::uint64_t n = parse_u64(val());
+        if (n < 64 || n > 65536) usage(1);
+        cfg.xdp.frames = static_cast<unsigned>(n);
+      } else usage(1);
+    }
     else if (a == "--quiet") quiet = true;
     else { std::fprintf(stderr, "adsb-feed-cli: unknown option %s\n", a.c_str()); usage(1); }
   }
 
+  if (cfg.rx != SubscriberClientConfig::Rx::kXdp && xdp_flags) {
+    std::fprintf(stderr, "adsb-feed-cli: --xdp-* options need --rx xdp\n");
+    return 1;
+  }
   SubscriberClient client(cfg);
   std::string err;
   if (!client.open(&err)) {
@@ -160,6 +192,11 @@ int main(int argc, char** argv) {
   if (!quiet) {
     std::printf("listening   feed %s  retransmit %s  snapshot %s\n", to_string(cfg.feed).c_str(),
                 to_string(cfg.retransmit).c_str(), to_string(cfg.snapshot).c_str());
+    if (client.xdp().is_open()) {
+      const XdpReceiver& x = client.xdp();
+      std::printf("af_xdp      %s queue %u, %s mode, program attached in %s mode\n", x.device().name.c_str(),
+                  cfg.xdp.queue, XdpSender::mode_name(x.bound_mode()), XdpReceiver::attach_name(x.attach_mode()));
+    }
     std::fflush(stdout);
   }
 
@@ -192,6 +229,20 @@ int main(int argc, char** argv) {
               "(%llu failed), %llu session changes, %llu stale\n",
               u(s.gaps), u(s.requests), u(s.request_retries), u(s.naks), u(s.snapshots_loaded),
               u(s.snapshot_failures), u(s.session_changes), u(s.stale_packets));
+  if (client.xdp().is_open()) {
+    XdpReceiver& x = client.xdp();
+    x.refresh_kernel_stats();
+    const auto& xs = x.stats();
+    std::printf("rx          af_xdp %llu, kernel %llu feed datagrams; af_xdp %s/%s: %llu rejected, %llu wakeups, "
+                "kernel drops %llu (ring full %llu, fill empty %llu, invalid %llu)\n",
+                u(client.feed_via_xdp()), u(client.feed_via_kernel()), XdpSender::mode_name(x.bound_mode()),
+                XdpReceiver::attach_name(x.attach_mode()), u(xs.rejected), u(xs.wakeups), u(xs.rx_dropped),
+                u(xs.rx_ring_full), u(xs.rx_fill_ring_empty), u(xs.rx_invalid));
+    if (client.feed_via_xdp() == 0 && client.feed_via_kernel() > 0) {
+      std::printf("warning     no feed datagram came through AF_XDP: on a multi-queue NIC the feed may land on a "
+                  "queue other than %u (steer it there with ethtool -N, or pick that queue)\n", cfg.xdp.queue);
+    }
+  }
   if (!client.last_snapshot_error().empty()) {
     std::printf("snapshot    last error: %s\n", client.last_snapshot_error().c_str());
   }

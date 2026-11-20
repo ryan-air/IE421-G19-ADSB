@@ -58,6 +58,7 @@ add_library(adsb_core STATIC
   src/feed/shm_subscriber.cpp
   src/feed/uring_sender.cpp
   src/feed/xdp_sender.cpp
+  src/feed/xdp_receiver.cpp
   src/record/recording.cpp
   src/sim/synth.cpp
 )
@@ -91,25 +92,31 @@ endif()
 target_compile_definitions(adsb_core PUBLIC ADSB_HAVE_IO_URING=${ADSB_HAVE_IO_URING})
 message(STATUS "adsb: io_uring transport ${ADSB_HAVE_IO_URING} (ADSB_IO_URING=${ADSB_IO_URING})")
 
-# AF_XDP feed transport (§9.3): Linux kernel headers only (no libbpf/libxdp:
-# the publisher is TX-only and needs no XDP program). AUTO builds it when
-# <linux/if_xdp.h> has what it uses (kernel 5.4+ headers); ON makes that an
-# error; OFF compiles the stub (XdpSender::built() == false).
+# AF_XDP feed transport (§9.3): Linux kernel headers only, no libbpf/libxdp
+# (the subscriber's XDP program is built as eBPF instructions and loaded with
+# the bpf() syscall). AUTO builds it when <linux/if_xdp.h> and <linux/bpf.h>
+# have what it uses (kernel 5.9+ headers: XSKMAP, BPF links); ON makes that
+# an error; OFF compiles the stubs (XdpSender/XdpReceiver::built() == false).
 set(ADSB_AF_XDP AUTO CACHE STRING "AF_XDP transport: AUTO, ON, OFF")
 set(ADSB_HAVE_AF_XDP 0)
 if(NOT ADSB_AF_XDP STREQUAL "OFF" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   include(CheckCXXSourceCompiles)
   check_cxx_source_compiles([=[
+    #include <linux/bpf.h>
+    #include <linux/if_link.h>
     #include <linux/if_xdp.h>
-    int main() { xdp_statistics s{}; xdp_options o{}; return XDP_USE_NEED_WAKEUP + XDP_OPTIONS_ZEROCOPY
-                 + XDP_RING_NEED_WAKEUP + static_cast<int>(s.tx_invalid_descs + o.flags); }
+    int main() { xdp_statistics s{}; xdp_options o{}; bpf_attr a{}; a.link_create.target_ifindex = 1;
+                 return XDP_USE_NEED_WAKEUP + XDP_OPTIONS_ZEROCOPY + XDP_RING_NEED_WAKEUP
+                 + static_cast<int>(s.tx_invalid_descs + s.rx_ring_full + o.flags) + BPF_MAP_TYPE_XSKMAP
+                 + BPF_LINK_CREATE + BPF_XDP + XDP_FLAGS_DRV_MODE + XDP_FLAGS_SKB_MODE
+                 + static_cast<int>(a.link_create.target_ifindex); }
   ]=] ADSB_IF_XDP_HEADER_OK)
   if(ADSB_IF_XDP_HEADER_OK)
     set(ADSB_HAVE_AF_XDP 1)
   endif()
 endif()
 if(ADSB_AF_XDP STREQUAL "ON" AND NOT ADSB_HAVE_AF_XDP)
-  message(FATAL_ERROR "ADSB_AF_XDP=ON but <linux/if_xdp.h> (kernel 5.4+ headers) was not found")
+  message(FATAL_ERROR "ADSB_AF_XDP=ON but <linux/if_xdp.h> / <linux/bpf.h> (kernel 5.9+ headers) were not found")
 endif()
 target_compile_definitions(adsb_core PUBLIC ADSB_HAVE_AF_XDP=${ADSB_HAVE_AF_XDP})
 message(STATUS "adsb: AF_XDP transport ${ADSB_HAVE_AF_XDP} (ADSB_AF_XDP=${ADSB_AF_XDP})")

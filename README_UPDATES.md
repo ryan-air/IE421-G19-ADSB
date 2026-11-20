@@ -24,10 +24,10 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 > - the conflated feed (§10.2): latest state per aircraft at a fixed rate on its own group, with its own recovery; after every tick its book equals the main feed's by state.
 > - memory-model testing of both lock-free rings (§12): GenMC model checking with mutants, plus stress runs on x86 and ARM in CI; it found a lap-resume bug, fixed.
 > - the io_uring transport (§9.3): publisher sends through io_uring with SQPOLL, no syscall per datagram; the hot thread's send call p50 208 ns against 1,459 ns for `sendto()` (laptop VM), at the cost of a polling core.
-> - the AF_XDP transport, publisher side (§9.3): our own Ethernet/IPv4/UDP frames on an XSK TX ring, copy or zero-copy; in copy mode over a veth pair it matches kernel UDP (send call p50 750 ns both), so the gain waits for a zero-copy NIC.
+> - the AF_XDP transport (§9.3), both sides: the publisher writes our own Ethernet/IPv4/UDP frames on an XSK TX ring (in copy mode over a veth pair it matches kernel UDP, send call p50 750 ns both); the subscriber attaches a small XDP program (built without libbpf) that redirects the feed into an XSK, which takes the send → receive median from 1.71 µs to 1.13 µs even in copy mode.
 > - deterministic simulation testing (§12): the real publisher, recovery side and subscribers on a simulated network and clock, a random world per seed, invariants after every step; hundreds of thousands of seeds pass, 40,000 new ones per CI run and a nightly sweep. It found four subscriber defects (two ways a subscriber could end up permanently on a dead session after a restart, and two recovery-throughput problems), fixed in C++ and JS.
 >
-> Not started: the AF_XDP subscriber side (XDP redirect program), AF_XDP zero-copy numbers, hardware timestamps (§9.3–9.4), the arbiter (B), the demodulator (A), and fusion (I).
+> Not started: AF_XDP zero-copy numbers (need a NIC that supports it), hardware timestamps (§9.4, on hold), the arbiter (B), the demodulator (A), and fusion (I).
 
 > **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed, and own the whole path from **antenna to published decision**. We demodulate the radio samples ourselves, merge redundant A/B receiver lines, decode and maintain state on a lock-free pinned-core pipeline, and publish over kernel UDP, io_uring, AF_XDP, or shared memory. Every segment is measured in cycles and nanoseconds against hardware timestamps. We then show that the same infrastructure handles a real exchange feed (**Nasdaq ITCH 5.0**) at tens of millions of messages per second.
 
@@ -322,7 +322,7 @@ Other message types: `TrackDelete` (16 B), `FusionMatch` / `UnidentifiedObject` 
 |---|---|
 | **Kernel UDP** | `sendmsg`/`recvmmsg` with `SO_BUSY_POLL`. This is the baseline. |
 | **io_uring** | `IORING_SETUP_SQPOLL`, so a kernel thread polls submissions and no syscall is made per packet. Registered socket; a fixed buffer pool (registered buffers only pay off for zero-copy sends, which cost more than a copy for datagrams this small). Built: `--transport uring`, see `core/README.md`. |
-| **AF_XDP** | Publisher: an XSK socket in TX mode, building Ethernet, IPv4, and UDP headers ourselves (multicast MAC `01:00:5e` plus the low 23 bits of the group address). Subscriber: a small XDP/eBPF program redirects our UDP port into the XSK map and passes everything else to the kernel. **Zero-copy needs driver support** (Intel `igc` / `i40e` / `ice`, Mellanox `mlx5`). The Pi 5's NIC runs in copy mode only, and we report both. Built (publisher side): `--transport xdp`, raw `<linux/if_xdp.h>` (no XDP program needed for TX), copy/zero-copy/auto; copy mode over veth measured equal to kernel UDP, see `core/README.md`. |
+| **AF_XDP** | Publisher: an XSK socket in TX mode, building Ethernet, IPv4, and UDP headers ourselves (multicast MAC `01:00:5e` plus the low 23 bits of the group address). Subscriber: a small XDP/eBPF program redirects our UDP port into the XSK map and passes everything else to the kernel. **Zero-copy needs driver support** (Intel `igc` / `i40e` / `ice`, Mellanox `mlx5`). The Pi 5's NIC runs in copy mode only, and we report both. Built, both sides: publisher `--transport xdp`, raw `<linux/if_xdp.h>`, copy/zero-copy/auto, copy mode over veth equal to kernel UDP; subscriber `--rx xdp`, the redirect program as eBPF instructions loaded with `bpf()` and attached through a BPF link, send → receive p50 1.13 µs against 1.71 µs through the kernel socket (veth, copy mode). See `core/README.md`. |
 | **Shared-memory broadcast ring** | For subscribers on the same host: a single-producer, multi-consumer log on `/dev/shm` backed by huge pages (Aeron / LMAX Disruptor style). Each consumer keeps its own cursor. A consumer that falls a full lap behind detects it from the sequence number and recovers from a snapshot. |
 
 ### 9.4 Hardware timestamps and clock sync
@@ -508,7 +508,6 @@ group_19_project/
 │   ├── CMakeLists.txt
 │   ├── include/adsb/         #   spsc_ring, shm_ring, clock, histogram, iq, demod, arbiter, beast, modes, cpr, track_table, feed
 │   ├── src/                  #   ingest/, demod/, arbiter/, decode/, state/, publish/, transports/{udp,uring,xdp,shm}/, recovery/, conflate/
-│   ├── bpf/                  #   XDP redirect program for AF_XDP subscribers
 │   ├── tools/                #   iq-recorder, frame-recorder, replayer, loadgen, feed-cli
 │   ├── tests/  fuzz/  bench/
 │   └── scripts/              #   tune-host.sh, ptp-setup.sh, resctrl-setup.sh
@@ -535,7 +534,7 @@ group_19_project/
 | Language | C++20 (GCC ≥ 12 / Clang ≥ 15), `-O3 -march=native`, LTO, **profile-guided optimization** for benchmark builds |
 | Build | CMake + Ninja. Presets: `debug-asan`, `tsan`, `release`, `bench`, `bench-pgo`, `naive-baseline` |
 | SDR | librtlsdr; readsb (oracle and baseline) |
-| Kernel interfaces | liburing, libxdp / libbpf, `SO_TIMESTAMPING`, `resctrl` |
+| Kernel interfaces | liburing; AF_XDP and eBPF through raw syscalls (`<linux/if_xdp.h>`, `bpf()`), no libxdp / libbpf; `SO_TIMESTAMPING`, `resctrl` |
 | Time sync | linuxptp (`ptp4l`, `phc2sys`), chrony |
 | Testing | GoogleTest, Google Benchmark, libFuzzer, ASan, UBSan, TSan |
 | Formal methods | TLA+ with TLC; GenMC |
@@ -638,7 +637,7 @@ On `main`, with CI passing:
 - the conflated feed;
 - the TLA+ and GenMC models;
 - the before/after benchmark: frame → map in the browser about 1.1–1.6 s for the Fall 2025 system against about 70–90 ms for the new pipeline (median, laptop);
-- io_uring and AF_XDP (copy mode) publisher transports;
+- io_uring and AF_XDP transports (AF_XDP on both the publishing and the receiving side, copy mode);
 - deterministic simulation testing of the feed. Millions of seeded fault schedules found and fixed four recovery bugs in the subscriber.
 
 Not started: the demodulator and the IQ generator (A), A/B arbitration (B), hardware timestamps (§9.4), ITCH (J), and camera fusion (I).

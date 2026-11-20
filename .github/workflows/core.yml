@@ -416,7 +416,7 @@ jobs:
         run: build/uring/tools/adsb-tx-bench --seconds 2 --rounds 2
 
   xdp:
-    name: AF_XDP feed transport (unit tests, feed and overload suites over a veth pair)
+    name: AF_XDP feed transport (publisher and subscriber; unit tests, feed and overload suites over a veth pair)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -434,7 +434,9 @@ jobs:
       # Both ends in this namespace: frames sent on veth0 arrive on veth1.
       # accept_local: the source address is local; the ARP entry lets unicast
       # find veth1's MAC. File capabilities instead of sudo, so the build
-      # tree stays the runner's.
+      # tree stays the runner's: CAP_NET_RAW for XSK sockets, plus
+      # CAP_NET_ADMIN and CAP_BPF where the subscriber side loads and
+      # attaches its XDP program.
       - name: veth pair and capabilities
         run: |
           sudo ip link add veth0 type veth peer name veth1
@@ -444,7 +446,8 @@ jobs:
           sudo ip link set veth1 up
           sudo sysctl -w net.ipv4.conf.all.accept_local=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.veth1.rp_filter=0
           sudo ip neigh replace 10.11.0.2 lladdr "$(cat /sys/class/net/veth1/address)" dev veth0 nud permanent
-          sudo setcap cap_net_raw+ep build/xdp/tests/adsb_xdp_tests
+          sudo setcap cap_net_raw,cap_net_admin,cap_bpf+ep build/xdp/tests/adsb_xdp_tests
+          sudo setcap cap_net_raw,cap_net_admin,cap_bpf+ep build/xdp/tools/adsb-feed-cli
           for t in adsb-publish adsb-live; do sudo setcap cap_net_raw+ep build/xdp/tools/$t; done
       - name: Unit tests (must run, not skip)
         run: |
@@ -452,11 +455,15 @@ jobs:
           ! grep -q "Skipped" xdp-tests.txt
       - name: Feed suite over AF_XDP (loss, snapshots, late join, restart)
         run: FEED_TRANSPORT=xdp FEED_IFACE=10.11.0.1 FEED_SUB_IFACE=10.11.0.2 scripts/check-feed.sh build/xdp
+      # The subscribers receive through AF_XDP too: every feed datagram must
+      # come out of the XSK, none through the kernel socket.
+      - name: Feed suite over AF_XDP both ways (subscriber side redirects with XDP)
+        run: FEED_TRANSPORT=xdp FEED_RX=xdp FEED_IFACE=10.11.0.1 FEED_SUB_IFACE=10.11.0.2 scripts/check-feed.sh build/xdp
       - name: Overload suite with adsb-live on AF_XDP
         run: FEED_TRANSPORT=xdp OVL_FEED_HOST=10.11.0.2 OVL_PUB_IFACE=10.11.0.1 scripts/check-overload.sh build/xdp
       # For the log only: GitHub's shared runners are not a latency host. The
       # receiver gets its own namespace so kernel UDP crosses the veth too.
-      - name: TX bench over veth (kernel vs AF_XDP copy mode)
+      - name: Bench over veth (kernel vs AF_XDP copy mode, sending and receiving)
         run: |
           sudo ip link add vb0 type veth peer name vb1
           sudo ip netns add rx
@@ -465,7 +472,7 @@ jobs:
           sudo ip -n rx addr add 10.12.0.2/24 dev vb1
           sudo ip link set vb0 up
           sudo ip -n rx link set vb1 up
-          sudo build/xdp/tools/adsb-tx-bench --transport kernel,xdp --interface 10.12.0.1 --dest 10.12.0.2 \
+          sudo build/xdp/tools/adsb-tx-bench --transport kernel,xdp --rx all --interface 10.12.0.1 --dest 10.12.0.2 \
             --rx-netns rx --xdp-mode copy --seconds 2 --rounds 2
 
   dst:

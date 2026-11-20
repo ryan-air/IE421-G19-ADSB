@@ -27,7 +27,12 @@
 # descriptors and 0 failed kicks), FEED_SUB_IFACE (the subscribers' interface,
 # default FEED_IFACE; AF_XDP frames leave through the device and never loop
 # back, so run it over a veth pair: FEED_IFACE = this end's address,
-# FEED_SUB_IFACE = the far end's). Exits nonzero if any check fails.
+# FEED_SUB_IFACE = the far end's), FEED_RX (the subscribers' reception:
+# kernel (default) or xdp: an XDP program on FEED_SUB_IFACE's device takes
+# every feed frame there, so only one subscriber per device can use it: A and
+# R receive over AF_XDP and must get every feed datagram that way (none
+# through the kernel socket), and B and C are skipped). Exits nonzero if any
+# check fails.
 
 set -uo pipefail
 BUILD="${1:?usage: check-feed.sh BUILD_DIR}"
@@ -51,6 +56,11 @@ digest() { grep -E '^book digest' "$1" | awk '{print $3}'; }
 field() { grep -E "^$2" "$1" | head -1; }
 
 TRANSPORT="${FEED_TRANSPORT:-kernel}"
+RX="${FEED_RX:-kernel}"
+# With AF_XDP reception A also drops some datagrams after the XSK (fault
+# injection applies to both paths) and must recover them.
+A_EXTRA=()
+[[ $RX == xdp ]] && A_EXTRA=(--drop-rate 0.002 --seed 5)
 PUB_COMMON=(--feed "$GROUP:$PORT" --interface "$IFACE" --retransmit-port "$RTX" --snapshot-port "$SNAP"
             --bind 127.0.0.1 --no-flush --no-publish-ts --heartbeat-ms 50 --transport "$TRANSPORT")
 SUB_COMMON=(--feed "$GROUP:$PORT" --interface "$SUB_IFACE" --retransmit "127.0.0.1:$RTX"
@@ -61,21 +71,27 @@ echo "== scenario 1: loss, small ring, late join =="
 "$T/adsb-replay" "$W/a.adsbrec" --no-flush --book-digest > "$W/replay.txt" || exit 2
 D0=$(digest "$W/replay.txt")
 
-"$T/adsb-feed-cli" "${SUB_COMMON[@]}" --until-end --duration 40 > "$W/A.txt" &
+"$T/adsb-feed-cli" "${SUB_COMMON[@]}" --rx "$RX" ${A_EXTRA[@]+"${A_EXTRA[@]}"} --until-end --duration 40 > "$W/A.txt" &
 PA=$!
-"$T/adsb-feed-cli" "${SUB_COMMON[@]}" --until-end --duration 40 --drop-rate 0.0002 --drop-burst 4000 --drop-only-first 25000 --seed 3 > "$W/B.txt" &
-PB=$!
+if [[ $RX == kernel ]]; then
+  "$T/adsb-feed-cli" "${SUB_COMMON[@]}" --until-end --duration 40 --drop-rate 0.0002 --drop-burst 4000 --drop-only-first 25000 --seed 3 > "$W/B.txt" &
+  PB=$!
+fi
 sleep 0.5
 "$T/adsb-publish" "$W/a.adsbrec" "${PUB_COMMON[@]}" --session RUNA000001 --speed 15 --ring 2048 \
     --drop-rate 0.01 --drop-burst 3 --reply-drop-rate 0.05 --linger 4 > "$W/P.txt" &
 PP=$!
 sleep 1.5
-"$T/adsb-feed-cli" "${SUB_COMMON[@]}" --until-end --duration 40 > "$W/C.txt" &
-PC=$!
+if [[ $RX == kernel ]]; then
+  "$T/adsb-feed-cli" "${SUB_COMMON[@]}" --until-end --duration 40 > "$W/C.txt" &
+  PC=$!
+fi
 wait $PP; RP=$?
 wait $PA; RA=$?
-wait $PB; RB=$?
-wait $PC; RC=$?
+if [[ $RX == kernel ]]; then
+  wait $PB; RB=$?
+  wait $PC; RC=$?
+fi
 
 DP=$(digest "$W/P.txt")
 snapshots() { field "$1" recovery | sed -E 's/.* ([0-9]+) snapshots loaded.*/\1/'; }
@@ -85,16 +101,33 @@ check "publisher book == deterministic replay ($DP)"            '[[ -n "$DP" && 
 check "A ended and recovered ($RA)"                             '[[ $RA == 0 ]]'
 check "A book == publisher"                                     '[[ "$(digest "$W/A.txt")" == "$DP" ]]'
 check "A recovered gaps by retransmit ($(requests "$W/A.txt") requests)" '(( $(requests "$W/A.txt") > 0 ))'
+if [[ $RX == kernel ]]; then
 check "B ended and recovered ($RB)"                             '[[ $RB == 0 ]]'
 check "B book == publisher"                                     '[[ "$(digest "$W/B.txt")" == "$DP" ]]'
 check "B needed snapshots ($(snapshots "$W/B.txt"))"            '(( $(snapshots "$W/B.txt") >= 1 ))'
 check "C (late joiner) ended and recovered ($RC)"               '[[ $RC == 0 ]]'
 check "C book == publisher"                                     '[[ "$(digest "$W/C.txt")" == "$DP" ]]'
 check "C joined by snapshot ($(snapshots "$W/C.txt"))"          '(( $(snapshots "$W/C.txt") >= 1 ))'
+else
+  # One AF_XDP subscriber per device, so B's snapshot recovery runs on its
+  # own, against a second run of the same publisher: its datagrams wait in
+  # the XSK's ring while the blocking snapshot fetch runs.
+  echo "== scenario 1b (AF_XDP reception): B alone, snapshot recovery =="
+  "$T/adsb-feed-cli" "${SUB_COMMON[@]}" --rx xdp --until-end --duration 40 --drop-rate 0.0002 --drop-burst 4000 --drop-only-first 25000 --seed 3 > "$W/B.txt" &
+  PB=$!
+  sleep 0.5
+  "$T/adsb-publish" "$W/a.adsbrec" "${PUB_COMMON[@]}" --session RUNA000002 --speed 15 --ring 2048 \
+      --drop-rate 0.01 --drop-burst 3 --reply-drop-rate 0.05 --linger 4 > "$W/P1b.txt"
+  wait $PB; RB=$?
+  check "B ended and recovered over AF_XDP ($RB)"                 '[[ $RB == 0 ]]'
+  check "B book == publisher"                                     '[[ "$(digest "$W/B.txt")" == "$(digest "$W/P1b.txt")" ]]'
+  check "B needed snapshots ($(snapshots "$W/B.txt"))"            '(( $(snapshots "$W/B.txt") >= 1 ))'
+  echo "SKIP  C (one AF_XDP subscriber per device: A and B cover live and snapshot recovery)"
+fi
 
 echo "== scenario 2: publisher restart =="
 "$T/adsb-synth" -o "$W/b.adsbrec" --aircraft 120 --duration 20 --seed 8 > /dev/null || exit 2
-"$T/adsb-feed-cli" "${SUB_COMMON[@]}" --duration 12 > "$W/R.txt" &
+"$T/adsb-feed-cli" "${SUB_COMMON[@]}" --rx "$RX" --duration 12 > "$W/R.txt" &
 PR=$!
 sleep 0.5
 "$T/adsb-publish" "$W/a.adsbrec" "${PUB_COMMON[@]}" --session RUNB000001 --speed 30 --linger 0.5 > "$W/P1.txt"
@@ -122,7 +155,22 @@ elif [[ $TRANSPORT != kernel ]]; then
   done
 fi
 
+if [[ $RX == xdp ]]; then
+  echo "== AF_XDP reception =="
+  for f in A B R; do
+    line=$(grep '^rx ' "$W/$f.txt")
+    xdp=$(sed -E 's/^rx +af_xdp ([0-9]+),.*/\1/' <<<"$line")
+    kern=$(sed -E 's/^rx +af_xdp [0-9]+, kernel ([0-9]+) .*/\1/' <<<"$line")
+    check "subscriber $f received the feed through AF_XDP ($xdp datagrams, $kern through the kernel)" \
+      '[[ -n "$line" ]] && (( xdp > 1000 && kern == 0 ))'
+    check "subscriber $f: no AF_XDP frames rejected or dropped by the kernel" \
+      'grep -q " 0 rejected" <<<"$line" && grep -q "kernel drops 0 " <<<"$line"'
+  done
+  injected=$(field "$W/A.txt" received | sed -E 's/.*\(([0-9]+) dropped by injection\).*/\1/')
+  check "A's injected drops on the AF_XDP path were recovered ($injected dropped)" '(( injected > 0 ))'
+fi
+
 if (( FAIL )); then
-  for f in P A B C P1 P2 R; do echo "--- $f"; cat "$W/$f.txt"; done
+  for f in P A B C P1b P1 P2 R; do [[ -f "$W/$f.txt" ]] && { echo "--- $f"; cat "$W/$f.txt"; }; done
 fi
 exit "$FAIL"

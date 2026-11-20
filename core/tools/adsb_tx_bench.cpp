@@ -4,6 +4,7 @@
 //
 //   adsb-tx-bench [--transport all|T[,T...]] [--rate N] [--seconds S] [--size B]
 //                 [--rounds N] [--cpus S,R] [--interface ADDR --dest ADDR [--rx-netns NS]]
+//                 [--rx kernel|xdp|all]
 //                 [transport flags: --uring-sq-cpu N, --uring-in-flight N, --xdp-mode M, ...]
 //
 // A sender thread sends B-byte datagrams at a fixed rate (busy-wait pacing)
@@ -20,6 +21,10 @@
 //               receiver + io_uring's SQPOLL kernel thread, which belongs to
 //               the process: SQPOLL's price is that extra polling core);
 //   lost / reordered datagrams at the receiver.
+// --rx picks the receive path: the kernel socket (recv()), AF_XDP (an XDP
+// program on --dest's device redirects the datagrams into an XSK the
+// receiver thread polls; needs CAP_NET_ADMIN, CAP_BPF, CAP_NET_RAW and a
+// real device, so --interface/--dest), or both, crossed with every transport.
 // With --transport all, the transports run in turn, --rounds times, so a
 // change in machine load affects all of them alike.
 //
@@ -52,6 +57,7 @@
 #include "adsb/common/thread.hpp"
 #include "adsb/feed/net.hpp"
 #include "adsb/feed/tx.hpp"
+#include "adsb/feed/xdp_receiver.hpp"
 
 namespace {
 
@@ -71,6 +77,7 @@ using namespace adsb::feed;
                "  --interface A   the sending device's address (needed for xdp)\n"
                "  --dest A        the receiver's address (default 127.0.0.1)\n"
                "  --rx-netns NS   create the receiver socket in network namespace NS (Linux)\n"
+               "  --rx R          receive path: kernel (default), xdp (AF_XDP on --dest's device), or all\n"
                "transport flags (as in adsb-publish):\n" ADSB_TX_OPTIONS_HELP);
   std::exit(code);
 }
@@ -90,6 +97,7 @@ constexpr int kThread = RUSAGE_SELF;  // macOS: no per-thread figure
 
 struct Result {
   Transport t{};
+  bool xdp_rx = false;
   LatencyHistogram call, e2e;
   std::uint64_t sent = 0, received = 0, lost = 0, reordered = 0, max_late_ns = 0;
   double sender_cpu = 0, process_cpu = 0;
@@ -97,9 +105,22 @@ struct Result {
 };
 
 // A receiver socket, created in network namespace `netns` if given (a socket
-// stays in the namespace it was created in, whichever thread uses it).
-int open_receiver(const std::string& host, const std::string& netns, std::string* err) {
-  if (netns.empty()) return open_udp(host, 0, 16 << 20, err);
+// stays in the namespace it was created in, whichever thread uses it), and
+// with `xdp` an AF_XDP receiver for the same port opened there too (its
+// device lookup, socket, map and program all belong to that namespace).
+int open_receiver(const std::string& host, const std::string& netns, XdpReceiver* xdp, std::string* err) {
+  auto open_all = [&]() -> int {
+    const int fd = open_udp(host, 0, 16 << 20, err);
+    if (fd < 0 || !xdp) return fd;
+    XdpReceiver::Options o;
+    o.interface_host = host;
+    if (!xdp->open(Endpoint{host, local_port(fd)}, o, err)) {
+      close_fd(fd);
+      return -1;
+    }
+    return fd;
+  };
+  if (netns.empty()) return open_all();
 #if defined(__linux__)
   int fd = -1;
   std::thread t([&] {
@@ -110,7 +131,7 @@ int open_receiver(const std::string& host, const std::string& netns, std::string
       return;
     }
     ::close(ns);
-    fd = open_udp(host, 0, 16 << 20, err);
+    fd = open_all();
   });
   t.join();
   return fd;
@@ -133,7 +154,8 @@ void run(Result& res, const Setup& st) {
   const std::size_t size = st.size;
   const int cpu_s = st.cpu_s, cpu_r = st.cpu_r;
   std::string err;
-  const int rfd = open_receiver(st.dest, st.netns, &err);
+  XdpReceiver xr;
+  const int rfd = open_receiver(st.dest, st.netns, res.xdp_rx ? &xr : nullptr, &err);
   if (rfd < 0) {
     std::fprintf(stderr, "adsb-tx-bench: receiver: %s\n", err.c_str());
     std::exit(1);
@@ -165,23 +187,32 @@ void run(Result& res, const Setup& st) {
     if (cpu_r >= 0) pin_current_thread(cpu_r);
     std::uint8_t buf[4096];
     std::uint64_t expect = 1;
+    auto got = [&](std::span<const std::uint8_t> d) {
+      if (d.size() < 16) return;
+      const std::uint64_t now = mono_ns();
+      std::uint64_t seq, ts;
+      std::memcpy(&seq, d.data(), 8);
+      std::memcpy(&ts, d.data() + 8, 8);
+      res.e2e.record(now >= ts ? now - ts : 0);
+      ++res.received;
+      if (seq < expect) ++res.reordered;
+      else expect = seq + 1;
+    };
     ready = true;
     for (;;) {
-      const ssize_t n = ::recv(rfd, buf, sizeof buf, MSG_DONTWAIT);
-      if (n >= 16) {
-        const std::uint64_t now = mono_ns();
-        std::uint64_t seq, ts;
-        std::memcpy(&seq, buf, 8);
-        std::memcpy(&ts, buf + 8, 8);
-        res.e2e.record(now >= ts ? now - ts : 0);
-        ++res.received;
-        if (seq < expect) ++res.reordered;
-        else expect = seq + 1;
-      } else if (done.load(std::memory_order_acquire)) {
-        break;
+      bool any = false;
+      if (xr.is_open()) {
+        any = xr.receive(got, 64) != 0;
       } else {
-        cpu_relax();
+        const ssize_t n = ::recv(rfd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n > 0) {
+          got(std::span<const std::uint8_t>(buf, static_cast<std::size_t>(n)));
+          any = true;
+        }
       }
+      if (any) continue;
+      if (done.load(std::memory_order_acquire)) break;
+      cpu_relax();
     }
   });
   while (!ready.load()) cpu_relax();
@@ -217,6 +248,17 @@ void run(Result& res, const Setup& st) {
   res.sent = total;
   res.lost = total > res.received ? total - res.received : 0;
   res.report = tx.report();
+  if (xr.is_open()) {
+    xr.refresh_kernel_stats();
+    const auto& x = xr.stats();
+    char line[256];
+    std::snprintf(line, sizeof line, "%saf_xdp rx %s/%s: %llu received, %llu rejected, kernel drops %llu (ring full %llu)",
+                  res.report.empty() ? "" : "; ", XdpSender::mode_name(xr.bound_mode()),
+                  XdpReceiver::attach_name(xr.attach_mode()), static_cast<unsigned long long>(x.received),
+                  static_cast<unsigned long long>(x.rejected), static_cast<unsigned long long>(x.rx_dropped),
+                  static_cast<unsigned long long>(x.rx_ring_full));
+    res.report += line;
+  }
   close_fd(rfd);
 }
 
@@ -229,6 +271,7 @@ int main(int argc, char** argv) {
   double& seconds = st.seconds;
   std::size_t& size = st.size;
   int rounds = 1;
+  std::string rx = "kernel";
   Transport ignored{};
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -245,6 +288,7 @@ int main(int argc, char** argv) {
     else if (a == "--interface") st.iface = val();
     else if (a == "--dest") st.dest = val();
     else if (a == "--rx-netns") st.netns = val();
+    else if (a == "--rx") rx = val();
     else if (is_tx_flag(a)) { if (!apply_tx_flag(a, val(), ignored, st.txo)) usage(1); }
     else if (a == "--cpus") {
       if (std::sscanf(val().c_str(), "%d,%d", &st.cpu_s, &st.cpu_r) != 2) usage(1);
@@ -271,13 +315,27 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  std::vector<Result> all(ts.size());
-  for (std::size_t k = 0; k < ts.size(); ++k) all[k].t = ts[k];
+  if (rx != "kernel" && rx != "xdp" && rx != "all") usage(1);
+  if (rx != "kernel" && (st.iface.empty() || !XdpReceiver::built())) {
+    std::fprintf(stderr, "adsb-tx-bench: --rx xdp needs AF_XDP and a device: --interface and --dest\n");
+    return 1;
+  }
+  std::vector<Result> all;
+  for (const Transport t : ts) {
+    for (const bool x : {false, true}) {
+      if ((x && rx == "kernel") || (!x && rx == "xdp")) continue;
+      Result r;
+      r.t = t;
+      r.xdp_rx = x;
+      all.push_back(std::move(r));
+    }
+  }
   auto u = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
   for (int r = 0; r < rounds; ++r) {
     for (Result& res : all) {
       Result one;
       one.t = res.t;
+      one.xdp_rx = res.xdp_rx;
       run(one, st);
       res.call.merge(one.call);
       res.e2e.merge(one.e2e);
@@ -297,14 +355,15 @@ int main(int argc, char** argv) {
               st.netns.empty() ? "" : " in netns ", st.netns.c_str());
   for (const Result& res : all) {
     const double wall = seconds * rounds;
-    std::printf("%-15s send() p50 %llu p99 %llu p99.9 %llu max %llu ns | send->recv p50 %llu p99 %llu p99.9 %llu ns | "
+    const std::string name = std::string(transport_name(res.t)) + (res.xdp_rx ? " > xdp" : " > kernel");
+    std::printf("%-22s send() p50 %llu p99 %llu p99.9 %llu max %llu ns | send->recv p50 %llu p99 %llu p99.9 %llu ns | "
                 "cores busy: sender %.2f, process %.2f | lost %llu, reordered %llu, sender max late %.1f us\n",
-                transport_name(res.t), u(res.call.percentile(50)), u(res.call.percentile(99)),
+                name.c_str(), u(res.call.percentile(50)), u(res.call.percentile(99)),
                 u(res.call.percentile(99.9)), u(res.call.max()), u(res.e2e.percentile(50)),
                 u(res.e2e.percentile(99)), u(res.e2e.percentile(99.9)), res.sender_cpu / wall,
                 res.process_cpu / wall, u(res.lost), u(res.reordered),
                 static_cast<double>(res.max_late_ns) / 1e3);
-    if (!res.report.empty()) std::printf("                %s\n", res.report.c_str());
+    if (!res.report.empty()) std::printf("                       %s\n", res.report.c_str());
   }
   return 0;
 }

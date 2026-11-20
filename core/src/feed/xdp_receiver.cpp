@@ -303,7 +303,7 @@ bool XdpReceiver::open(const Endpoint& feed, const Options& opt, std::string* er
   reg.len = m->umem.len;
   reg.chunk_size = XdpSender::kFrameBytes;
   if (::setsockopt(m->xsk.fd, SOL_XDP, XDP_UMEM_REG, &reg, sizeof reg) != 0) {
-    set_error(error, "XDP_UMEM_REG (RLIMIT_MEMLOCK too low?)", errno);
+    xsk::set_umem_error(error, m->umem.len, errno);
     return false;
   }
   // A completion ring is required even for an RX-only socket.

@@ -451,6 +451,7 @@ jobs:
           for t in adsb-publish adsb-live; do sudo setcap cap_net_raw+ep build/xdp/tools/$t; done
       - name: Unit tests (must run, not skip)
         run: |
+          echo "RLIMIT_MEMLOCK: $(ulimit -l) KiB"
           ADSB_XDP_TEST=10.11.0.1,10.11.0.2 ctest --test-dir build/xdp -R "Xdp" --output-on-failure | tee xdp-tests.txt
           ! grep -q "Skipped" xdp-tests.txt
       - name: Feed suite over AF_XDP (loss, snapshots, late join, restart)

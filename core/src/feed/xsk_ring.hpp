@@ -5,6 +5,7 @@
 
 #include <linux/if_xdp.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 
 #include <cerrno>
@@ -24,6 +25,22 @@ namespace adsb::feed::xsk {
 
 inline void set_error(std::string* error, const std::string& what, int err) {
   if (error) *error = what + ": " + std::strerror(err);
+}
+
+// XDP_UMEM_REG failed. ENOBUFS / EPERM / ENOMEM there usually mean the
+// pinned-memory limit: the kernel charges every UMEM to the user's
+// RLIMIT_MEMLOCK (shared by all of that user's processes, and released a
+// little after a socket closes) unless the process has CAP_IPC_LOCK.
+inline void set_umem_error(std::string* error, std::size_t umem_bytes, int err) {
+  if (!error) return;
+  std::string what = "XDP_UMEM_REG: " + std::string(std::strerror(err));
+  rlimit lim{};
+  if ((err == ENOBUFS || err == EPERM || err == ENOMEM) && ::getrlimit(RLIMIT_MEMLOCK, &lim) == 0) {
+    what += " (this UMEM pins " + std::to_string(umem_bytes >> 10) + " KiB; RLIMIT_MEMLOCK is ";
+    what += lim.rlim_cur == RLIM_INFINITY ? std::string("unlimited") : std::to_string(lim.rlim_cur >> 10) + " KiB";
+    what += " for all of this user's pinned memory: use fewer frames, raise ulimit -l, or grant CAP_IPC_LOCK)";
+  }
+  *error = what;
 }
 
 // We own one index (producer or consumer), the kernel the other.

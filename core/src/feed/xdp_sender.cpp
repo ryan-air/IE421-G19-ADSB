@@ -93,7 +93,7 @@ void UdpFrameBuilder::init(const MacAddress& src_mac, const MacAddress& dst_mac,
 
 std::size_t UdpFrameBuilder::build(std::span<const std::uint8_t> payload, std::uint8_t* out) const noexcept {
   std::memcpy(out, tmpl_.data(), kHeaderBytes);
-  std::memcpy(out + kHeaderBytes, payload.data(), payload.size());
+  if (!payload.empty()) std::memcpy(out + kHeaderBytes, payload.data(), payload.size());  // data() may be null
   const auto udp_len = static_cast<std::uint16_t>(8 + payload.size());
   std::uint8_t* ip = out + 14;
   put16(ip + 2, static_cast<std::uint16_t>(20 + udp_len));
@@ -336,7 +336,7 @@ bool XdpSender::open(const Endpoint& dest, const Options& opt, std::string* erro
   reg.chunk_size = kFrameBytes;
   reg.headroom = 0;
   if (::setsockopt(m->fd, SOL_XDP, XDP_UMEM_REG, &reg, sizeof reg) != 0) {
-    set_error(error, "XDP_UMEM_REG (RLIMIT_MEMLOCK too low?)", errno);
+    xsk::set_umem_error(error, m->umem_len, errno);
     return false;
   }
   // The fill ring feeds RX; a TX-only socket still needs one to bind.

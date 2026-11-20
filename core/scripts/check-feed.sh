@@ -61,6 +61,12 @@ RX="${FEED_RX:-kernel}"
 # injection applies to both paths) and must recover them.
 A_EXTRA=()
 [[ $RX == xdp ]] && A_EXTRA=(--drop-rate 0.002 --seed 5)
+# Subscribers receiving over AF_XDP use 1 MiB UMEMs: every UMEM is pinned
+# memory charged to the user's RLIMIT_MEMLOCK (8 MiB on GitHub's runners),
+# and two subscribers and the publisher can hold one at the same time.
+XDP_RX=(--rx xdp --xdp-frames 512)
+RX_ARGS=(--rx kernel)
+[[ $RX == xdp ]] && RX_ARGS=("${XDP_RX[@]}")
 PUB_COMMON=(--feed "$GROUP:$PORT" --interface "$IFACE" --retransmit-port "$RTX" --snapshot-port "$SNAP"
             --bind 127.0.0.1 --no-flush --no-publish-ts --heartbeat-ms 50 --transport "$TRANSPORT")
 SUB_COMMON=(--feed "$GROUP:$PORT" --interface "$SUB_IFACE" --retransmit "127.0.0.1:$RTX"
@@ -71,7 +77,7 @@ echo "== scenario 1: loss, small ring, late join =="
 "$T/adsb-replay" "$W/a.adsbrec" --no-flush --book-digest > "$W/replay.txt" || exit 2
 D0=$(digest "$W/replay.txt")
 
-"$T/adsb-feed-cli" "${SUB_COMMON[@]}" --rx "$RX" ${A_EXTRA[@]+"${A_EXTRA[@]}"} --until-end --duration 40 > "$W/A.txt" &
+"$T/adsb-feed-cli" "${SUB_COMMON[@]}" "${RX_ARGS[@]}" ${A_EXTRA[@]+"${A_EXTRA[@]}"} --until-end --duration 40 > "$W/A.txt" &
 PA=$!
 if [[ $RX == kernel ]]; then
   "$T/adsb-feed-cli" "${SUB_COMMON[@]}" --until-end --duration 40 --drop-rate 0.0002 --drop-burst 4000 --drop-only-first 25000 --seed 3 > "$W/B.txt" &
@@ -113,7 +119,7 @@ else
   # own, against a second run of the same publisher: its datagrams wait in
   # the XSK's ring while the blocking snapshot fetch runs.
   echo "== scenario 1b (AF_XDP reception): B alone, snapshot recovery =="
-  "$T/adsb-feed-cli" "${SUB_COMMON[@]}" --rx xdp --until-end --duration 40 --drop-rate 0.0002 --drop-burst 4000 --drop-only-first 25000 --seed 3 > "$W/B.txt" &
+  "$T/adsb-feed-cli" "${SUB_COMMON[@]}" "${XDP_RX[@]}" --until-end --duration 40 --drop-rate 0.0002 --drop-burst 4000 --drop-only-first 25000 --seed 3 > "$W/B.txt" &
   PB=$!
   sleep 0.5
   "$T/adsb-publish" "$W/a.adsbrec" "${PUB_COMMON[@]}" --session RUNA000002 --speed 15 --ring 2048 \
@@ -127,7 +133,7 @@ fi
 
 echo "== scenario 2: publisher restart =="
 "$T/adsb-synth" -o "$W/b.adsbrec" --aircraft 120 --duration 20 --seed 8 > /dev/null || exit 2
-"$T/adsb-feed-cli" "${SUB_COMMON[@]}" --rx "$RX" --duration 12 > "$W/R.txt" &
+"$T/adsb-feed-cli" "${SUB_COMMON[@]}" "${RX_ARGS[@]}" --duration 12 > "$W/R.txt" &
 PR=$!
 sleep 0.5
 "$T/adsb-publish" "$W/a.adsbrec" "${PUB_COMMON[@]}" --session RUNB000001 --speed 30 --linger 0.5 > "$W/P1.txt"

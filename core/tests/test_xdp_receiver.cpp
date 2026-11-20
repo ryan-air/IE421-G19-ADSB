@@ -472,12 +472,17 @@ XdpSender::Options tx_options(const Pair& p) {
   XdpSender::Options o;
   o.udp.interface_host = p.tx;
   o.mode = XdpSender::Mode::kCopy;
+  o.frames = 256;
   return o;
 }
 
+// Small UMEMs: every UMEM counts against the user's RLIMIT_MEMLOCK (8 MiB on
+// GitHub's runners), and some tests hold two receivers, or reopen before the
+// kernel has released the first one's pinned pages.
 XdpReceiver::Options rx_options(const Pair& p) {
   XdpReceiver::Options o;
   o.interface_host = p.rx;
+  o.frames = 256;
   return o;
 }
 
@@ -592,6 +597,7 @@ TEST(XdpReceiver, SubscriberClientRecoversAFeedReceivedOverAfXdp) {
   cfg.feed = Endpoint{"239.19.0.79", 0};
   cfg.interface_host = p.rx;
   cfg.rx = SubscriberClientConfig::Rx::kXdp;
+  cfg.xdp.frames = 256;
   SubscriberClient sub(cfg);
   std::string err;
   ASSERT_TRUE(sub.open(&err)) << err;

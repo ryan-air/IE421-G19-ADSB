@@ -188,7 +188,11 @@ class SubscriberCore {
   bool confirm_ = false;               // live, but the session change awaits the server's word
   std::uint64_t snap_last_ns_ = 0;     // time of the last fetch attempt
   std::uint64_t snap_anchor_ = 0;      // first seq buffered in snapshot mode (0 = none yet)
-  protocol::Session snap_req_session_{};  // session we were in when the last fetch was requested
+  // Session changes so far, and their count when the last fetch was
+  // requested: an answer is current only if no change happened since (an
+  // id comparison misses a switch away and back).
+  std::uint64_t session_epoch_ = 0;
+  std::uint64_t snap_req_epoch_ = 0;
 
   SubscriberStats stats_;
 };

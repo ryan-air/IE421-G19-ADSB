@@ -330,7 +330,11 @@ export class SubscriberCore {
     this.snapDue = false;
     this.snapLastNs = -Infinity;
     this.snapAnchor = 0;
-    this.snapReqSession = '';
+    // Session changes so far, and their count when the last fetch was
+    // requested: an answer is current only if no change happened since (an
+    // id comparison misses a switch away and back).
+    this.sessionEpoch = 0;
+    this.snapReqEpoch = 0;
     this.confirming = false; // live, but a session change awaits the server's word
 
     this.stats = newStats();
@@ -361,6 +365,7 @@ export class SubscriberCore {
       this.stats.session_changes++;
     }
     this.unretire(s);
+    this.sessionEpoch++;
     this.session = s;
     this.hasSession = true;
     this.book.clear();
@@ -572,7 +577,7 @@ export class SubscriberCore {
     if (!this.snapDue && nowNs - this.snapLastNs < this.cfg.snapshotRetryNs) return false;
     this.snapDue = false;
     this.snapLastNs = nowNs;
-    this.snapReqSession = this.session;
+    this.snapReqEpoch = this.sessionEpoch;
     this.stats.snapshot_requests++;
     return true;
   }
@@ -584,8 +589,15 @@ export class SubscriberCore {
 
   // snap: { session, asOfSeq, tracks: [Buffer(64)] } (SnapshotParser.data)
   onSnapshot(snap, nowNs) {
+    if (this.mode !== Mode.kSnapshot && !this.confirming) return; // not asked for
+    // An answer to a request made before a session change is stale whatever
+    // session it carries: a server that died since may have answered it, and
+    // a switch away and back makes the ids match again (C++ SubscriberCore).
+    if (this.hasSession && this.snapReqEpoch !== this.sessionEpoch) {
+      this.onSnapshotFailed(nowNs);
+      return;
+    }
     if (this.mode !== Mode.kSnapshot) {
-      if (!this.confirming) return;
       if (this.hasSession && snap.session === this.session) {
         this.confirming = false; // the server agrees: keep our state
         this.stats.sessions_confirmed++;
@@ -594,15 +606,9 @@ export class SubscriberCore {
       // The server is in another session: adopt it, as below.
     }
     if (!this.hasSession || snap.session !== this.session) {
-      // Only an answer to a request made in the current session says which
-      // session is live (the publisher's): ours came from a stray or late
-      // packet. One asked for before we changed session is stale whatever
-      // session it carries (C++ SubscriberCore: a server that died since may
-      // have answered it).
-      if (this.snapReqSession !== this.session) {
-        this.onSnapshotFailed(nowNs);
-        return;
-      }
+      // Asked for from the current session (checked above), so the server
+      // -- the publisher -- is telling us its live session: ours came from a
+      // stray or late packet.
       this.newSession(snap.session);
       this.mode = Mode.kSnapshot;
     }

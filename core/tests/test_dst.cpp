@@ -91,9 +91,11 @@ TEST(Dst, SeedsThatFoundTheStaleSessionBugPass) {
 // Worlds where an async snapshot fetch, asked for before a session change and
 // answered by a server that died since, put a subscriber on the dead session
 // (before only answers to requests made in the current session could switch
-// sessions). Rare: 2 in 120,000 quick worlds.
+// sessions), or matched the session it had meanwhile moved to after two
+// quick restarts (40013996, found by a CI sweep; before session changes were
+// counted rather than ids compared). Rare.
 TEST(Dst, SeedsThatFoundTheStaleSnapshotBugPass) {
-  for (std::uint64_t seed : {2542u, 75323u}) {
+  for (std::uint64_t seed : {2542u, 75323u, 40013996u}) {
     const dst::Result r = dst::run(dst::random_config(seed));
     EXPECT_TRUE(r.ok) << "seed " << seed << ": " << r.failure;
   }

@@ -77,6 +77,7 @@ void SubscriberCore::new_session(const protocol::Session& s) {
     ++stats_.session_changes;
   }
   unretire(s);
+  ++session_epoch_;
   session_ = s;
   has_session_ = true;
   book_.clear();
@@ -301,7 +302,7 @@ bool SubscriberCore::take_snapshot_request(std::uint64_t now_ns) {
   if (!snap_due_ && now_ns - snap_last_ns_ < cfg_.snapshot_retry_ns) return false;
   snap_due_ = false;
   snap_last_ns_ = now_ns;
-  snap_req_session_ = session_;
+  snap_req_epoch_ = session_epoch_;
   ++stats_.snapshot_requests;
   return true;
 }
@@ -312,8 +313,25 @@ void SubscriberCore::on_snapshot_failed(std::uint64_t now_ns) {
 }
 
 void SubscriberCore::on_snapshot(const SnapshotData& snap, std::uint64_t now_ns) {
+  if (mode_ != Mode::kSnapshot && !confirm_) return;  // not asked for (already recovered)
+  // An answer to a request made before we changed session is stale whatever
+  // session it carries: it reflects the server at some earlier moment,
+  // possibly a server that has died since. Found by deterministic
+  // simulation: an async fetch requested in session 1, answered by session
+  // 2's server, which then died, arrived after session 3 began and put the
+  // subscriber on session 2 for good (seed 75323). Comparing session ids is
+  // not enough, so a count of session changes tells: after two quick
+  // restarts a subscriber went 1 -> 3 (newest packets first) -> 2 (a late
+  // packet of the session between), and that same kind of answer then
+  // matched session 2 and was loaded, retiring 3 (seed 40013996); requested
+  // in 2, away to 3 and back to 2 is just as stale. The rejected fetch is
+  // retried at once if one is due, and the live server's answer moves the
+  // subscriber to its session.
+  if (has_session_ && snap_req_epoch_ != session_epoch_) {
+    on_snapshot_failed(now_ns);
+    return;
+  }
   if (mode_ != Mode::kSnapshot) {
-    if (!confirm_) return;  // not asked for (already recovered)
     if (has_session_ && snap.session == session_) {
       confirm_ = false;  // the server agrees: keep our state
       ++stats_.sessions_confirmed;
@@ -323,20 +341,10 @@ void SubscriberCore::on_snapshot(const SnapshotData& snap, std::uint64_t now_ns)
     // dead one. Adopt the server's, as for any snapshot below.
   }
   if (!has_session_ || snap.session != session_) {
-    // A snapshot of another session. If we asked for it from the current
-    // session, the server -- the publisher itself -- is telling us its live
-    // session: the current one came from a stray or late packet. Adopt it
-    // then, or we would never recover. An answer to a request made before
-    // we changed session is stale whatever session it carries: it reflects
-    // the server at some earlier moment, possibly a server that has died
-    // since (found by deterministic simulation: an async fetch, requested
-    // in session 1, answered by session 2's server, which then died,
-    // arrived after session 3 began and put the subscriber on session 2 for
-    // good). The rejected fetch is retried at once if one is due.
-    if (snap_req_session_ != session_) {
-      on_snapshot_failed(now_ns);
-      return;
-    }
+    // A snapshot of another session, asked for from the current one (see
+    // above): the server -- the publisher itself -- is telling us its live
+    // session, so the current one came from a stray or late packet. Adopt
+    // it, or we would never recover.
     new_session(snap.session);
     mode_ = Mode::kSnapshot;
   }

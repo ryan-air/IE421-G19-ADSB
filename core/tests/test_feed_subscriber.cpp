@@ -472,6 +472,34 @@ TEST(Subscriber, ASnapshotRequestedBeforeASessionChangeIsNeverAdopted) {
   EXPECT_EQ(f.sub.session(), s3);
 }
 
+// Found by deterministic simulation (adsb-dst seed 40013996): two quick
+// restarts; the subscriber, still fetching S1's snapshot, sees S3's packets
+// first, then a late packet of S2 (which it never saw) and moves to S2,
+// retiring S3. The S1-era fetch is then answered by S2's server, which has
+// died since. It carries the session the subscriber is now in, but was asked
+// for before two session changes: rejected, and the next fetch, answered by
+// the live server, brings the subscriber to S3.
+TEST(Subscriber, AStaleAnswerIsRejectedEvenWhenItMatchesTheCurrentSession) {
+  const auto s3 = protocol::make_session("SESSION003");
+  Fixture f;
+  f.feed(packet(kS1, 50, 1));                   // late join to S1: snapshot mode
+  ASSERT_TRUE(f.sub.take_snapshot_request(0));  // asked in S1
+  f.feed(heartbeat(s3, 2, true));               // S3's end of session (one message)
+  ASSERT_EQ(f.sub.session(), s3);
+  f.feed(packet(kS2, 2, 1));                    // late, from the session between
+  ASSERT_EQ(f.sub.session(), kS2);
+  f.sub.on_snapshot(snapshot_as_of(kS2, 4), 0);  // the S1-era fetch, answered by S2's server
+  EXPECT_EQ(f.sub.mode(), Mode::kSnapshot) << "not loaded: asked for two session changes ago";
+  EXPECT_EQ(f.sub.stats().snapshot_failures, 1u);
+  ASSERT_TRUE(f.sub.take_snapshot_request(0)) << "asked again at once";
+  f.sub.on_snapshot(snapshot_as_of(s3, 1), 0);  // the live server
+  EXPECT_EQ(f.sub.session(), s3);
+  EXPECT_EQ(f.sub.mode(), Mode::kLive);
+  f.feed(heartbeat(s3, 2, true));
+  EXPECT_TRUE(f.sub.ended());
+  EXPECT_TRUE(f.sub.book() == reference(1));
+}
+
 TEST(Subscriber, SnapshotRequestedBeforeARestartIsRejected) {
   Fixture f;
   f.feed(packet(kS1, 50, 1));  // late join to S1

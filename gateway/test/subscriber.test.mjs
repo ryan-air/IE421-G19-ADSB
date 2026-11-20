@@ -383,6 +383,30 @@ test('a snapshot requested before a session change is never adopted', () => {
   assert.equal(f.sub.session, S3);
 });
 
+// Found by deterministic simulation of the C++ SubscriberCore (adsb-dst seed
+// 40013996): S1 -> S3 (newest packets first) -> S2 (a late packet of the
+// session between); the S1-era fetch, answered by S2's dead server, matches
+// the current session but is stale.
+test('a stale answer is rejected even when it matches the current session', () => {
+  const f = new Fixture();
+  f.feed(packet(S1, 50, 1));
+  assert.ok(f.sub.takeSnapshotRequest(0));
+  f.feed(heartbeat(S3, 2, true));
+  assert.equal(f.sub.session, S3);
+  f.feed(packet(S2, 2, 1));
+  assert.equal(f.sub.session, S2);
+  f.sub.onSnapshot(snapshotAsOf(S2, 4), 0);
+  assert.equal(f.sub.mode, Mode.kSnapshot, 'not loaded: asked for two session changes ago');
+  assert.equal(f.sub.stats.snapshot_failures, 1);
+  assert.ok(f.sub.takeSnapshotRequest(0));
+  f.sub.onSnapshot(snapshotAsOf(S3, 1), 0);
+  assert.equal(f.sub.session, S3);
+  assert.equal(f.sub.mode, Mode.kLive);
+  f.feed(heartbeat(S3, 2, true));
+  assert.ok(f.sub.ended);
+  assert.equal(f.sub.book.hexDigest(), reference(1).hexDigest());
+});
+
 test('snapshot requested before a restart is rejected', () => {
   const f = new Fixture();
   f.feed(packet(S1, 50, 1));

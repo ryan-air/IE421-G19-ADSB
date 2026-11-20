@@ -730,14 +730,33 @@ struct World {
     chaos_end_ns = cfg.chaos_ns;
     schedule(chaos_end_ns, Kind::kChaosEnd);
     start_era();
-    const std::uint64_t deadline = chaos_end_ns + cfg.settle_limit_ns;
+    std::uint64_t deadline = chaos_end_ns + cfg.settle_limit_ns;
+    const std::uint64_t cap = chaos_end_ns + std::max(cfg.settle_limit_ns, cfg.settle_cap_ns);
+    std::vector<std::uint64_t> expected_at(subs.size(), 0);
+    bool extended = false;
     while (res.ok && !q.empty()) {
-      Event ev = q.top();
-      q.pop();
-      if (ev.t > deadline) {
-        t_now = deadline;
-        break;
+      const Event& top = q.top();
+      if (top.t > deadline) {
+        // Past the limit: more time only while every unfinished subscriber
+        // keeps advancing (see Config::settle_cap_ns). The first extension
+        // has no earlier reading to compare with, so a stuck subscriber
+        // fails one window after the limit.
+        bool advancing = deadline + cfg.progress_window_ns <= cap;
+        for (std::size_t i = 0; i < subs.size() && advancing; ++i) {
+          const SubscriberCore& c = *subs[i]->core;
+          if (!c.ended() && extended && c.expected() <= expected_at[i]) advancing = false;
+        }
+        if (!advancing) {
+          t_now = deadline;
+          break;
+        }
+        for (std::size_t i = 0; i < subs.size(); ++i) expected_at[i] = subs[i]->core->expected();
+        extended = true;
+        deadline += cfg.progress_window_ns;
+        continue;
       }
+      Event ev = top;
+      q.pop();
       step(ev);
       if (res.events > cfg.max_events) {
         char msg[128];
@@ -772,7 +791,7 @@ struct World {
   void finish() {
     char msg[512];
     if (!converged()) {
-      std::string why = "liveness: not every subscriber reached the end of the final session within the limit:";
+      std::string why = "liveness: not every subscriber reached the end of the final session within the limit (or stopped advancing after it):";
       for (const auto& s : subs) {
         const SubscriberCore& c = *s->core;
         std::snprintf(msg, sizeof msg,

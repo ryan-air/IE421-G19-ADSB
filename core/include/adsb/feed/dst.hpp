@@ -88,9 +88,16 @@ struct Config {
 
   // Phases. Publishing and faults last chaos_ns; then faults stop, the
   // publisher ends its session, and every subscriber must have converged
-  // within settle_limit_ns.
+  // within settle_limit_ns. A subscriber that is still advancing then (its
+  // expected sequence number grew over the last progress_window_ns) gets
+  // more time, window by window, up to settle_cap_ns: recovery throughput
+  // is bounded by the configuration (a window of 8 messages per round trip
+  // of several ms catches up at a few thousand messages per second), and
+  // slow is not stuck. One that stops advancing fails at the next window.
   std::uint64_t chaos_ns = 200'000'000;
   std::uint64_t settle_limit_ns = 20'000'000'000;
+  std::uint64_t progress_window_ns = 2'000'000'000;
+  std::uint64_t settle_cap_ns = 200'000'000'000;
   // A run that executes more events than this fails: a request or
   // retransmit storm (simulated time crawls while events pile up).
   std::uint64_t max_events = 50'000'000;

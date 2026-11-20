@@ -19,7 +19,7 @@ About 40% of the plan is done, and everything listed here is on `main` with CI p
 | Overload | Loss only at the input boundary and counted; publisher batching under load; tested at 0.5×, 2×, 10× saturation | [core/README.md](core/README.md#overload-semantics-workstream-f-readme_updatesmd-10) |
 | Benchmark | Fall 2025 vs. new pipeline on the same traffic: frame → map in the browser 1.1–1.6 s → about 70–90 ms (median, laptop) | [bench/results/legacy-baseline/README.md](bench/results/legacy-baseline/README.md) |
 
-Not started: the demodulator, A/B arbitration, io_uring and AF_XDP, hardware timestamps, ITCH, and camera fusion. (The shared-memory ring and the conflated feed are done.)
+Not started: the demodulator, A/B arbitration, the AF_XDP subscriber side, hardware timestamps, ITCH, and camera fusion. (The shared-memory ring, the conflated feed, memory-model testing, the io_uring transport and the AF_XDP publisher are done.)
 
 ---
 
@@ -73,9 +73,9 @@ Plan §9.3–9.4, §10.2 and §12.
 | ~~Shared-memory broadcast ring (same-host IPC); target p99 < 500 ns~~ **Done:** p99 209 ns at 100 k msg/s on the laptop, see `core/README.md` | Should | None | M |
 | ~~Conflated feed: latest state per aircraft at about 10 Hz; the gateway subscribes to it~~ **Done:** `--conflate` on `adsb-live` / `adsb-publish`; point the gateway's `--feed` at it | Should | None | M |
 | ~~Memory-model testing of the lock-free rings~~ **Done:** GenMC models of both rings with 20 mutants, `adsb-ring-stress` on x86 and ARM in CI, see `spec/memory-model/README.md` | Should | None | M |
-| AF_XDP transport (copy mode can be developed in Docker) | Should | Zero-copy needs the NIC | L |
+| ~~AF_XDP transport, publisher~~ **Done:** `--transport xdp` (copy, zero-copy, auto), tested over a veth pair in CI, see `core/README.md`. Still open: the subscriber's XDP redirect program, and zero-copy numbers on the benchmark NIC | Should | Zero-copy needs the NIC | L |
 | Hardware timestamps and PTP across two hosts | Should | Benchmark host and NIC | L |
-| io_uring transport; deterministic simulation testing | Could | None | M each |
+| ~~io_uring transport~~ **Done:** `--transport uring` on `adsb-publish` / `adsb-live`, `adsb-tx-bench`, see `core/README.md`; deterministic simulation testing | Could | None | M each |
 
 Start with: `core/include/adsb/feed/`, `protocol/feed_spec.md`, `spec/`.
 

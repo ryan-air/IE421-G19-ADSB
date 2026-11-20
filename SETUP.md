@@ -51,7 +51,7 @@ Apple clang 15+ works for everything except libFuzzer (use the `fuzz-standalone`
 ### Ubuntu 24.04 / Debian 12 / Raspberry Pi OS (Bookworm)
 
 ```bash
-sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build git clang
+sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build git clang liburing-dev pkg-config
 ```
 
 **Ubuntu 22.04** ships CMake 3.22, which is too old. Install a newer one with `pip install --user cmake` (or from Kitware's apt repository), then check `cmake --version`.

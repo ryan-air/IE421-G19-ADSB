@@ -21,7 +21,13 @@
 #
 # Environment: FEED_GROUP (default 239.19.0.7), FEED_IFACE (default
 # 127.0.0.1; use 0.0.0.0 where loopback multicast is unavailable), FEED_PORT
-# (base port, default 42900). Exits nonzero if any check fails.
+# (base port, default 42900), FEED_TRANSPORT (the publisher's UDP transport:
+# kernel (default), uring, uring-nosqpoll, xdp; with io_uring every publisher
+# must also report 0 reordered and 0 failed completions, with AF_XDP 0 invalid
+# descriptors and 0 failed kicks), FEED_SUB_IFACE (the subscribers' interface,
+# default FEED_IFACE; AF_XDP frames leave through the device and never loop
+# back, so run it over a veth pair: FEED_IFACE = this end's address,
+# FEED_SUB_IFACE = the far end's). Exits nonzero if any check fails.
 
 set -uo pipefail
 BUILD="${1:?usage: check-feed.sh BUILD_DIR}"
@@ -31,6 +37,7 @@ for t in adsb-synth adsb-replay adsb-publish adsb-feed-cli; do
 done
 GROUP="${FEED_GROUP:-239.19.0.7}"
 IFACE="${FEED_IFACE:-127.0.0.1}"
+SUB_IFACE="${FEED_SUB_IFACE:-$IFACE}"
 PORT="${FEED_PORT:-42900}"
 RTX=$((PORT + 1))
 SNAP=$((PORT + 2))
@@ -43,9 +50,10 @@ check() {  # description, condition
 digest() { grep -E '^book digest' "$1" | awk '{print $3}'; }
 field() { grep -E "^$2" "$1" | head -1; }
 
+TRANSPORT="${FEED_TRANSPORT:-kernel}"
 PUB_COMMON=(--feed "$GROUP:$PORT" --interface "$IFACE" --retransmit-port "$RTX" --snapshot-port "$SNAP"
-            --bind 127.0.0.1 --no-flush --no-publish-ts --heartbeat-ms 50)
-SUB_COMMON=(--feed "$GROUP:$PORT" --interface "$IFACE" --retransmit "127.0.0.1:$RTX"
+            --bind 127.0.0.1 --no-flush --no-publish-ts --heartbeat-ms 50 --transport "$TRANSPORT")
+SUB_COMMON=(--feed "$GROUP:$PORT" --interface "$SUB_IFACE" --retransmit "127.0.0.1:$RTX"
             --snapshot "127.0.0.1:$SNAP" --quiet)
 
 echo "== scenario 1: loss, small ring, late join =="
@@ -97,6 +105,22 @@ check "subscriber followed the restart ($CHANGES session change)" '[[ "$CHANGES"
 check "its book == the second run's book"                      '[[ "$(digest "$W/R.txt")" == "$(digest "$W/P2.txt")" ]]'
 check "and differs from the first run's"                       '[[ "$(digest "$W/R.txt")" != "$(digest "$W/P1.txt")" ]]'
 check "session RUNB000002 reached its end"                     'grep -q "RUNB000002, ended" "$W/R.txt"'
+
+if [[ $TRANSPORT == xdp ]]; then
+  echo "== AF_XDP =="
+  for f in P P1 P2; do
+    line=$(grep '^af_xdp' "$W/$f.txt")
+    check "publisher $f sent through AF_XDP, 0 invalid, 0 failed kicks: ${line#af_xdp      }" \
+      '[[ -n "$line" ]] && grep -q " 0 invalid" <<<"$line" && grep -q " 0 failed," <<<"$line"'
+  done
+elif [[ $TRANSPORT != kernel ]]; then
+  echo "== io_uring ($TRANSPORT) =="
+  for f in P P1 P2; do
+    line=$(grep '^io_uring' "$W/$f.txt")
+    check "publisher $f sent through io_uring, 0 reordered, 0 failed: ${line#io_uring    }" \
+      '[[ -n "$line" ]] && grep -q " 0 failed" <<<"$line" && grep -q " 0 reordered" <<<"$line"'
+  done
+fi
 
 if (( FAIL )); then
   for f in P A B C P1 P2 R; do echo "--- $f"; cat "$W/$f.txt"; done

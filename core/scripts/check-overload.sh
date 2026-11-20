@@ -23,7 +23,11 @@
 # but unbounded queueing delay and a sender that falls far behind, i.e. the
 # loss moves upstream, uncounted.
 #
-# Environment: OVL_PORT (base port, default 43800). KEEP=1 keeps the work dir.
+# Environment: OVL_PORT (base port, default 43800), FEED_TRANSPORT (adsb-live's
+# feed transport: kernel (default), uring, uring-nosqpoll, xdp), OVL_FEED_HOST
+# (the subscribers' address the feed is sent to, default 127.0.0.1) and
+# OVL_PUB_IFACE (adsb-live's sending interface address; xdp needs both, e.g.
+# the two ends of a veth pair). KEEP=1 keeps the work dir.
 
 set -uo pipefail
 # Empty arrays are expanded as ${a[@]+"${a[@]}"}: macOS ships bash 3.2, where
@@ -34,6 +38,9 @@ for t in adsb-synth adsb-live adsb-beast-serve adsb-feed-cli; do
   [[ -x "$T/$t" ]] || { echo "missing $T/$t (build with tools enabled)"; exit 2; }
 done
 PORT="${OVL_PORT:-43800}"
+FEED_HOST="${OVL_FEED_HOST:-127.0.0.1}"
+PUB_IFACE=()
+[[ -n "${OVL_PUB_IFACE:-}" ]] && PUB_IFACE=(--publish-interface "$OVL_PUB_IFACE")
 W="$(mktemp -d)"
 trap 'kill $(jobs -p) 2>/dev/null; [[ -n "${KEEP:-}" ]] && echo "kept $W" || rm -rf "$W"' EXIT
 FAIL=0
@@ -53,7 +60,7 @@ run() {
   [[ $# -gt 0 ]] && shift
   live_args=("$@")
   local P=$((PORT)) F=$((PORT + 1))
-  "$T/adsb-feed-cli" --feed "127.0.0.1:$F" --retransmit "127.0.0.1:$((F + 1))" \
+  "$T/adsb-feed-cli" --feed "$FEED_HOST:$F" --retransmit "127.0.0.1:$((F + 1))" \
       --snapshot "127.0.0.1:$((F + 2))" --until-end --duration $((dur + 20)) --quiet > "$W/$name.sub" 2>&1 &
   local SUB=$!
   "$T/adsb-beast-serve" "$W/rec.adsbrec" --port "$P" --rate "$rate" --loop --duration "$dur" \
@@ -61,7 +68,7 @@ run() {
   local SV=$!
   sleep 0.3
   "$T/adsb-live" --port "$P" --quiet --stats-every 0.5 --simulate-work-ns "$WORK_NS" \
-      --publish "127.0.0.1:$F" --retransmit-port $((F + 1)) --snapshot-port $((F + 2)) \
+      --publish "$FEED_HOST:$F" ${PUB_IFACE[@]+"${PUB_IFACE[@]}"} --transport "${FEED_TRANSPORT:-kernel}" --retransmit-port $((F + 1)) --snapshot-port $((F + 2)) \
       ${live_args[@]+"${live_args[@]}"} > "$W/$name.live" 2>&1 &
   local LV=$!
   local rss_max=0

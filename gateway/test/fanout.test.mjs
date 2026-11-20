@@ -7,7 +7,7 @@ import { test } from 'node:test';
 
 import { FrameFlags, decodeFrame } from '../public/gateway_protocol.mjs';
 import { Gateway } from '../src/gateway.mjs';
-import { sleep } from './net_fixture.mjs';
+import { sleep, waitFor } from './net_fixture.mjs';
 
 function stubClient(overrides = {}) {
   const frames = [];
@@ -45,7 +45,10 @@ test('a client skipped once is retried even if no more feed input arrives', asyn
   g.flush();
   assert.equal(frames.length, 0);
   c.ws.bufferedBytes = 0; // the kernel took it, silently
-  await sleep(100);
+  // Wait for the outcome, not a fixed time: after an event-loop stall the
+  // test's own timer can fire in the same pass as the retry timer, before
+  // the flush that timer schedules has run.
+  await waitFor(() => frames.length > 0, 2000, 'the retry timer to resend');
   assert.equal(frames.length, 1, 'retried by the timer');
   assert.equal(c.needSnapshot, false);
   clearTimeout(g.retryTimer);
@@ -78,7 +81,7 @@ test('a client out of credit is dropped after stuckMs even on a quiet feed', asy
   g.flush();
   c.dirty.add(1); // a change it will never get credit for
   g.flush();
-  await sleep(200);
+  await waitFor(() => !c.ws.open, 2000, 'the stuck client to be dropped'); // see the first test
   assert.equal(frames.length, 1);
   assert.equal(c.ws.open, false, 'terminated as stuck');
   assert.equal(g.counters.clients_dropped_stuck, 1);

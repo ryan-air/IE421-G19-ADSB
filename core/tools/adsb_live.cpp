@@ -39,6 +39,7 @@
 #include "adsb/feed/conflated_feed.hpp"
 #include "adsb/feed/recovery.hpp"
 #include "adsb/feed/shm_ring.hpp"
+#include "adsb/feed/tx.hpp"
 #include "adsb/ingest/beast_tcp.hpp"
 #include "adsb/record/recording.hpp"
 #include "adsb/state/track_engine.hpp"
@@ -72,6 +73,7 @@ void on_signal(int) { g_stop.store(true); }
                "feed (README_UPDATES.md §9):\n"
                "  --publish HOST:PORT   publish tracks on this multicast group (or unicast address)\n"
                "  --publish-interface A multicast egress interface address (default: kernel's choice)\n"
+               ADSB_TX_OPTIONS_HELP
                "  --batch-us N          hold a datagram at most N microseconds while busy (default 100;\n"
                "                        it is sent at once whenever the input queue is empty, so light\n"
                "                        load adds no delay; 0 = one datagram per update)\n"
@@ -105,7 +107,7 @@ struct Shared {
 
 // UDP multicast and/or the same-host shared-memory ring (either may be absent).
 // The ring first: a ring write costs tens of ns, a UDP sendto() microseconds.
-using FeedOut = adsb::feed::DualOut<adsb::feed::ShmOut, adsb::feed::UdpSender>;
+using FeedOut = adsb::feed::DualOut<adsb::feed::ShmOut, adsb::feed::FeedTx>;
 using FeedPublisher = adsb::feed::Publisher<FeedOut>;
 
 struct CountingSink {
@@ -147,6 +149,8 @@ int main(int argc, char** argv) {
   std::string publish_to, session_id, shm_name;
   std::uint64_t shm_slots = adsb::feed::kShmDefaultSlots;
   adsb::feed::UdpSender::Options send_opt;
+  adsb::feed::Transport transport = adsb::feed::Transport::kKernel;
+  adsb::feed::TxOptions tx_opt;
   adsb::feed::PublisherConfig pub_cfg;
   std::string conflate_to;
   adsb::feed::ConflatedFeedConfig conf_cfg;
@@ -203,6 +207,7 @@ int main(int argc, char** argv) {
       if (std::sscanf(v.c_str(), "%d,%d,%d", &cpu_ingest, &cpu_state, &cpu_recorder) < 2) usage(1);
     } else if (a == "--publish") publish_to = val();
     else if (a == "--publish-interface") send_opt.interface_host = val();
+    else if (adsb::feed::is_tx_flag(a)) { if (!adsb::feed::apply_tx_flag(a, val(), transport, tx_opt)) usage(1); }
     else if (a == "--batch-us") pub_cfg.max_batch_delay_ns = std::strtoull(val().c_str(), nullptr, 10) * 1000;
     else if (a == "--retransmit-port") rec_cfg.retransmit_port = parse_port(val());
     else if (a == "--snapshot-port") rec_cfg.snapshot_port = parse_port(val());
@@ -236,7 +241,7 @@ int main(int argc, char** argv) {
   }
 
   // Feed publisher and recovery servers (optional).
-  std::unique_ptr<adsb::feed::UdpSender> udp;
+  std::unique_ptr<adsb::feed::FeedTx> udp;
   adsb::feed::ShmRegion shm_region;
   std::unique_ptr<adsb::feed::ShmOut> shm_out;
   std::unique_ptr<FeedOut> feed_out;
@@ -256,8 +261,8 @@ int main(int argc, char** argv) {
     rec_cfg.recovery.session = pub_cfg.session;
     std::string err;
     if (!publish_to.empty()) {
-      udp = std::make_unique<adsb::feed::UdpSender>();
-      if (!udp->open(dest, send_opt, &err)) {
+      udp = std::make_unique<adsb::feed::FeedTx>();
+      if (!udp->open(dest, transport, send_opt, tx_opt, &err)) {
         std::fprintf(stderr, "adsb-live: publish %s: %s\n", publish_to.c_str(), err.c_str());
         return 1;
       }
@@ -507,6 +512,10 @@ int main(int argc, char** argv) {
   if (!record_path.empty()) {
     std::printf("recording   %s: %llu records, %llu dropped%s\n", record_path.c_str(), u(writer.count()),
                 u(shared.record_dropped.load()), rec_ok ? "" : " (WRITE FAILED)");
+  }
+  if (udp) {
+    (void)udp->drain();
+    if (const std::string r = udp->report(); !r.empty()) std::printf("%s\n", r.c_str());
   }
   if (pub) {
     const auto& ps = pub->stats();

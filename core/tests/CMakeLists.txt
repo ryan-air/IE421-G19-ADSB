@@ -22,6 +22,7 @@ set(ADSB_TEST_SOURCES
   test_feed_net.cpp
   test_conflate.cpp
   test_shm_ring.cpp
+  test_uring.cpp
 )
 
 add_executable(adsb_tests ${ADSB_TEST_SOURCES})
@@ -34,3 +35,13 @@ target_compile_definitions(adsb_tests PRIVATE
 gtest_discover_tests(adsb_tests
   DISCOVERY_TIMEOUT 60
   PROPERTIES TIMEOUT 300)
+
+# AF_XDP: the live tests bind the same device queue (one XSK per queue), so
+# they run one at a time even under ctest -j; their own binary carries the
+# lock (gtest_discover_tests applies properties to a whole executable).
+add_executable(adsb_xdp_tests test_xdp.cpp)
+target_link_libraries(adsb_xdp_tests PRIVATE adsb::core GTest::gtest_main)
+adsb_apply_compiler_options(adsb_xdp_tests)
+gtest_discover_tests(adsb_xdp_tests
+  DISCOVERY_TIMEOUT 60
+  PROPERTIES TIMEOUT 300 RESOURCE_LOCK adsb_xdp_device)

@@ -246,12 +246,16 @@ TEST(ShmRegion, AnotherProcessReadsWhatThisOneWrites) {
   ShmRegion w;
   ASSERT_TRUE(w.create(name, 1024, kS1, 1, &err)) << err;
   constexpr std::uint64_t kN = 50'000;
+  int ready[2];
+  ASSERT_EQ(::pipe(ready), 0);
   const pid_t pid = ::fork();
   ASSERT_GE(pid, 0);
-  if (pid == 0) {  // child: read every message (the ring is big enough not to lap... usually)
+  if (pid == 0) {  // child: read every message it can (laps are allowed, torn reads are not)
     ShmRegion rd;
     std::string e;
     if (!rd.open(name, &e)) ::_exit(10);
+    const char one = 1;
+    if (::write(ready[1], &one, 1) != 1) ::_exit(13);
     std::uint64_t expect = 1, ok = 0;
     std::uint8_t buf[64];
     std::size_t len = 0;
@@ -268,15 +272,21 @@ TEST(ShmRegion, AnotherProcessReadsWhatThisOneWrites) {
     }
     ::_exit(ok > kN / 10 ? 0 : 12);
   }
-  std::this_thread::sleep_for(50ms);  // let the child map the ring
+  // Wait until the child has mapped the ring, then write at a pace (about
+  // 50 ms in all) that a briefly descheduled child can follow: a fixed 50 ms
+  // head start was not enough under parallel test load.
+  char c = 0;
+  ASSERT_EQ(::read(ready[0], &c, 1), 1);
+  ::close(ready[0]);
+  ::close(ready[1]);
   for (std::uint64_t s = 1; s <= kN; ++s) {
     w.view().write(s, pattern(s).data(), 64);
-    if (s % 512 == 0) std::this_thread::yield();
+    if (s % 1024 == 0) std::this_thread::sleep_for(1ms);
   }
   int status = 0;
   ASSERT_EQ(::waitpid(pid, &status, 0), pid);
   ASSERT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(WEXITSTATUS(status), 0) << "10: open failed, 11: torn message, 12: too few read";
+  EXPECT_EQ(WEXITSTATUS(status), 0) << "10: open failed, 11: torn message, 12: too few read, 13: pipe";
 }
 
 // ---------------------------------------------------------------------------

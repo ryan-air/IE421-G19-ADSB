@@ -25,6 +25,9 @@ concurrency:
 
 defaults:
   run:
+    # Explicit bash runs steps with -eo pipefail (the default shell has no
+    # pipefail, so `ctest ... | tee` would hide a failing test).
+    shell: bash
     working-directory: core
 
 jobs:
@@ -381,3 +384,86 @@ jobs:
       # exactly once, in order, intact; laps reported. Longer runs: see
       # spec/memory-model/README.md.
       - run: build/stress/tools/adsb-ring-stress --seconds 60 --seed ${{ github.run_number }}
+
+  uring:
+    name: io_uring feed transport (unit tests, feed and overload suites over io_uring)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 liburing-dev pkg-config
+      # ADSB_IO_URING=ON: a missing liburing fails the build instead of
+      # silently compiling the stub (and skipping every io_uring test).
+      - name: Build
+        run: |
+          CXX=g++-14 cmake -S . -B build/uring -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_IO_URING=ON
+          cmake --build build/uring
+      - name: Unit tests (must run, not skip)
+        run: |
+          ctest --test-dir build/uring -R "Uring|^FeedTx\\." --output-on-failure | tee uring-tests.txt
+          ! grep -q "Skipped" uring-tests.txt
+      - name: Feed suite over io_uring (loss, snapshots, late join, restart)
+        run: |
+          FEED_IFACE=127.0.0.1 FEED_TRANSPORT=uring scripts/check-feed.sh build/uring
+          FEED_IFACE=127.0.0.1 FEED_TRANSPORT=uring-nosqpoll scripts/check-feed.sh build/uring
+      - name: Overload suite with adsb-live on io_uring
+        run: FEED_TRANSPORT=uring scripts/check-overload.sh build/uring
+      # For the log only: GitHub's shared runners are not a latency host.
+      - name: TX bench (kernel vs io_uring)
+        run: build/uring/tools/adsb-tx-bench --seconds 2 --rounds 2
+
+  xdp:
+    name: AF_XDP feed transport (unit tests, feed and overload suites over a veth pair)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 iproute2 libcap2-bin
+      # ADSB_AF_XDP=ON: missing kernel headers fail the build instead of
+      # silently compiling the stub (and skipping every AF_XDP test).
+      - name: Build
+        run: |
+          CXX=g++-14 cmake -S . -B build/xdp -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_AF_XDP=ON
+          cmake --build build/xdp
+      # Both ends in this namespace: frames sent on veth0 arrive on veth1.
+      # accept_local: the source address is local; the ARP entry lets unicast
+      # find veth1's MAC. File capabilities instead of sudo, so the build
+      # tree stays the runner's.
+      - name: veth pair and capabilities
+        run: |
+          sudo ip link add veth0 type veth peer name veth1
+          sudo ip addr add 10.11.0.1/24 dev veth0
+          sudo ip addr add 10.11.0.2/24 dev veth1
+          sudo ip link set veth0 up
+          sudo ip link set veth1 up
+          sudo sysctl -w net.ipv4.conf.all.accept_local=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.veth1.rp_filter=0
+          sudo ip neigh replace 10.11.0.2 lladdr "$(cat /sys/class/net/veth1/address)" dev veth0 nud permanent
+          sudo setcap cap_net_raw+ep build/xdp/tests/adsb_xdp_tests
+          for t in adsb-publish adsb-live; do sudo setcap cap_net_raw+ep build/xdp/tools/$t; done
+      - name: Unit tests (must run, not skip)
+        run: |
+          ADSB_XDP_TEST=10.11.0.1,10.11.0.2 ctest --test-dir build/xdp -R "Xdp" --output-on-failure | tee xdp-tests.txt
+          ! grep -q "Skipped" xdp-tests.txt
+      - name: Feed suite over AF_XDP (loss, snapshots, late join, restart)
+        run: FEED_TRANSPORT=xdp FEED_IFACE=10.11.0.1 FEED_SUB_IFACE=10.11.0.2 scripts/check-feed.sh build/xdp
+      - name: Overload suite with adsb-live on AF_XDP
+        run: FEED_TRANSPORT=xdp OVL_FEED_HOST=10.11.0.2 OVL_PUB_IFACE=10.11.0.1 scripts/check-overload.sh build/xdp
+      # For the log only: GitHub's shared runners are not a latency host. The
+      # receiver gets its own namespace so kernel UDP crosses the veth too.
+      - name: TX bench over veth (kernel vs AF_XDP copy mode)
+        run: |
+          sudo ip link add vb0 type veth peer name vb1
+          sudo ip netns add rx
+          sudo ip link set vb1 netns rx
+          sudo ip addr add 10.12.0.1/24 dev vb0
+          sudo ip -n rx addr add 10.12.0.2/24 dev vb1
+          sudo ip link set vb0 up
+          sudo ip -n rx link set vb1 up
+          sudo build/xdp/tools/adsb-tx-bench --transport kernel,xdp --interface 10.12.0.1 --dest 10.12.0.2 \
+            --rx-netns rx --xdp-mode copy --seconds 2 --rounds 2

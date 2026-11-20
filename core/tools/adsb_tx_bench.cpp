@@ -25,6 +25,9 @@
 // program on --dest's device redirects the datagrams into an XSK the
 // receiver thread polls; needs CAP_NET_ADMIN, CAP_BPF, CAP_NET_RAW and a
 // real device, so --interface/--dest), or both, crossed with every transport.
+// --xdp-mode and --xdp-queue apply to the AF_XDP receiver as well as to the
+// AF_XDP sender (on a multi-queue NIC, steer the flow to that queue or set
+// the device to one queue: frames on other queues reach only the kernel).
 // With --transport all, the transports run in turn, --rounds times, so a
 // change in machine load affects all of them alike.
 //
@@ -107,13 +110,18 @@ struct Result {
 // A receiver socket, created in network namespace `netns` if given (a socket
 // stays in the namespace it was created in, whichever thread uses it), and
 // with `xdp` an AF_XDP receiver for the same port opened there too (its
-// device lookup, socket, map and program all belong to that namespace).
-int open_receiver(const std::string& host, const std::string& netns, XdpReceiver* xdp, std::string* err) {
+// device lookup, socket, map and program all belong to that namespace). The
+// receiver takes --xdp-mode and --xdp-queue from the sender's options, so
+// `--xdp-mode zerocopy` asks for zero-copy at both ends.
+int open_receiver(const std::string& host, const std::string& netns, const XdpSender::Options& xo,
+                  XdpReceiver* xdp, std::string* err) {
   auto open_all = [&]() -> int {
     const int fd = open_udp(host, 0, 16 << 20, err);
     if (fd < 0 || !xdp) return fd;
     XdpReceiver::Options o;
     o.interface_host = host;
+    o.mode = xo.mode;
+    o.queue = xo.queue;
     if (!xdp->open(Endpoint{host, local_port(fd)}, o, err)) {
       close_fd(fd);
       return -1;
@@ -155,7 +163,7 @@ void run(Result& res, const Setup& st) {
   const int cpu_s = st.cpu_s, cpu_r = st.cpu_r;
   std::string err;
   XdpReceiver xr;
-  const int rfd = open_receiver(st.dest, st.netns, res.xdp_rx ? &xr : nullptr, &err);
+  const int rfd = open_receiver(st.dest, st.netns, st.txo.xdp, res.xdp_rx ? &xr : nullptr, &err);
   if (rfd < 0) {
     std::fprintf(stderr, "adsb-tx-bench: receiver: %s\n", err.c_str());
     std::exit(1);

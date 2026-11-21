@@ -26,7 +26,7 @@ The default feed is the multicast group `239.19.0.1:41900` (feed_spec.md §5). T
 | `bin/adsb-gateway.mjs` | The gateway. `--help` lists options: feed, retransmit and snapshot addresses, `--listen` (default `127.0.0.1:8080`), `--flush-ms`, `--high-water`, fault injection (`--drop-rate` ...), `--until-end`. The last line printed on exit is the book digest. |
 | `bin/adsb-ws-client.mjs` | A browser stand-in. It keeps the table exactly as the map does, measures publish → received latency, and prints the table's digest. `--slow-ms N` makes it a slow client; `--window N` sets its flow-control window (0 = off). |
 
-Endpoints: `/` serves the map, `/gateway/ws` is the WebSocket, `/gateway/stats` returns subscriber, fan-out and latency counters as JSON, and `/gateway/digest` returns the book digest.
+Endpoints: `/` serves the map, `/gateway/ws` is the WebSocket, `/gateway/stats` returns subscriber, fan-out and latency counters as JSON, `/gateway/latency` returns both latency histograms as 76 log-spaced buckets (cumulative; the map's Analysis sheet diffs two readings for per-interval percentiles), and `/gateway/digest` returns the book digest.
 
 ## How it works
 

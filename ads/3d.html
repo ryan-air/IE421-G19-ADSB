@@ -3,993 +3,171 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>3D Aircraft Tracker</title>
-
-    <!-- Cesium.js -->
+    <title>ADS-B Atlas · 3D</title>
     <script src="https://cesium.com/downloads/cesiumjs/releases/1.111/Build/Cesium/Cesium.js"></script>
     <link href="https://cesium.com/downloads/cesiumjs/releases/1.111/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
-
-    <!-- Math.js for Kalman filter -->
+    <!-- Math.js: used by the Fall 2025 Kalman code -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/12.4.1/math.min.js"></script>
-
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Courier New', monospace;
-            background: #0a0a0a;
-            color: #7a9a7a;
-            overflow: hidden;
-        }
-
-        #cesiumContainer {
-            width: 100%;
-            height: 100vh;
-            position: absolute;
-            top: 0;
-            left: 0;
-        }
-
-        /* Top header */
-        .top-header {
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            background: rgba(10, 10, 10, 0.9);
-            padding: 15px 20px;
-            border-bottom: 2px solid #7a9a7a;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            z-index: 1000;
-        }
-
-        .top-header h1 {
-            font-size: 24px;
-            color: #7a9a7a;
-            letter-spacing: 2px;
-        }
-
-        .header-controls {
-            display: flex;
-            gap: 20px;
-            align-items: center;
-        }
-
-        .stat-inline {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-        }
-
-        .stat-label {
-            color: #5a7a5a;
-            font-size: 14px;
-        }
-
-        .stat-value {
-            color: #7a9a7a;
-            font-weight: bold;
-            font-size: 16px;
-        }
-
-        .status {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-        }
-
-        .status-dot {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: #666;
-        }
-
-        .status-dot.connected {
-            background: #7a9a7a;
-            box-shadow: 0 0 10px #7a9a7a;
-        }
-
-        .status-dot.disconnected {
-            background: #c85a54;
-            box-shadow: 0 0 10px #c85a54;
-        }
-
-        /* Controls panel */
-        .controls-overlay {
-            position: absolute;
-            top: 80px;
-            left: 10px;
-            background: rgba(10, 10, 10, 0.9);
-            border: 1px solid #7a9a7a;
-            border-radius: 6px;
-            padding: 8px;
-            z-index: 1000;
-            min-width: 110px;
-            max-width: 200px;
-            transition: all 0.3s ease;
-        }
-
-        .controls-overlay.collapsed {
-            min-width: auto;
-            padding: 8px;
-        }
-
-        .controls-overlay.collapsed .controls-content {
-            display: none;
-        }
-
-        .controls-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 8px;
-        }
-
-        .controls-header h3 {
-            color: #7a9a7a;
-            font-size: 11px;
-            margin: 0;
-        }
-
-        .controls-overlay.collapsed .controls-header {
-            margin-bottom: 0;
-        }
-
-        .collapse-btn {
-            background: none;
-            border: none;
-            color: #7a9a7a;
-            cursor: pointer;
-            font-size: 14px;
-            padding: 2px 6px;
-            border-radius: 3px;
-        }
-
-        .collapse-btn:hover {
-            background: rgba(122, 154, 122, 0.3);
-        }
-
-        .control-button {
-            width: 100%;
-            padding: 6px 8px;
-            margin: 3px 0;
-            background: rgba(122, 154, 122, 0.2);
-            border: 1px solid #5a7a5a;
-            color: #7a9a7a;
-            cursor: pointer;
-            font-family: 'Courier New', monospace;
-            font-size: 10px;
-            border-radius: 3px;
-            transition: all 0.3s;
-        }
-
-        .control-button:hover {
-            background: rgba(122, 154, 122, 0.4);
-            border-color: #7a9a7a;
-        }
-
-        .control-button.active {
-            background: rgba(122, 154, 122, 0.6);
-            border-color: #9aba9a;
-        }
-
-        /* Info panel */
-        .info-panel {
-            position: absolute;
-            bottom: 20px;
-            left: 20px;
-            background: rgba(10, 10, 10, 0.9);
-            border: 1px solid #7a9a7a;
-            border-radius: 6px;
-            padding: 12px;
-            z-index: 1000;
-            max-width: 280px;
-            max-height: 250px;
-            overflow-y: auto;
-        }
-
-        .info-panel h3 {
-            color: #7a9a7a;
-            margin-bottom: 8px;
-            font-size: 12px;
-        }
-
-        .info-panel .info-content {
-            color: #7a9a7a;
-            font-size: 11px;
-            line-height: 1.5;
-        }
-
-        .info-panel .info-content strong {
-            color: #8aaa8a;
-        }
-
-        .info-panel.collision-info {
-            border-color: #ff6600;
-        }
-
-        .info-panel.collision-info h3 {
-            color: #ff6600;
-        }
-
-        /* Statistics panel */
-        .statistics-panel-3d {
-            position: fixed;
-            right: -320px;
-            top: 60px;
-            bottom: 20px;
-            width: 300px;
-            background: rgba(15, 20, 15, 0.95);
-            border: 2px solid #5a7a5a;
-            border-radius: 10px;
-            z-index: 1500;
-            transition: right 0.3s ease;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-
-        .statistics-panel-3d.open {
-            right: 10px;
-        }
-
-        .statistics-header-3d {
-            padding: 12px 15px;
-            border-bottom: 1px solid #5a7a5a;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: rgba(20, 30, 20, 0.9);
-        }
-
-        .statistics-header-3d h3 {
-            color: #9aba9a;
-            font-size: 13px;
-            margin: 0;
-            font-family: 'Courier New', monospace;
-        }
-
-        .close-stats-btn {
-            background: none;
-            border: none;
-            color: #7a9a7a;
-            font-size: 20px;
-            cursor: pointer;
-            padding: 0 5px;
-            line-height: 1;
-        }
-
-        .close-stats-btn:hover {
-            color: #ff6666;
-        }
-
-        .statistics-content-3d {
-            flex: 1;
-            overflow-y: auto;
-            padding: 12px;
-        }
-
-        .stats-summary-3d {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 8px;
-            margin-bottom: 15px;
-        }
-
-        .stat-card-3d {
-            background: rgba(90, 122, 90, 0.2);
-            border: 1px solid #5a7a5a;
-            border-radius: 6px;
-            padding: 10px 8px;
-            text-align: center;
-        }
-
-        .stat-card-label-3d {
-            color: #7a9a7a;
-            font-size: 9px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .stat-card-value-3d {
-            color: #00ffff;
-            font-size: 16px;
-            font-weight: bold;
-            margin-top: 4px;
-        }
-
-        .stats-section-3d {
-            margin-bottom: 15px;
-        }
-
-        .stats-section-3d h4 {
-            color: #8aaa8a;
-            font-size: 11px;
-            margin-bottom: 10px;
-            padding-bottom: 5px;
-            border-bottom: 1px solid #4a6a4a;
-        }
-
-        .stat-bar-container-3d {
-            display: grid;
-            grid-template-columns: 55px 1fr 25px;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 6px;
-        }
-
-        .stat-bar-label-3d {
-            color: #7a9a7a;
-            font-size: 9px;
-        }
-
-        .stat-bar-bg-3d {
-            background: rgba(10, 10, 10, 0.8);
-            border: 1px solid #4a6a4a;
-            height: 14px;
-            border-radius: 2px;
-            overflow: hidden;
-        }
-
-        .stat-bar-3d {
-            height: 100%;
-            background: linear-gradient(90deg, #5a8a5a 0%, #00aaaa 100%);
-            transition: width 0.5s ease;
-        }
-
-        .stat-bar-value-3d {
-            color: #9aba9a;
-            font-size: 10px;
-            text-align: right;
-        }
-
-        .durations-list-3d {
-            max-height: 150px;
-            overflow-y: auto;
-        }
-
-        .duration-item-3d {
-            display: flex;
-            justify-content: space-between;
-            padding: 5px 0;
-            border-bottom: 1px solid rgba(90, 122, 90, 0.2);
-            font-size: 10px;
-        }
-
-        .duration-flight-3d {
-            color: #00ffff;
-        }
-
-        .duration-time-3d {
-            color: #7a9a7a;
-        }
-
-        .loading-state {
-            color: #7a9a7a;
-            text-align: center;
-            padding: 20px;
-            font-size: 11px;
-        }
-
-        /* View mode buttons */
-        .view-modes {
-            display: flex;
-            gap: 3px;
-            margin-bottom: 6px;
-        }
-
-        .view-mode-btn {
-            flex: 1;
-            padding: 5px;
-            background: rgba(122, 154, 122, 0.2);
-            border: 1px solid #5a7a5a;
-            color: #7a9a7a;
-            cursor: pointer;
-            font-family: 'Courier New', monospace;
-            font-size: 9px;
-            border-radius: 3px;
-            transition: all 0.3s;
-        }
-
-        .view-mode-btn:hover {
-            background: rgba(122, 154, 122, 0.4);
-        }
-
-        .view-mode-btn.active {
-            background: rgba(122, 154, 122, 0.6);
-            border-color: #9aba9a;
-        }
-
-        /* Aircraft list panel */
-        .aircraft-list-panel-3d {
-            position: fixed;
-            right: -320px;
-            top: 80px;
-            bottom: 20px;
-            width: 300px;
-            max-height: calc(100vh - 120px);
-            background: rgba(15, 20, 15, 0.95);
-            border: 2px solid #5a7a5a;
-            border-radius: 10px;
-            z-index: 1400;
-            transition: right 0.3s ease;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-
-        .aircraft-list-panel-3d.open {
-            right: 10px;
-        }
-
-        .aircraft-list-header-3d {
-            padding: 12px 15px;
-            border-bottom: 1px solid #5a7a5a;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: rgba(20, 30, 20, 0.9);
-        }
-
-        .aircraft-list-header-3d h3 {
-            color: #9aba9a;
-            font-size: 13px;
-            margin: 0;
-            font-family: 'Courier New', monospace;
-        }
-
-        .close-list-btn {
-            background: none;
-            border: none;
-            color: #7a9a7a;
-            font-size: 20px;
-            cursor: pointer;
-            padding: 0 5px;
-            line-height: 1;
-        }
-
-        .close-list-btn:hover {
-            color: #ff6666;
-        }
-
-        .aircraft-list-3d {
-            flex: 1;
-            overflow-y: auto;
-            padding: 8px;
-        }
-
-        .aircraft-item-3d {
-            background: rgba(90, 122, 90, 0.15);
-            border: 1px solid #4a6a4a;
-            border-radius: 6px;
-            padding: 10px;
-            margin-bottom: 6px;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-
-        .aircraft-item-3d:hover {
-            background: rgba(122, 154, 122, 0.25);
-            border-color: #7a9a7a;
-            transform: translateX(4px);
-        }
-
-        .aircraft-item-header-3d {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 6px;
-        }
-
-        .aircraft-callsign-3d {
-            color: #00ffff;
-            font-size: 12px;
-            font-weight: bold;
-        }
-
-        .aircraft-hex-3d {
-            color: #7a9a7a;
-            font-size: 9px;
-        }
-
-        .aircraft-details-3d {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 6px;
-            font-size: 10px;
-        }
-
-        .aircraft-detail-3d {
-            color: #8aaa8a;
-        }
-
-        .aircraft-detail-3d strong {
-            color: #9aba9a;
-        }
-
-        /* Mobile responsive styles */
-        @media (max-width: 768px) {
-            .top-header {
-                padding: 8px 12px;
-                flex-wrap: wrap;
-                gap: 6px;
-            }
-
-            .top-header h1 {
-                font-size: 14px;
-                letter-spacing: 1px;
-                width: 100%;
-                text-align: center;
-            }
-
-            .header-controls {
-                width: 100%;
-                justify-content: center;
-                gap: 10px;
-                flex-wrap: wrap;
-            }
-
-            .stat-inline {
-                gap: 4px;
-            }
-
-            .stat-label {
-                font-size: 10px;
-            }
-
-            .stat-value {
-                font-size: 12px;
-            }
-
-            /* Controls panel as horizontal toolbar at top */
-            .controls-overlay {
-                top: 65px;
-                bottom: auto;
-                left: 10px;
-                right: 10px;
-                min-width: unset;
-                max-height: none;
-                padding: 10px 12px;
-                border-radius: 10px;
-            }
-
-            .controls-header {
-                display: none;
-            }
-
-            .controls-content {
-                display: flex;
-                flex-direction: row;
-                flex-wrap: wrap;
-                gap: 8px;
-                justify-content: center;
-                align-items: center;
-            }
-
-            .view-modes {
-                display: flex;
-                gap: 4px;
-                margin-bottom: 0;
-            }
-
-            .view-mode-btn {
-                font-size: 10px;
-                padding: 8px 12px;
-                border-radius: 6px;
-            }
-
-            .control-button {
-                padding: 8px 12px;
-                font-size: 10px;
-                margin: 0;
-                width: auto;
-                border-radius: 6px;
-            }
-
-            .info-panel {
-                bottom: 10px;
-                left: 10px;
-                max-width: 200px;
-                max-height: 150px;
-                padding: 10px;
-            }
-
-            .info-panel h3 {
-                font-size: 11px;
-            }
-
-            .info-panel .info-content {
-                font-size: 10px;
-            }
-
-            /* Adjust panels to avoid mobile controls overlap */
-            .statistics-panel-3d.open {
-                right: 10px;
-                top: 145px;
-                bottom: 200px;
-                max-height: calc(100vh - 365px);
-            }
-
-            .aircraft-list-panel-3d.open {
-                right: 10px;
-                top: 145px;
-                bottom: 200px;
-                max-height: calc(100vh - 365px);
-            }
-        }
-
-        @media (max-width: 480px) {
-            .top-header h1 {
-                font-size: 11px;
-            }
-
-            .stat-label {
-                font-size: 8px;
-            }
-
-            .stat-value {
-                font-size: 10px;
-            }
-
-            .header-controls {
-                gap: 4px;
-            }
-
-            .controls-overlay {
-                top: 58px;
-                padding: 8px 10px;
-            }
-
-            .controls-content {
-                gap: 5px;
-            }
-
-            .view-mode-btn {
-                font-size: 9px;
-                padding: 6px 10px;
-            }
-
-            .control-button {
-                padding: 6px 10px;
-                font-size: 9px;
-            }
-
-            .info-panel {
-                max-width: 160px;
-                max-height: 120px;
-                padding: 8px;
-            }
-
-            /* Further adjust panels for smaller screens */
-            .statistics-panel-3d.open {
-                top: 120px;
-                bottom: 180px;
-                max-height: calc(100vh - 320px);
-                width: calc(100vw - 20px);
-                right: 10px;
-            }
-
-            .aircraft-list-panel-3d.open {
-                top: 120px;
-                bottom: 180px;
-                max-height: calc(100vh - 320px);
-                width: calc(100vw - 20px);
-                right: 10px;
-            }
-        }
-
-        /* Mobile tip banner */
-        #mobile-tip-banner {
-            position: fixed;
-            bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            z-index: 9999;
-            transition: opacity 0.3s ease;
-        }
-
-        .mobile-tip-content {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            background: rgba(26, 36, 26, 0.95);
-            border: 2px solid #ff9900;
-            border-radius: 12px;
-            padding: 12px 16px;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            color: #ddd;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
-        }
-
-        .mobile-tip-link {
-            color: #00ffff;
-            text-decoration: none;
-            background: rgba(0, 255, 255, 0.15);
-            padding: 6px 12px;
-            border-radius: 6px;
-            border: 1px solid #00ffff;
-            white-space: nowrap;
-            transition: all 0.2s;
-        }
-
-        .mobile-tip-link:hover, .mobile-tip-link:active {
-            background: rgba(0, 255, 255, 0.3);
-        }
-
-        .mobile-tip-close {
-            background: none;
-            border: none;
-            color: #999;
-            font-size: 16px;
-            cursor: pointer;
-            padding: 4px;
-            line-height: 1;
-        }
-
-        .mobile-tip-close:hover {
-            color: #fff;
-        }
-
-        @media (max-width: 480px) {
-            #mobile-tip-banner {
-                bottom: 80px;
-                left: 10px;
-                right: 10px;
-                transform: none;
-            }
-
-            .mobile-tip-content {
-                flex-direction: column;
-                gap: 8px;
-                text-align: center;
-                font-size: 11px;
-            }
-
-            .mobile-tip-close {
-                position: absolute;
-                top: 4px;
-                right: 8px;
-            }
-        }
-
-        /* Mobile touch controls - hidden by default, shown on mobile */
-        .mobile-controls {
-            display: none;
-            position: fixed;
-            bottom: 20px;
-            right: 10px;
-            z-index: 1000;
-            flex-direction: column;
-            gap: 10px;
-            background: rgba(20, 30, 20, 0.95);
-            border: 2px solid #5a7a5a;
-            border-radius: 12px;
-            padding: 12px;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
-        }
-
-        .mobile-controls-section {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 4px;
-        }
-
-        .mobile-section-label {
-            font-family: 'Courier New', monospace;
-            font-size: 9px;
-            color: #7a9a7a;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-
-        .mobile-btn-group {
-            display: flex;
-            gap: 4px;
-        }
-
-        .mobile-btn-group.vertical {
-            flex-direction: column;
-        }
-
-        .mobile-btn-group.horizontal {
-            flex-direction: row;
-        }
-
-        .mobile-ctrl-btn {
-            width: 44px;
-            height: 44px;
-            background: rgba(122, 154, 122, 0.3);
-            border: 2px solid #5a7a5a;
-            border-radius: 8px;
-            color: #9aba9a;
-            font-size: 18px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            touch-action: manipulation;
-            -webkit-tap-highlight-color: transparent;
-            transition: all 0.15s;
-        }
-
-        .mobile-ctrl-btn:active {
-            background: rgba(122, 154, 122, 0.6);
-            border-color: #8aaa8a;
-            transform: scale(0.95);
-        }
-
-        .mobile-view-btn {
-            width: 36px;
-            height: 36px;
-            background: rgba(0, 200, 200, 0.2);
-            border: 2px solid #00aaaa;
-            border-radius: 6px;
-            color: #00ffff;
-            font-size: 14px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            touch-action: manipulation;
-            -webkit-tap-highlight-color: transparent;
-            transition: all 0.15s;
-        }
-
-        .mobile-view-btn:active {
-            background: rgba(0, 200, 200, 0.5);
-            transform: scale(0.95);
-        }
-
-        /* Show mobile controls on touch devices */
-        @media (max-width: 768px), (pointer: coarse) {
-            .mobile-controls {
-                display: flex;
-                bottom: 20px;
-                right: 10px;
-            }
-        }
-
-        @media (max-width: 480px) {
-            .mobile-controls {
-                bottom: 15px;
-                right: 8px;
-                padding: 10px;
-                gap: 8px;
-            }
-
-            .mobile-ctrl-btn {
-                width: 38px;
-                height: 38px;
-                font-size: 15px;
-            }
-
-            .mobile-view-btn {
-                width: 30px;
-                height: 30px;
-                font-size: 11px;
-            }
-        }
-    </style>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&family=Instrument+Serif:ital@0;1&display=swap">
+    <link rel="stylesheet" href="styles.css">
 </head>
-<body>
-    <!-- Top header bar -->
-    <header class="top-header">
-        <h1>✈ 3D AIR TRAFFIC CONTROL</h1>
-        <div class="header-controls">
-            <div class="status">
-                <span id="status-indicator" class="status-dot"></span>
-                <span id="status-text">Connecting...</span>
-            </div>
-            <div class="stat-inline">
-                <span class="stat-label">Aircraft:</span>
-                <span class="stat-value" id="aircraft-count">0</span>
-            </div>
-            <div class="stat-inline">
-                <span class="stat-label">Update:</span>
-                <span class="stat-value" id="last-update">--</span>
-            </div>
-            <div class="stat-inline">
-                <span class="stat-label">Collisions:</span>
-                <span class="stat-value" id="collision-count" style="color: #ff8800;">0</span>
-            </div>
+<body class="view-3d">
+    <!-- The globe is the page -->
+    <div id="cesiumContainer"></div>
+
+    <!-- Masthead: where the camera looks -->
+    <header class="masthead">
+        <div class="kicker">ADS-B surveillance atlas <span class="sep">/</span> perspective</div>
+        <h1 id="mast-place">&nbsp;</h1>
+        <div class="mast-meta">
+            <span id="mast-coords" class="mono">—</span>
+            <span id="mast-eye" class="mono">—</span>
+            <span id="mast-near"></span>
         </div>
     </header>
 
-    <!-- Cesium 3D container -->
-    <div id="cesiumContainer"></div>
-
-    <!-- Controls -->
-    <div class="controls-overlay" id="controls-overlay">
-        <div class="controls-header">
-            <h3>Controls</h3>
-            <button class="collapse-btn" id="collapse-controls" title="Toggle Controls">▼</button>
+    <!-- Instrument readouts -->
+    <section class="readouts" aria-label="Status">
+        <div class="ro" id="ro-link">
+            <label>Link</label>
+            <div class="ro-value"><span id="status-indicator" class="status-dot"></span><span id="ro-link-value">Connecting</span></div>
+            <small id="ro-link-sub">polling · 2 s</small>
+            <span id="status-text" hidden>Connecting...</span>
         </div>
-        <div class="controls-content" id="controls-content">
-            <div class="view-modes">
-                <button id="view-globe" class="view-mode-btn active">Globe</button>
-                <button id="view-follow" class="view-mode-btn">Follow</button>
+        <div class="ro feed-only" id="ro-seq">
+            <label>Sequence</label>
+            <div class="ro-value mono" id="ro-seq-value">—</div>
+            <small id="ro-seq-sub">—</small>
+        </div>
+        <div class="ro feed-only" id="ro-rate">
+            <label>Feed rate</label>
+            <div class="ro-value mono" id="ro-rate-value">—</div>
+            <small>messages / s</small>
+        </div>
+        <div class="ro feed-only" id="ro-lat">
+            <label>Feed → WebSocket</label>
+            <div class="ro-value mono" id="ro-lat-value">—</div>
+            <small id="ro-lat-sub">µs p50</small>
+        </div>
+        <div class="ro" id="ro-update">
+            <label>Updated</label>
+            <div class="ro-value mono" id="last-update">--</div>
+            <small id="ro-update-sub">waiting</small>
+        </div>
+        <div class="ro" id="ro-conflict">
+            <label>Conflicts</label>
+            <div class="ro-value mono" id="collision-count">—</div>
+            <small id="ro-conflict-sub">next 5 min</small>
+        </div>
+    </section>
+
+    <!-- Aircraft count -->
+    <section class="count" aria-live="polite">
+        <div id="count-big" class="count-big">0</div>
+        <div class="count-label"><span>Aircraft tracked</span> <span id="count-sub">0 airborne</span></div>
+    </section>
+
+    <!-- Edge rail -->
+    <nav class="rail" aria-label="Globe tools">
+        <button class="rail-btn" data-sheet="layers" aria-label="Layers">
+            <svg viewBox="0 0 20 20"><path d="M10 3 L17.5 7 L10 11 L2.5 7 Z"/><path d="M2.5 10.5 L10 14.5 L17.5 10.5"/><path d="M2.5 14 L10 18 L17.5 14"/></svg>
+            <span>Layers</span>
+        </button>
+        <button class="rail-btn" data-sheet="index" aria-label="Aircraft index">
+            <svg viewBox="0 0 20 20"><path d="M3 5h2M3 10h2M3 15h2M8 5h9M8 10h9M8 15h6"/></svg>
+            <span>Index <kbd>/</kbd></span>
+        </button>
+        <button class="rail-btn" data-sheet="analysis" aria-label="Analysis">
+            <svg viewBox="0 0 20 20"><path d="M3 17V3M3 17h14"/><path d="M6.5 14V9M10 14V6M13.5 14v-3"/></svg>
+            <span>Analysis</span>
+        </button>
+        <i class="rail-rule"></i>
+        <button class="rail-btn" id="view-top" aria-label="Look straight down">
+            <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="6.5"/><circle cx="10" cy="10" r="1.2"/></svg>
+            <span>Plan view</span>
+        </button>
+        <button class="rail-btn" id="view-angle" aria-label="Oblique view">
+            <svg viewBox="0 0 20 20"><path d="M3 15 L10 6 L17 15 Z"/></svg>
+            <span>Oblique</span>
+        </button>
+        <button class="rail-btn" id="view-horizon" aria-label="Near the horizon">
+            <svg viewBox="0 0 20 20"><path d="M2.5 12.5h15M5 9.5h10"/></svg>
+            <span>Horizon</span>
+        </button>
+        <button class="rail-btn" id="rotate-left" aria-label="Rotate left">
+            <svg viewBox="0 0 20 20"><path d="M15.5 10a5.5 5.5 0 1 1-1.8-4.1"/><path d="M14 2.5v3.6h-3.6"/></svg>
+            <span>Rotate</span>
+        </button>
+        <button class="rail-btn" id="reset-view" aria-label="Overview">
+            <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="4.5"/><path d="M10 1.5v4M10 14.5v4M1.5 10h4M14.5 10h4"/></svg>
+            <span>Overview</span>
+        </button>
+        <i class="rail-rule"></i>
+        <a class="rail-btn" href="index.html" aria-label="Map">
+            <svg viewBox="0 0 20 20"><path d="M2.5 5 L7.5 3 L12.5 5 L17.5 3 V15 L12.5 17 L7.5 15 L2.5 17 Z"/><path d="M7.5 3v12M12.5 5v12"/></svg>
+            <span>Map</span>
+        </a>
+    </nav>
+
+    <!-- Sheets -->
+    <aside class="sheet" data-sheet="layers" hidden>
+        <header><h2>Layers</h2><button class="sheet-close" aria-label="Close">×</button></header>
+        <div class="sheet-body">
+            <button id="toggle-stems" class="layer active"><span>Altitude stems</span><small>A line from each aircraft to the ground beneath it</small></button>
+            <button id="toggle-labels" class="layer active"><span>Data blocks</span><small>Callsign, flight level, speed</small></button>
+            <button id="toggle-airports" class="layer"><span>All airports</span><small>Large airports are always named; this adds the rest</small></button>
+            <button id="toggle-trails" class="layer"><span>Source trails</span><small>From the server: the gateway keeps the last 200 fixes per aircraft</small></button>
+            <button id="toggle-probability-cones" class="layer"><span>Prediction cones</span><small>Kalman-filter uncertainty, five minutes ahead (Fall 2025 server only)</small></button>
+            <button id="toggle-grounded" class="layer"><span>Hide ground traffic</span><small>Aircraft below 100 ft</small></button>
+            <button id="toggle-buildings" class="layer active"><span>Buildings</span><small>OpenStreetMap 3D buildings</small></button>
+            <button id="toggle-terrain" class="layer active"><span>Globe surface</span><small>Terrain and map imagery</small></button>
+            <div class="sheet-note">
+                <h3>Altitude</h3>
+                <div class="legend-row"><i class="sw top"></i>30,000 ft and above</div>
+                <div class="legend-row"><i class="sw high"></i>20,000 – 30,000</div>
+                <div class="legend-row"><i class="sw mid"></i>10,000 – 20,000</div>
+                <div class="legend-row"><i class="sw low"></i>Below 10,000</div>
+                <div class="legend-row"><i class="sw ground"></i>On the ground</div>
+                <h3>Controls</h3>
+                <p class="muted sheet-help">Drag to orbit · right-drag or shift-drag to tilt · scroll to zoom · click an aircraft for its detail.</p>
             </div>
-            <button id="toggle-airports" class="control-button">Airports</button>
-            <button id="toggle-trails" class="control-button">Trails</button>
-            <button id="toggle-terrain" class="control-button">Terrain</button>
-            <button id="toggle-probability-cones" class="control-button" onclick="toggleProbabilityCones()">⚪ Prediction Cones</button>
-            <button id="toggle-grounded" class="control-button" onclick="toggleHideGroundedPlanes()">⚪ Hide Grounded</button>
-            <button id="toggle-list" class="control-button" onclick="toggleAircraftList()">📋 Aircraft List</button>
-            <button id="toggle-statistics" class="control-button" onclick="toggleStatistics()">📊 Stats</button>
-            <button id="reset-view" class="control-button">Reset View</button>
-            <button class="control-button" onclick="window.location.href='index.html'" style="background: rgba(0, 180, 180, 0.2); border-color: #00aaaa; color: #00ffff;">← 2D View</button>
         </div>
-    </div>
+    </aside>
 
-    <!-- Info panel -->
-    <div class="info-panel" id="info-panel" style="display: none;">
-        <h3 id="info-title">Aircraft Information</h3>
-        <div id="info-content" class="info-content"></div>
-    </div>
-
-    <!-- Statistics panel -->
-    <div id="statistics-panel" class="statistics-panel-3d">
-        <div class="statistics-header-3d">
-            <h3>📊 Statistics</h3>
-            <button class="close-stats-btn" onclick="toggleStatistics()">×</button>
-        </div>
-        <div id="statistics-content" class="statistics-content-3d">
-            <div class="loading-state">Loading statistics...</div>
-        </div>
-    </div>
-
-    <!-- Aircraft list panel -->
-    <div id="aircraft-list-panel" class="aircraft-list-panel-3d">
-        <div class="aircraft-list-header-3d">
-            <h3>📋 Aircraft List</h3>
-            <button class="close-list-btn" onclick="toggleAircraftList()">×</button>
-        </div>
-        <div id="aircraft-list" class="aircraft-list-3d"></div>
-    </div>
-
-    <!-- Follow mode hint -->
-    <div id="follow-hint" style="display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(10, 10, 10, 0.95); border: 2px solid #7a9a7a; border-radius: 8px; padding: 20px; text-align: center; z-index: 2000; pointer-events: none;">
-        <div style="color: #7a9a7a; font-family: 'Courier New', monospace; font-size: 16px;">
-            <strong>Follow Mode Active</strong><br>
-            <span style="font-size: 12px; color: #8aaa8a;">Click on any aircraft to follow it</span>
-        </div>
-    </div>
-
-    <!-- Mobile touch controls -->
-    <div id="mobile-controls" class="mobile-controls">
-        <div class="mobile-controls-section">
-            <span class="mobile-section-label">Tilt</span>
-            <div class="mobile-btn-group vertical">
-                <button class="mobile-ctrl-btn" id="tilt-up" title="Tilt Up">▲</button>
-                <button class="mobile-ctrl-btn" id="tilt-down" title="Tilt Down">▼</button>
+    <aside class="sheet sheet-index" data-sheet="index" hidden>
+        <header><h2>Index</h2><span id="index-count" class="sheet-count"></span><button class="sheet-close" aria-label="Close">×</button></header>
+        <div class="sheet-body">
+            <input id="index-search" type="search" placeholder="Callsign, ICAO or squawk" autocomplete="off" spellcheck="false">
+            <div class="index-sort">
+                <button data-sort="callsign" class="on">Callsign</button>
+                <button data-sort="alt">Altitude</button>
+                <button data-sort="spd">Speed</button>
+                <span>Trk</span>
             </div>
+            <ol id="index-list" class="index-list"></ol>
         </div>
-        <div class="mobile-controls-section">
-            <span class="mobile-section-label">Rotate</span>
-            <div class="mobile-btn-group horizontal">
-                <button class="mobile-ctrl-btn" id="rotate-left" title="Rotate Left">◀</button>
-                <button class="mobile-ctrl-btn" id="rotate-right" title="Rotate Right">▶</button>
-            </div>
-        </div>
-        <div class="mobile-controls-section">
-            <span class="mobile-section-label">Views</span>
-            <div class="mobile-btn-group horizontal">
-                <button class="mobile-view-btn" id="view-top" title="Top Down">⬇</button>
-                <button class="mobile-view-btn" id="view-angle" title="Angled">◢</button>
-                <button class="mobile-view-btn" id="view-horizon" title="Horizon">━</button>
-            </div>
-        </div>
+    </aside>
+
+    <aside class="sheet sheet-analysis" data-sheet="analysis" hidden>
+        <header><h2>Analysis</h2><button class="sheet-close" aria-label="Close">×</button></header>
+        <div class="sheet-body" id="analysis-body"></div>
+    </aside>
+
+    <!-- Selection annotation and its leader -->
+    <svg id="annotation-leader" class="annotation-leader" aria-hidden="true"><polyline points=""/><circle r="2.5"/></svg>
+    <article id="annotation" class="annotation" hidden></article>
+
+    <!-- Compass: the camera's heading -->
+    <div class="compass" aria-hidden="true">
+        <div class="compass-rose" id="compass-rose"><span>N</span><i></i></div>
+        <div class="compass-read"><b id="compass-heading">000°</b><span id="compass-pitch">pitch −45°</span></div>
     </div>
 
+    <div id="toast" class="toast" hidden></div>
+
+    <script src="analysis.js"></script>
     <script type="module" src="cesium-app.js"></script>
 </body>
 </html>

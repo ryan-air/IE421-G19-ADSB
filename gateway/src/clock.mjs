@@ -91,18 +91,42 @@ export class ClockSync {
   }
 }
 
+// Log-spaced bucket index for an integer number of µs: buckets 0-3 are 1 µs
+// wide, then four buckets per octave ([4,5), [5,6), [6,7), [7,8), [8,10) ...),
+// so each is at most 25% wide. 76 buckets cover 0 µs to 1 s.
+export const kLogBuckets = 76;
+
+export function logBucket(us) {
+  if (us < 4) return us;
+  const octave = 31 - Math.clz32(us);
+  return 4 + (octave - 2) * 4 + ((us >>> (octave - 2)) & 3);
+}
+
+// [lower, upper) edges of a log bucket, in µs.
+export function logBucketEdges(i) {
+  if (i < 4) return [i, i + 1];
+  const octave = 2 + ((i - 4) >> 2);
+  const sub = (i - 4) & 3;
+  return [(4 + sub) * 2 ** (octave - 2), (5 + sub) * 2 ** (octave - 2)];
+}
+
 // Latency histogram with 1 µs buckets up to 1 s (plus overflow): exact enough
-// for percentiles at these scales, fixed memory, O(1) record.
+// for percentiles at these scales, fixed memory, O(1) record. A second,
+// log-spaced copy (76 buckets) is kept for clients that draw the distribution
+// or diff two readings for a windowed percentile: reading the fine histogram
+// means scanning a million buckets on the event loop.
 export class LatencyHistogram {
   static kBuckets = 1_000_000;
 
   constructor() {
     this.counts = new Uint32Array(LatencyHistogram.kBuckets);
+    this.logCounts = new Float64Array(kLogBuckets);
     this.reset();
   }
 
   reset() {
     this.counts.fill(0);
+    this.logCounts.fill(0);
     this.n = 0;
     this.overflow = 0;
     this.negative = 0;
@@ -117,7 +141,10 @@ export class LatencyHistogram {
     }
     const us = Math.floor(ns / 1000);
     if (us >= LatencyHistogram.kBuckets) this.overflow++;
-    else this.counts[us]++;
+    else {
+      this.counts[us]++;
+      this.logCounts[logBucket(us)]++;
+    }
     this.n++;
     this.sumNs += ns;
     if (ns > this.maxNs) this.maxNs = ns;
@@ -133,6 +160,15 @@ export class LatencyHistogram {
       if (seen >= rank) return i + 1;
     }
     return Infinity;
+  }
+
+  // Cumulative counts per log bucket since start (or reset); `edges_us` has
+  // one more entry than `counts`. Samples of 1 s or more are in `over_1s`.
+  logHistogram() {
+    const edges = [];
+    for (let i = 0; i < kLogBuckets; i++) edges.push(logBucketEdges(i)[0]);
+    edges.push(logBucketEdges(kLogBuckets - 1)[1]);
+    return { edges_us: edges, counts: Array.from(this.logCounts), over_1s: this.overflow, count: this.n };
   }
 
   summary() {

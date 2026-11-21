@@ -3,98 +3,189 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live Aircraft Tracker</title>
+    <title>ADS-B Atlas</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&family=Instrument+Serif:ital@0;1&display=swap">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <!-- Top header bar -->
-    <header class="top-header">
-        <h1>✈ AIR TRAFFIC CONTROL</h1>
-        <div class="header-controls">
-            <div class="status">
-                <span id="status-indicator" class="status-dot"></span>
-                <span id="status-text">Connecting...</span>
-            </div>
-            <div class="stat-inline">
-                <span class="stat-label">Aircraft:</span>
-                <span class="stat-value" id="aircraft-count">0</span>
-            </div>
-            <div class="stat-inline">
-                <span class="stat-label">Update:</span>
-                <span class="stat-value" id="last-update">--</span>
-            </div>
-            <div class="stat-inline">
-                <span class="stat-label">Collisions:</span>
-                <span class="stat-value" id="collision-count" style="color: #ff8800;">0</span>
-            </div>
+    <!-- The map is the page -->
+    <div id="map"></div>
+
+    <!-- Masthead: where the view is -->
+    <header class="masthead" data-reserve>
+        <div class="kicker">ADS-B surveillance atlas <span class="sep">/</span> 1090 MHz</div>
+        <h1 id="mast-place">&nbsp;</h1>
+        <div class="mast-meta">
+            <span id="mast-coords" class="mono">—</span>
+            <span id="mast-zoom" class="mono">—</span>
+            <span id="mast-near"></span>
         </div>
     </header>
 
-    <!-- Map container (fullscreen) -->
-    <div id="map"></div>
+    <!-- Instrument readouts -->
+    <section class="readouts" aria-label="Status" data-reserve>
+        <div class="ro" id="ro-link">
+            <label>Link</label>
+            <div class="ro-value"><span id="status-indicator" class="status-dot"></span><span id="ro-link-value">Connecting</span></div>
+            <small id="ro-link-sub">—</small>
+            <span id="status-text" hidden>Connecting...</span>
+        </div>
+        <div class="ro feed-only" id="ro-seq">
+            <label>Sequence</label>
+            <div class="ro-value mono" id="ro-seq-value">—</div>
+            <small id="ro-seq-sub">—</small>
+        </div>
+        <div class="ro feed-only" id="ro-rate">
+            <label>Feed rate</label>
+            <div class="ro-value mono" id="ro-rate-value">—</div>
+            <small>messages / s</small>
+        </div>
+        <div class="ro feed-only" id="ro-lat">
+            <label>Feed → WebSocket</label>
+            <div class="ro-value mono" id="ro-lat-value">—</div>
+            <small id="ro-lat-sub">µs p50</small>
+        </div>
+        <div class="ro" id="ro-update">
+            <label>Updated</label>
+            <div class="ro-value mono" id="last-update">--</div>
+            <small id="ro-update-sub">waiting</small>
+        </div>
+        <div class="ro" id="ro-conflict">
+            <label>Conflicts</label>
+            <div class="ro-value mono" id="collision-count">0</div>
+            <small id="ro-conflict-sub">next 5 min</small>
+        </div>
+    </section>
 
-    <!-- Controls overlay (top-right) - Simplified -->
-    <div class="controls-overlay">
-        <div class="control-panel">
-            <h3>Controls</h3>
-            <button id="toggle-list" class="control-button">Toggle Aircraft List</button>
-            <button id="toggle-statistics" class="control-button">Toggle Statistics</button>
-            <button id="toggle-airports" class="control-button">Toggle Airports</button>
-            <button id="toggle-trails" class="control-button">⚪ Show All Trails</button>
-            <button id="toggle-predictions" class="control-button" onclick="togglePredictionWedges()">⚪ Show Predictions</button>
-            <button onclick="window.location.href='3d.html'" class="control-button" style="background: rgba(122, 154, 122, 0.3); border-color: #8aaa8a;">View in 3D 🌍</button>
+    <!-- Aircraft count -->
+    <section class="count" data-reserve aria-live="polite">
+        <div id="count-big" class="count-big">0</div>
+        <span id="aircraft-count" hidden>0</span>
+        <div class="count-label"><span>Aircraft in view</span> <span id="count-sub">of 0 tracked</span></div>
+    </section>
+
+    <!-- Edge rail -->
+    <nav class="rail" aria-label="Map tools">
+        <button class="rail-btn" data-sheet="layers" aria-label="Layers">
+            <svg viewBox="0 0 20 20"><path d="M10 3 L17.5 7 L10 11 L2.5 7 Z"/><path d="M2.5 10.5 L10 14.5 L17.5 10.5"/><path d="M2.5 14 L10 18 L17.5 14"/></svg>
+            <span>Layers</span>
+        </button>
+        <button class="rail-btn" data-sheet="index" aria-label="Aircraft index">
+            <svg viewBox="0 0 20 20"><path d="M3 5h2M3 10h2M3 15h2M8 5h9M8 10h9M8 15h6"/></svg>
+            <span>Index <kbd>/</kbd></span>
+        </button>
+        <button class="rail-btn" data-sheet="analysis" aria-label="Analysis">
+            <svg viewBox="0 0 20 20"><path d="M3 17V3M3 17h14"/><path d="M6.5 14V9M10 14V6M13.5 14v-3"/></svg>
+            <span>Analysis</span>
+        </button>
+        <i class="rail-rule"></i>
+        <button class="rail-btn" id="rail-zoom-in" aria-label="Zoom in">
+            <svg viewBox="0 0 20 20"><path d="M10 4v12M4 10h12"/></svg>
+            <span>Zoom in</span>
+        </button>
+        <button class="rail-btn" id="rail-zoom-out" aria-label="Zoom out">
+            <svg viewBox="0 0 20 20"><path d="M4 10h12"/></svg>
+            <span>Zoom out</span>
+        </button>
+        <button class="rail-btn" id="rail-home" aria-label="Receiver">
+            <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="4.5"/><path d="M10 1.5v4M10 14.5v4M1.5 10h4M14.5 10h4"/></svg>
+            <span>Receiver</span>
+        </button>
+        <i class="rail-rule"></i>
+        <a class="rail-btn" href="3d.html" aria-label="3D view">
+            <svg viewBox="0 0 20 20"><path d="M10 2.5 L17 6.5 V13.5 L10 17.5 L3 13.5 V6.5 Z"/><path d="M3 6.5 L10 10.5 L17 6.5M10 10.5V17.5"/></svg>
+            <span>3D view</span>
+        </a>
+    </nav>
+
+    <!-- Sheets, opened from the rail -->
+    <aside class="sheet" data-sheet="layers" hidden>
+        <header><h2>Layers</h2><button class="sheet-close" aria-label="Close">×</button></header>
+        <div class="sheet-body">
+            <button id="toggle-labels" class="layer active"><span>Data blocks</span><small>Callsign, flight level, speed; placed to avoid overlap <kbd>N</kbd></small></button>
+            <button id="toggle-tape" class="layer active"><span>Altitude tape</span><small>Every aircraft on one vertical scale</small></button>
+            <button id="toggle-airports" class="layer"><span>Airports</span><small>All airports in the data set; large ones are always named</small></button>
+            <button id="toggle-trails" class="layer"><span>Source trails</span><small>From the server: the gateway keeps the last 200 fixes per aircraft</small></button>
+            <button id="toggle-predictions" class="layer" onclick="togglePredictionWedges()"><span>Prediction wedges</span><small>Five minutes ahead, ±12° of track</small></button>
+            <button id="toggle-wind" class="layer active"><span>Wind</span><small>Current weather-model wind (Open-Meteo), not measured here; streak speed scaled</small></button>
+            <div class="wind-levels" role="group" aria-label="Wind level">
+                <button data-level="10m" class="on">SFC</button><button data-level="850hPa">FL050</button><button data-level="500hPa">FL180</button><button data-level="250hPa">FL340</button>
+            </div>
+            <div class="sheet-note">
+                <h3>Altitude</h3>
+                <div class="legend-row"><i class="sw top"></i>30,000 ft and above</div>
+                <div class="legend-row"><i class="sw high"></i>20,000 – 30,000</div>
+                <div class="legend-row"><i class="sw mid"></i>10,000 – 20,000</div>
+                <div class="legend-row"><i class="sw low"></i>Below 10,000</div>
+                <div class="legend-row"><i class="sw ground"></i>On the ground</div>
+            </div>
+        </div>
+    </aside>
+
+    <aside class="sheet sheet-index" data-sheet="index" hidden>
+        <header><h2>Index</h2><span id="index-count" class="sheet-count"></span><button class="sheet-close" aria-label="Close">×</button></header>
+        <div class="sheet-body">
+            <input id="index-search" type="search" placeholder="Callsign, ICAO or squawk" autocomplete="off" spellcheck="false">
+            <div class="index-sort">
+                <button data-sort="callsign" class="on">Callsign</button>
+                <button data-sort="alt">Altitude</button>
+                <button data-sort="spd">Speed</button>
+                <span>Trk</span>
+            </div>
+            <ol id="index-list" class="index-list"></ol>
+            <!-- kept for app.js compatibility -->
+            <div id="aircraft-list" hidden></div>
+        </div>
+    </aside>
+
+    <aside class="sheet sheet-analysis" data-sheet="analysis" hidden>
+        <header><h2>Analysis</h2><button class="sheet-close" aria-label="Close">×</button></header>
+        <div class="sheet-body" id="analysis-body"></div>
+    </aside>
+
+    <!-- Selection annotation and its leader -->
+    <svg id="annotation-leader" class="annotation-leader" aria-hidden="true"><polyline points=""/><circle r="2.5"/></svg>
+    <article id="annotation" class="annotation" data-reserve hidden></article>
+
+    <!-- Altitude tape -->
+    <div class="alt-tape" data-reserve aria-hidden="true">
+        <label>Altitude<br><span>×100 ft</span></label>
+        <div class="alt-tape-canvas-wrap"><canvas id="alt-tape-canvas"></canvas></div>
+    </div>
+
+    <!-- Scale -->
+    <div class="scale" data-reserve aria-hidden="true">
+        <div id="wind-legend" class="wind-legend" hidden></div>
+        <div class="north"><span>N</span><i></i></div>
+        <div class="scale-bar-wrap">
+            <div id="scale-bar" class="scale-bar"><span>0</span><span id="scale-mid"></span><span id="scale-label">—</span></div>
         </div>
     </div>
 
-    <!-- Aircraft list panel (bottom, collapsible) -->
-    <div id="aircraft-list-panel" class="aircraft-list-panel">
-        <div class="aircraft-list-header">
-            <h2>Aircraft List</h2>
-            <button id="close-list" class="close-button">×</button>
+    <!-- Timeline -->
+    <footer class="timeline" data-reserve>
+        <div class="tl-controls">
+            <button id="tl-play" class="tl-play" aria-label="Play back"><svg viewBox="0 0 16 16"><path class="i-play" d="M4.5 3 L13 8 L4.5 13 Z"/><path class="i-pause" d="M4.5 3h2.5v10H4.5zM9 3h2.5v10H9z"/></svg></button>
+            <button id="tl-speed" class="tl-speed" aria-label="Playback speed">1×</button>
+            <button id="tl-live" class="tl-live on">Live</button>
         </div>
-        <div id="aircraft-list" class="aircraft-list"></div>
-    </div>
-
-    <!-- Statistics panel (right side, collapsible) -->
-    <div id="statistics-panel" class="statistics-panel">
-        <div class="statistics-header">
-            <h2>Statistics Dashboard</h2>
-            <button id="close-statistics" class="close-button">×</button>
+        <div class="tl-track">
+            <canvas id="timeline-canvas"></canvas>
+            <div id="timeline-tip" class="tl-tip" hidden></div>
         </div>
-        <div id="statistics-content" class="statistics-content">
-            <div class="loading-state">Loading statistics...</div>
+        <div class="tl-readout">
+            <div id="tl-time" class="tl-time">Live</div>
+            <div id="tl-sub" class="tl-sub">recording</div>
         </div>
-    </div>
-
-    <!-- Mobile menu toggle -->
-    <button class="mobile-menu-toggle" id="mobile-menu-toggle" onclick="toggleMobileMenu()">☰</button>
+    </footer>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="app.js"></script>
-    <script>
-        // Mobile menu toggle
-        function toggleMobileMenu() {
-            const sidebar = document.querySelector('.controls-overlay');
-            const toggle = document.getElementById('mobile-menu-toggle');
-            sidebar.classList.toggle('mobile-open');
-            toggle.classList.toggle('active');
-            toggle.textContent = sidebar.classList.contains('mobile-open') ? '✕' : '☰';
-        }
-
-        // Close mobile menu when clicking outside
-        document.addEventListener('click', (e) => {
-            const sidebar = document.querySelector('.controls-overlay');
-            const toggle = document.getElementById('mobile-menu-toggle');
-            if (window.innerWidth <= 768 && 
-                sidebar.classList.contains('mobile-open') && 
-                !sidebar.contains(e.target) && 
-                !toggle.contains(e.target)) {
-                sidebar.classList.remove('mobile-open');
-                toggle.classList.remove('active');
-                toggle.textContent = '☰';
-            }
-        });
-    </script>
+    <script src="analysis.js"></script>
+    <script src="wind.js"></script>
+    <script src="atlas.js"></script>
 </body>
 </html>

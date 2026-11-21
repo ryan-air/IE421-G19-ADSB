@@ -1,6 +1,6 @@
 # ADS-B as a Market Data Feed — Project Updates
 
-This document describes how we are extending the Fall 2025 **ADS-B Aircraft Tracking System** (see [README.md](README.md) and [PROJECT_REPORT.md](PROJECT_REPORT.md)) into a low-latency, HFT-style system. The original README still documents the existing system. This file documents **what we are changing, how, and how we will measure it**.
+This document describes how we are extending the Fall 2025 **ADS-B Aircraft Tracking System** (see [FALL2025_README.md](FALL2025_README.md) and [PROJECT_REPORT.md](PROJECT_REPORT.md)) into a low-latency, HFT-style system. The original README, kept as `FALL2025_README.md`, still documents the existing system. This file documents **what we are changing, how, and how we will measure it**.
 
 > **Team setup:** to build and test the new code, start with [SETUP.md](SETUP.md).
 
@@ -15,7 +15,7 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 >
 > - live Beast ingest from readsb (`adsb-live`, §5.3);
 > - the feed over kernel UDP (§9.1–9.2, 9.5): publisher, retransmit and snapshot servers, subscriber library and `adsb-feed-cli`, with loss injection; reconstructed books are byte-identical to the publisher's;
-> - the WebSocket gateway (`gateway/`, Node): subscribes to the feed with the same recovery protocol, pushes conflated frames to browsers with per-client flow control, and serves the Fall 2025 map from memory instead of Postgres (`ads/` itself unmodified; it can subscribe to the full feed or the conflated feed);
+> - the WebSocket gateway (`gateway/`, Node): subscribes to the feed with the same recovery protocol, pushes conflated frames to browsers with per-client flow control, and serves the map from memory instead of Postgres (`ads/app.js` takes the live feed itself; it can subscribe to the full feed or the conflated feed);
 > - the first end-to-end before/after comparison ([findings](bench/results/legacy-baseline/README.md)): frame → map in the browser about 1.1–1.6 s for the Fall 2025 system (83% of positions discarded) against about 70–90 ms for the new pipeline (median, 50–3,000 aircraft, laptop; tail percentiles still to be measured on a quiet host).
 >
 > - overload semantics for the live pipeline (§10.1, §10.3): loss only at the input boundary and counted, publisher batching while busy (1 M frames/s with publishing, up from about 300 k), tested at 0.5×, 2× and 10× saturation and through a burst (`core/scripts/check-overload.sh`, in CI).

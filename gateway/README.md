@@ -1,9 +1,9 @@
 # WebSocket gateway
 
-Subscribes to the track feed (multicast UDP, with full gap recovery), keeps the track table in memory, and pushes it to browsers over WebSockets (README_UPDATES.md §9.6, §10). It also serves the **Fall 2025 map, unmodified**, from memory instead of Postgres: the 2-second database poll becomes a push.
+Subscribes to the track feed (multicast UDP, with full gap recovery), keeps the track table in memory, and pushes it to browsers over WebSockets (README_UPDATES.md §9.6, §10). It also serves the map (`ads/`) from memory instead of Postgres: the 2-second database poll becomes a push.
 
 ```
-adsb-publish / adsb-live --publish ──multicast──▶ adsb-gateway ──WebSocket──▶ browsers (ads/ map + shim)
+adsb-publish / adsb-live --publish ──multicast──▶ adsb-gateway ──WebSocket──▶ browsers (ads/ map)
         ▲ retransmit (UDP) / snapshot (TCP) ◀────────┘      └──HTTP──▶ /api/aircraft, trails, statistics (Fall 2025 API)
 ```
 
@@ -34,14 +34,16 @@ Endpoints: `/` serves the map, `/gateway/ws` is the WebSocket, `/gateway/stats` 
 
 **Fan-out.** Each client has a set of ICAO addresses that changed since its last frame. A flush sends the current bytes of each (or a delete). After every frame, the client's table therefore equals the gateway's book at the frame's `as_of_seq`, however far the client fell behind. A slow client receives less data, but each frame brings it fully up to date. Its pending state is bounded by the number of aircraft, never by the message rate, and it never delays other clients.
 
-**Flow control.** A client that opts in keeps at most `window` frames unacknowledged. While it is behind, its changes are conflated into the next frame. Without this, a slow browser's backlog hides in kernel socket buffers, which on loopback autotune to megabytes. A client stalling 3 ms per frame then fell more than 18 s behind. With a window of 8 it stays about 20 ms behind (8 frames × its own 3 ms). The map shim and `adsb-ws-client` both use window 8 and acknowledge every 4 frames. Clients without flow control are still served: the gateway writes a frame only once the previous one is in the kernel (`--high-water 0`). A client stuck for 10 s (`--stuck-ms`) is disconnected.
+**Flow control.** A client that opts in keeps at most `window` frames unacknowledged. While it is behind, its changes are conflated into the next frame. Without this, a slow browser's backlog hides in kernel socket buffers, which on loopback autotune to megabytes. A client stalling 3 ms per frame then fell more than 18 s behind. With a window of 8 it stays about 20 ms behind (8 frames × its own 3 ms). The map (`ads/app.js`) and `adsb-ws-client` both use window 8 and acknowledge every 4 frames. Clients without flow control are still served: the gateway writes a frame only once the previous one is in the kernel (`--high-water 0`). A client stuck for 10 s (`--stuck-ms`) is disconnected.
 
-**The Fall 2025 map.** `ads/` is served as-is. The gateway adds one script, `public/map-shim.js`, to `index.html`. The shim:
+**The map.** `ads/` is served as it is. Its `app.js` takes the live feed itself (the "Live feed" section at its end; until November 2026 this was a separate shim that the gateway added to the page). When the page can load `/gateway/gateway_protocol.mjs`, it:
 - keeps a live table from the WebSocket;
-- answers the page's own `fetch('/api/aircraft')` from that table;
-- calls `app.js`'s `fetchAircraftData()` when frames arrive, at most every 100 ms (`?render_ms=N`), on an animation frame;
-- replaces the 2 s marker easing with an immediate move, so markers show the latest position (`?animate=1` restores the easing);
-- acknowledges frames for flow control.
+- redraws from that table when frames arrive, at most every 100 ms (`?render_ms=N`), on an animation frame, and stops polling `/api/aircraft` while in sync;
+- shows markers at their latest position instead of easing over 2 s (`?animate=1` restores the easing);
+- acknowledges frames for flow control;
+- reconnects with backoff, with the 2-second poll covering the time out of sync (back in sync about 1 s after a gateway restart).
+
+Served by the Fall 2025 `server.js`, there is no protocol module, so the page polls as before.
 
 `/api/aircraft`, `/api/aircraft/:hex/trail` (from an in-memory ring of 200 positions per aircraft), `/api/statistics` and `/api/health` are answered from memory in the Fall 2025 JSON shapes. `/api/collisions/kalman` returns an empty list: the gateway does not run the Fall 2025 collision model.
 
@@ -81,7 +83,7 @@ The server accepts client messages up to 64 KiB.
 | publish → WebSocket client (`adsb-ws-client`, Node) | p50 95 µs, p99 about 2 ms | Same run |
 | Slow client (stalls 3 ms per frame), no flow control | over 1 s behind (p50); max 18.6 s | 300 aircraft, 15× real time |
 | Slow client, window 8 | p50 19–25 ms | Same run |
-| Browser (unmodified Fall 2025 map, 150 aircraft) | markers at the latest position (0 m off); one full render 8 ms | Built-in browser pane |
+| Browser (the map, 150 aircraft) | markers at the latest position (0 m off); one full render 8 ms | Built-in browser pane |
 | Fall 2025 system, for comparison | 1.1–1.6 s frame → map | `bench/results/legacy-baseline/` |
 
 **Caveats.**
@@ -110,7 +112,7 @@ gateway/scripts/check-gateway.sh core/build/release # integration against the C+
 - **Network exposure:** no TLS and no authentication. The gateway listens on 127.0.0.1 by default. Put it behind nginx (as `ads/nginx-adsb.conf` does for the Fall 2025 server) to expose it.
 - **One process:** Node is single-threaded, so feed processing and fan-out share one core. At real-world rates (hundreds to a few thousand messages a second) this is far from the limit.
 - **Map features:** collision detection and Postgres-backed history are not provided. Trails last as long as the gateway's memory, 200 points per aircraft.
-- **Map tiles:** the Fall 2025 map's CARTO tile URL now answers "API key required". This is unrelated to the gateway, and `ads/` is not modified here.
+- **Map tiles:** the map uses Esri's dark gray canvas and its labels layer, which need no API key (the Fall 2025 CARTO tiles now answer "API key required"). They are fetched from Esri by each browser, so the map needs internet access.
 - **Feed choice:** the gateway works on either feed. The plan (§9.6) has it subscribe to the conflated feed: publish one with `--conflate 239.19.0.3:41910` and start the gateway with `--feed 239.19.0.3:41910 --retransmit 127.0.0.1:41911 --snapshot 127.0.0.1:41912`. It conflates per client in either case. On ADS-B traffic, the 10 Hz conflated feed carries 96% of the full feed's updates, so it caps per-aircraft rates more than it saves bandwidth.
 
 An independent review found two flow-control bugs, both fixed with regression tests in `test/fanout.test.mjs`:

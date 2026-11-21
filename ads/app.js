@@ -27,11 +27,18 @@ function initializeMap() {
         attributionControl: true
     }).setView([41.88, -87.63], 9); // Default: Chicago, IL (receiver location)
 
-    // Add dark CartoDB tiles for ATC/radar look
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-        attribution: '© OpenStreetMap contributors © CARTO',
-        maxZoom: 19,
-        subdomains: 'abcd'
+    // Dark basemap for the ATC/radar look: Esri's dark gray canvas plus its
+    // labels layer (no API key needed; CARTO's dark_all now requires one).
+    const esri = 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas';
+    const esriAttribution = 'Tiles &copy; Esri &mdash; Esri, HERE, Garmin, &copy; OpenStreetMap contributors';
+    L.tileLayer(`${esri}/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}`, {
+        attribution: esriAttribution,
+        maxNativeZoom: 16,
+        maxZoom: 19
+    }).addTo(map);
+    L.tileLayer(`${esri}/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}`, {
+        maxNativeZoom: 16,
+        maxZoom: 19
     }).addTo(map);
 
     // Load airports data
@@ -219,6 +226,20 @@ function interpolateAngle(start, end, t) {
 
 // Smooth movement interpolation
 function smoothMoveMarker(marker, targetLat, targetLon, targetHeading, duration) {
+    // With the live feed, updates arrive many times a second: show the
+    // latest position at once instead of easing towards it over 2 s
+    // (?animate=1 keeps the easing).
+    if (liveFeed.synced && !liveFeed.animate) {
+        marker.setLatLng([targetLat, targetLon]);
+        if (marker._icon) {
+            const iconElement = marker._icon.querySelector('.aircraft-icon');
+            if (iconElement) {
+                iconElement.style.transform = `rotate(${targetHeading}deg)`;
+            }
+        }
+        marker._heading = targetHeading;
+        return;
+    }
     const currentPos = marker.getLatLng();
     const startLat = currentPos.lat;
     const startLon = currentPos.lng;
@@ -414,8 +435,10 @@ function getTimeWindow() {
     return 0;
 }
 
-// Fetch aircraft data from backend
+// Fetch aircraft data from backend (the 2 s poll; skipped while the live
+// feed from the gateway is in sync, see "Live feed" below)
 async function fetchAircraftData() {
+    if (liveFeed.synced) return;
     try {
         const timeWindow = getTimeWindow();
         const response = await fetch(`/api/aircraft?window=${timeWindow}`);
@@ -425,8 +448,18 @@ async function fetchAircraftData() {
         }
 
         const data = await response.json();
+        if (liveFeed.synced) return; // the live feed took over meanwhile
 
         updateStatus(true);
+        renderAircraftData(data);
+    } catch (error) {
+        console.error('Error fetching aircraft data:', error);
+        updateStatus(false, 'Connection Error');
+    }
+}
+
+// Shows one aircraft table ({now, aircraft: [...]}) on the map and the list.
+function renderAircraftData(data) {
         document.getElementById('aircraft-count').textContent = data.aircraft?.length || 0;
         document.getElementById('last-update').textContent = formatTime(data.now || Date.now());
 
@@ -445,10 +478,6 @@ async function fetchAircraftData() {
                 }
             });
         }
-    } catch (error) {
-        console.error('Error fetching aircraft data:', error);
-        updateStatus(false, 'Connection Error');
-    }
 }
 
 /**
@@ -1054,6 +1083,161 @@ function setupControls() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live feed
+//
+// Served by the WebSocket gateway (gateway/), the page keeps a live copy of
+// the track table from /gateway/ws and redraws within `render_ms` (default
+// 100 ms) of each update, instead of polling /api/aircraft every 2 s. It:
+//   - acknowledges frames (flow control: window 8, an ack every 4 frames), so
+//     a page that falls behind gets conflated frames instead of a backlog;
+//   - reconnects with backoff, and the 2 s poll covers the time out of sync;
+//   - shows markers at their latest position (?animate=1 keeps the easing).
+// Served by the Fall 2025 server.js there is no gateway: the protocol module
+// fails to load and the page keeps polling, as before.
+// window.__gateway is the same object, for tests and latency measurement.
+// ---------------------------------------------------------------------------
+const liveFeed = {
+    connected: false,
+    synced: false, // first full table received
+    animate: new URLSearchParams(location.search).get('animate') === '1',
+    renderMs: Math.max(0, Number(new URLSearchParams(location.search).get('render_ms') ?? 100)),
+    frames: 0,
+    renders: 0,
+    reconnects: 0,
+    asOfSeq: 0,
+    flags: 0,
+    lastFrameAt: 0,
+    lastRenderAt: 0,
+    seen: new Map(), // icao -> wall ms of the last update
+    table: null,
+    status: null,
+    backoff: 250,
+};
+window.__gateway = liveFeed;
+let liveProto = null;
+let liveRenderTimer = null;
+let liveRenderScheduled = false;
+
+function liveAircraftData() {
+    const aircraft = [];
+    for (const [icao, u] of liveFeed.table.tracks) {
+        const seen = liveFeed.seen.get(icao);
+        const a = liveProto.toAircraft(u, seen ? Math.floor(seen / 1000) : null);
+        if (a.lat === null || a.lon === null) continue;
+        aircraft.push(a);
+    }
+    return { now: Date.now(), aircraft, timeWindow: 0, source: 'gateway-ws', as_of_seq: liveFeed.asOfSeq };
+}
+
+function updateLiveStatus() {
+    if (!liveFeed.connected) updateStatus(false, 'Gateway disconnected');
+    else if (!liveFeed.synced) updateStatus(false, 'Syncing...');
+    else if (liveFeed.flags & liveProto.FrameFlags.kStale) updateStatus(false, 'Recovering feed...');
+    else if (liveFeed.flags & liveProto.FrameFlags.kEnded) updateStatus(false, 'Feed ended');
+    else updateStatus(true, 'Live (WebSocket)');
+}
+
+function renderLive() {
+    liveRenderScheduled = false;
+    liveFeed.lastRenderAt = performance.now();
+    liveFeed.renders++;
+    if (liveFeed.synced) {
+        try {
+            renderAircraftData(liveAircraftData());
+        } catch (error) {
+            console.error('Error drawing the live feed:', error);
+        }
+    }
+    updateLiveStatus();
+}
+
+function scheduleLiveRender() {
+    if (liveRenderScheduled) return;
+    liveRenderScheduled = true;
+    const wait = Math.max(0, liveFeed.lastRenderAt + liveFeed.renderMs - performance.now());
+    clearTimeout(liveRenderTimer);
+    liveRenderTimer = setTimeout(() => requestAnimationFrame(renderLive), wait);
+}
+
+function connectLiveFeed() {
+    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/gateway/ws`);
+    ws.binaryType = 'arraybuffer';
+    let processed = 0;
+    let acked = 0;
+    const ack = new Uint8Array(5);
+    ack[0] = 0x41; // 'A'
+    const ackView = new DataView(ack.buffer);
+    ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'hello', window: 8 }));
+        liveFeed.connected = true;
+        liveFeed.backoff = 250;
+        updateLiveStatus();
+    };
+    ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+            try {
+                liveFeed.status = JSON.parse(ev.data);
+            } catch {
+                // ignore
+            }
+            return;
+        }
+        // Count every binary frame, even one that fails to decode, or the
+        // gateway would wait for its ack forever. An ack every 4 frames keeps
+        // a window of 8 from running dry.
+        processed++;
+        if (processed - acked >= 4) {
+            acked = processed;
+            ackView.setUint32(1, acked, true);
+            ws.send(ack);
+        }
+        let frame;
+        try {
+            frame = liveProto.decodeFrame(ev.data);
+        } catch (error) {
+            console.error('gateway frame', error);
+            return;
+        }
+        const now = Date.now();
+        const touched = liveFeed.table.apply(frame);
+        if (touched === null) { // a full table
+            liveFeed.seen.clear();
+            for (const icao of liveFeed.table.tracks.keys()) liveFeed.seen.set(icao, now);
+            liveFeed.synced = true;
+        } else {
+            for (const icao of touched) {
+                if (liveFeed.table.tracks.has(icao)) liveFeed.seen.set(icao, now);
+                else liveFeed.seen.delete(icao);
+            }
+        }
+        liveFeed.frames++;
+        liveFeed.asOfSeq = frame.asOfSeq;
+        liveFeed.flags = frame.flags;
+        liveFeed.lastFrameAt = performance.now();
+        scheduleLiveRender();
+    };
+    ws.onclose = () => {
+        liveFeed.connected = false;
+        liveFeed.synced = false; // the 2 s poll takes over until the next full table
+        updateLiveStatus();
+        liveFeed.reconnects++;
+        const backoff = Math.min(5000, liveFeed.backoff);
+        liveFeed.backoff = backoff * 2;
+        setTimeout(connectLiveFeed, backoff);
+    };
+}
+
+function startLiveFeed() {
+    import('/gateway/gateway_protocol.mjs').then((m) => {
+        liveProto = m;
+        liveFeed.table = new m.TrackTable();
+        connectLiveFeed();
+    }, () => {
+        // No gateway (the Fall 2025 server): keep polling.
+    });
+}
+
 // Initialize when page loads
 // Load aircraft types for helicopter detection
 document.addEventListener('DOMContentLoaded', () => {
@@ -1061,6 +1245,7 @@ document.addEventListener('DOMContentLoaded', () => {
     updateStatus(false, 'Connecting...');
     setupControls();
     startPolling();
+    startLiveFeed();
 });
 
 // Cleanup on page unload

@@ -1,8 +1,9 @@
 // The WebSocket gateway (README_UPDATES.md §10): subscribes to the track feed
 // with full gap recovery, keeps the book in memory, and pushes it to browsers
-// over WebSockets. It also serves the Fall 2025 map (ads/, unmodified) with a
-// small shim, and answers the map's REST endpoints (/api/aircraft, trails,
-// statistics) from memory instead of Postgres.
+// over WebSockets. It also serves the map (ads/; app.js takes the live feed
+// from /gateway/ws when it can load /gateway/gateway_protocol.mjs), and
+// answers the map's REST endpoints (/api/aircraft, trails, statistics) from
+// memory instead of Postgres.
 //
 // Fan-out is conflated per client. Each client has a set of ICAO addresses
 // that changed since its last frame. A flush sends the current bytes of each
@@ -569,15 +570,8 @@ export class Gateway {
       res.end('not found');
       return;
     }
-    if (root === this.opts.mapDir && decoded === 'index.html') body = injectShim(body.toString('utf8'));
     res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache' });
     res.end(method === 'HEAD' ? undefined : body);
   }
 }
 
-// Adds the gateway shim to the Fall 2025 page, after app.js.
-export function injectShim(html) {
-  const tag = '<script src="/gateway/map-shim.js"></script>\n';
-  const i = html.lastIndexOf('</body>');
-  return i < 0 ? html + tag : html.slice(0, i) + tag + html.slice(i);
-}

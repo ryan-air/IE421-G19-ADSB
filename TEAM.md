@@ -87,7 +87,7 @@ Most of this waits for the benchmark host. Until then, anyone with spare time ca
 |---|---|---|---|
 | Set up and tune the benchmark host (`core/scripts/tune-host.sh`); rerun every benchmark there (laptop tail latencies are unreliable). The whole suite is one command: `bench/lab/run.sh` (see `bench/lab/README.md`) | Must | Benchmark host | M |
 | Full benchmark report: 10,000-aircraft load, tail analysis (explain every p99.9 outlier class), PGO and ablation table | Must | Benchmark host | L |
-| Fold the gateway's map shim into `ads/app.js` (the Fall 2025 code may now be edited; the benchmark measures the tag `fall2025-final`), fix the map tiles' API key, update `README.md` and `PROJECT_REPORT.md` | Should | None | S–M |
+| ~~Fold the gateway's map shim into `ads/app.js`, fix the map tiles' API key, update `README.md` and `PROJECT_REPORT.md`~~ **Done:** `ads/app.js` takes the live feed itself (polls the Fall 2025 server as before); Esri dark tiles, no key; new `README.md` for the project (the original is `FALL2025_README.md`); `PROJECT_REPORT.md` marked as the Fall 2025 report | Should | None | S–M |
 | Noisy-neighbor isolation matrix (CAT/MBA) | Should | A CPU with RDT | M |
 | Minimal camera fusion (plan §13) | Should | Camera and a site | M–L |
 | Final report, demo video, reproducible-run instructions | Must | None | M |

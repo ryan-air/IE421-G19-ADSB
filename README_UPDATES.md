@@ -644,7 +644,7 @@ On `main`, with CI passing:
 
 - the IQ scenario generator (§22.4): `adsb-iqsynth` writes SigMF recordings with per-message truth; pinned readsb decodes 98.8% of clean messages at 15–30 dB SNR, with timestamps within 0.3 µs of the truth (`core/scripts/check-iq.sh`, in CI).
 
-- the demodulator (§5.2): `adsb-demod` decodes the generator's files with 1–20% more messages than readsb on the same files (+10% on weak signals), thanks to a sequence detector behind the half-bit slicer, and no false DF17; starts within 0.06 µs of the truth (`core/scripts/check-demod.sh`, in CI). Not yet: real RTL-SDR recordings, live SDR ingest (§5.1), SIMD.
+- the demodulator (§5.2): `adsb-demod` decodes the generator's files with 1–20% more messages than readsb on the same files (+10% on weak signals), thanks to a sequence detector behind the half-bit slicer, and no false DF17; starts within 0.06 µs of the truth (`core/scripts/check-demod.sh`, in CI). `adsb-live --iq` runs the whole pipeline on IQ samples: a paced reader and a block ring that drops and counts whole blocks under overload, then the demodulator, track state and feed; last sample → track state p50 1.2 / 5.2 / 20 ms for 1.7 / 6.8 / 27 ms blocks (`core/scripts/check-iq-live.sh`, in CI). Not yet: real RTL-SDR recordings, a live `librtlsdr` source (§5.1), SIMD.
 
 Not started: A/B arbitration (B), hardware timestamps (§9.4), ITCH (J), and camera fusion (I).
 

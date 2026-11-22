@@ -1,4 +1,5 @@
-// adsb-live: run the pipeline on a live Beast feed (readsb / dump1090).
+// adsb-live: run the pipeline on a live Beast feed (readsb / dump1090), or
+// on raw IQ samples through our own demodulator (--iq).
 //
 //   adsb-live [--host 127.0.0.1] [--port 30005] [--record FILE.adsbrec]
 //             [--duration SECONDS] [--receiver LAT,LON] [--stats-every SECONDS]
@@ -6,7 +7,11 @@
 //             [--publish GROUP:PORT [--publish-interface ADDR] [--batch-us N] ...]
 //
 // Threads:
-//   ingest    BeastTcpSource: recv -> parse -> Record (rx_ns = receive time)
+//   ingest    BeastTcpSource: recv -> parse -> Record (rx_ns = receive time),
+//             or with --iq the IqSource consumer: IQ blocks -> demodulator ->
+//             Record (rx_ns = host time the frame's last sample arrived),
+//             fed by an IQ reader thread through a block ring that drops and
+//             counts whole blocks when the demodulator falls behind
 //               -> StageQueue -> state thread
 //               -> recorder queue (if --record; dropped and counted if full,
 //                  so a slow disk never stalls ingest)
@@ -41,6 +46,7 @@
 #include "adsb/feed/shm_ring.hpp"
 #include "adsb/feed/tx.hpp"
 #include "adsb/ingest/beast_tcp.hpp"
+#include "adsb/ingest/iq_source.hpp"
 #include "adsb/record/recording.hpp"
 #include "adsb/state/track_engine.hpp"
 
@@ -61,6 +67,21 @@ void on_signal(int) { g_stop.store(true); }
                "  --busy-poll           spin on the socket instead of poll() (lowest latency, uses a core)\n"
                "  --cpus I,S[,R]        pin ingest, state, recorder threads (Linux only)\n"
                "  --line N              receiver line id to stamp on frames (default 0)\n"
+               "IQ input (our demodulator instead of readsb; README_UPDATES.md §5):\n"
+               "  --iq PATH             IQ samples: NAME.sigmf-meta / .sigmf-data (format and rate from the\n"
+               "                        metadata), a raw file, or - for stdin; adsb-live stops at its end\n"
+               "  --iq-format F         cu8 | cs8 | cs16 | cf32 (raw input)\n"
+               "  --iq-rate HZ          sample rate (raw input; default 2.4e6)\n"
+               "  --iq-block N          samples per block, like an SDR's USB transfer (default 16384)\n"
+               "  --iq-buffers N        blocks the IQ ring holds (default 16); when full, blocks are dropped\n"
+               "                        and counted\n"
+               "  --iq-speed X          pace the input at X times the sample rate (default 1 = like a receiver;\n"
+               "                        0 = as fast as the demodulator goes, waiting instead of dropping, frames\n"
+               "                        timed on the sample clock; at most 200)\n"
+               "  --iq-drop             with --iq-speed 0: drop when the ring is full, and time frames by arrival\n"
+               "                        (a live receiver on stdin, e.g. rtl_sdr -f 1090e6 -s 2.4e6 - | adsb-live\n"
+               "                        --iq - --iq-format cu8 --iq-speed 0 --iq-drop)\n"
+               "  --iq-fix              correct one wrong bit in DF11/17/18 frames\n"
                "overload (README_UPDATES.md §10.1):\n"
                "  --overload drop|block when decode/state falls behind: drop the frame at the input and\n"
                "                        count it (default), or stop reading the socket until it catches up\n"
@@ -98,7 +119,7 @@ struct Item {
 // Counters the state thread publishes for the periodic report.
 struct Shared {
   std::atomic<std::uint64_t> frames{0}, tracks{0}, updates{0}, deletes{0}, bad{0}, positions{0};
-  std::atomic<std::uint64_t> recorded{0}, record_dropped{0};
+  std::atomic<std::uint64_t> recorded{0}, record_dropped{0}, record_rejected{0};
   // Overload at the input boundary (README_UPDATES.md §10.1): frames dropped
   // because the decode/state stage was behind, and the deepest the input
   // queue got. Written by the ingest thread only.
@@ -141,6 +162,9 @@ void print_hist(const char* name, const adsb::LatencyHistogram& h) {
 
 int main(int argc, char** argv) {
   adsb::ingest::BeastTcpConfig src_cfg;
+  adsb::ingest::IqSourceConfig iq_cfg;
+  std::string iq_path, iq_format;
+  bool iq_rate_given = false;
   adsb::state::EngineConfig eng_cfg;
   std::string record_path;
   double duration_s = 0, stats_every_s = 10;
@@ -197,6 +221,14 @@ int main(int argc, char** argv) {
     else if (a == "--shm") shm_name = val();
     else if (a == "--shm-slots") shm_slots = std::strtoull(val().c_str(), nullptr, 10);
     else if (a == "--simulate-work-ns") work_ns = std::strtoull(val().c_str(), nullptr, 10);
+    else if (a == "--iq") iq_path = val();
+    else if (a == "--iq-format") iq_format = val();
+    else if (a == "--iq-rate") { iq_cfg.sample_rate_hz = std::strtod(val().c_str(), nullptr); iq_rate_given = true; }
+    else if (a == "--iq-block") iq_cfg.block_samples = std::strtoull(val().c_str(), nullptr, 10);
+    else if (a == "--iq-buffers") iq_cfg.buffers = std::strtoull(val().c_str(), nullptr, 10);
+    else if (a == "--iq-speed") iq_cfg.speed = std::strtod(val().c_str(), nullptr);
+    else if (a == "--iq-fix") iq_cfg.demod.fix_single_bit = true;
+    else if (a == "--iq-drop") iq_cfg.drop_when_full = true;
     else if (a == "--line") src_cfg.line = static_cast<std::uint8_t>(std::strtol(val().c_str(), nullptr, 10) & 0xF);
     else if (a == "--receiver") {
       const std::string v = val();
@@ -220,6 +252,39 @@ int main(int argc, char** argv) {
     }
   }
 
+  // IQ input.
+  const bool iq_mode = !iq_path.empty();
+  std::unique_ptr<adsb::ingest::IqSource> iq_source;
+  if (iq_mode) {
+    std::string err;
+    iq_cfg.path = iq_path;
+    if (iq_path.size() > 11 && (iq_path.ends_with(".sigmf-meta") || iq_path.ends_with(".sigmf-data"))) {
+      double rate = 0;
+      if (!adsb::ingest::read_sigmf(iq_path, iq_cfg.path, iq_cfg.format, rate, &err)) {
+        std::fprintf(stderr, "adsb-live: %s\n", err.c_str());
+        return 1;
+      }
+      if (!iq_rate_given) iq_cfg.sample_rate_hz = rate;
+    } else if (iq_format.empty() || !adsb::demod::parse_format(iq_format, iq_cfg.format)) {
+      std::fprintf(stderr, "adsb-live: raw --iq input needs --iq-format cu8|cs8|cs16|cf32\n");
+      return 1;
+    }
+    if (!iq_format.empty() && (iq_path.ends_with(".sigmf-meta") || iq_path.ends_with(".sigmf-data"))) {
+      std::fprintf(stderr, "adsb-live: --iq-format is for raw input; SigMF gives the format\n");
+      return 1;
+    }
+    iq_cfg.line = src_cfg.line;
+    if (!adsb::ingest::validate(iq_cfg, &err)) {
+      std::fprintf(stderr, "adsb-live: --iq: %s\n", err.c_str());
+      return 1;
+    }
+    iq_source = std::make_unique<adsb::ingest::IqSource>(iq_cfg);
+    if (!iq_source->open(&err)) {
+      std::fprintf(stderr, "adsb-live: --iq: %s\n", err.c_str());
+      return 1;
+    }
+  }
+
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
   std::signal(SIGPIPE, SIG_IGN);
@@ -228,7 +293,7 @@ int main(int argc, char** argv) {
   adsb::record::RecordingWriter writer;
   if (!record_path.empty()) {
     adsb::record::RecordingInfo info;
-    info.source = "readsb-beast";
+    info.source = iq_mode ? "adsb-demod" : "readsb-beast";
     info.start_wall_ns = adsb::wall_ns();
     info.has_receiver_position = eng_cfg.has_receiver;
     info.receiver_lat = eng_cfg.receiver_lat;
@@ -316,9 +381,7 @@ int main(int argc, char** argv) {
     std::size_t high_water = 0;
     const std::size_t queue_limit =
         max_queue == 0 || max_queue > StateQueue::kCapacity ? StateQueue::kCapacity : max_queue;
-    source.run(
-        g_stop,
-        [&](const adsb::record::Record& r) {
+    auto on_record = [&](const adsb::record::Record& r) {
           if (rec_q) {
             if (rec_q->try_push(r)) {
               shared.recorded.fetch_add(1, std::memory_order_relaxed);
@@ -348,10 +411,17 @@ int main(int argc, char** argv) {
             }
             adsb::cpu_relax();
           }
-        },
-        [&](const char* status) {
-          if (!quiet) std::fprintf(stderr, "adsb-live: %s:%u %s\n", src_cfg.host.c_str(), src_cfg.port, status);
-        });
+        };
+    if (iq_source) {
+      iq_source->run(g_stop, on_record, [&](const char* status) {
+        if (!quiet) std::fprintf(stderr, "adsb-live: %s: %s\n", iq_path.c_str(), status);
+      });
+      g_stop.store(true);  // the input has ended: stop like Ctrl-C (queues drain first)
+    } else {
+      source.run(g_stop, on_record, [&](const char* status) {
+        if (!quiet) std::fprintf(stderr, "adsb-live: %s:%u %s\n", src_cfg.host.c_str(), src_cfg.port, status);
+      });
+    }
     ingest_done.store(true, std::memory_order_release);
   });
 
@@ -438,7 +508,9 @@ int main(int argc, char** argv) {
       adsb::record::Record r;
       for (;;) {
         if (rec_q->try_pop(r)) {
-          (void)writer.append(r);
+          // The writer refuses a record whose time goes backwards (or a bad
+          // length); count it rather than lose it silently.
+          if (!writer.append(r)) shared.record_rejected.fetch_add(1, std::memory_order_relaxed);
         } else if (ingest_done.load(std::memory_order_acquire) && rec_q->empty_approx()) {
           break;
         } else {
@@ -499,10 +571,30 @@ int main(int argc, char** argv) {
   const auto s = source.stats();
   const auto& es = engine->stats();
   auto u = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
-  std::printf("source      %s:%u, %llu connects, %llu disconnects, %llu failed attempts\n", src_cfg.host.c_str(),
-              src_cfg.port, u(s.connects), u(s.disconnects), u(s.connect_failures));
-  std::printf("stream      %llu bytes, %llu frames, %llu truncated, %llu bad type, %llu bytes skipped\n",
-              u(s.bytes), u(s.frames), u(s.parser.truncated), u(s.parser.bad_type), u(s.parser.skipped_bytes));
+  std::uint64_t input_frames = s.frames;
+  if (iq_source) {
+    const auto q = iq_source->stats();
+    input_frames = q.frames;
+    std::printf("source      IQ %s (%s, %.3f MS/s, %zu-sample blocks, %zu buffers, %s)%s\n", iq_cfg.path.c_str(),
+                adsb::demod::format_name(iq_cfg.format), iq_cfg.sample_rate_hz / 1e6, iq_cfg.block_samples,
+                iq_cfg.buffers,
+                iq_cfg.speed > 0 ? (std::to_string(iq_cfg.speed) + "x real time").c_str() : "unpaced",
+                q.read_error ? " READ ERROR" : "");
+    std::printf("iq          %llu blocks (%llu samples, %.2f s), %llu blocks dropped (%llu samples, %.4f%%), "
+                "ring high water %llu of %zu, max lateness %.3f ms\n",
+                u(q.blocks), u(q.samples), static_cast<double>(q.samples) / iq_cfg.sample_rate_hz, u(q.blocks_dropped),
+                u(q.samples_dropped), q.samples ? 100.0 * static_cast<double>(q.samples_dropped) / static_cast<double>(q.samples) : 0.0,
+                u(q.ring_high_water), iq_cfg.buffers, static_cast<double>(q.max_lateness_ns) * 1e-6);
+    std::printf("demod       %llu frames (%llu by the sequence detector, %llu fixed), %llu preambles, %llu failed; "
+                "%llu frame times raised to stay monotonic\n",
+                u(q.demod.frames), u(q.demod.sequence_decoded), u(q.demod.corrected), u(q.demod.preambles),
+                u(q.demod.bad_crc), u(q.time_clamped));
+  } else {
+    std::printf("source      %s:%u, %llu connects, %llu disconnects, %llu failed attempts\n", src_cfg.host.c_str(),
+                src_cfg.port, u(s.connects), u(s.disconnects), u(s.connect_failures));
+    std::printf("stream      %llu bytes, %llu frames, %llu truncated, %llu bad type, %llu bytes skipped\n",
+                u(s.bytes), u(s.frames), u(s.parser.truncated), u(s.parser.bad_type), u(s.parser.skipped_bytes));
+  }
   std::printf("engine      %llu frames, %llu bad, %llu duplicates, A/P accepted %llu / rejected %llu\n",
               u(es.frames), u(es.bad_frames), u(es.duplicates), u(es.ap_accepted), u(es.ap_rejected));
   std::printf("positions   global %llu, local %llu, unresolved %llu, rejected %llu\n", u(es.cpr_global),
@@ -510,8 +602,9 @@ int main(int argc, char** argv) {
   std::printf("tracks      created %llu, expired %llu, live %zu\n", u(es.tracks_created), u(es.tracks_expired),
               engine->track_count());
   if (!record_path.empty()) {
-    std::printf("recording   %s: %llu records, %llu dropped%s\n", record_path.c_str(), u(writer.count()),
-                u(shared.record_dropped.load()), rec_ok ? "" : " (WRITE FAILED)");
+    std::printf("recording   %s: %llu records, %llu dropped, %llu rejected by the writer%s\n", record_path.c_str(),
+                u(writer.count()), u(shared.record_dropped.load()), u(shared.record_rejected.load()),
+                rec_ok ? "" : " (WRITE FAILED)");
   }
   if (udp) {
     (void)udp->drain();
@@ -539,12 +632,12 @@ int main(int argc, char** argv) {
   std::printf("overload    policy %s, %llu frames dropped at the input boundary (%.4f%%), "
               "queue high water %llu of %zu\n",
               overload_block ? "block" : "drop", u(shared.overload_dropped.load()),
-              s.frames ? 100.0 * static_cast<double>(shared.overload_dropped.load()) / static_cast<double>(s.frames) : 0.0,
+              input_frames ? 100.0 * static_cast<double>(shared.overload_dropped.load()) / static_cast<double>(input_frames) : 0.0,
               u(shared.queue_high_water.load()),
               max_queue == 0 || max_queue > StateQueue::kCapacity ? StateQueue::kCapacity : max_queue);
   std::printf("build       %s\n", adsb::build_variant());
   std::printf("latency (receive -> track state updated%s, per frame):\n", pub ? " and published" : "");
   print_hist("queue wait", *queue_wait);
-  print_hist("receive -> state done", *recv_to_state);
+  print_hist(iq_mode ? "last sample -> state" : "receive -> state done", *recv_to_state);
   return rec_ok && !conf_failed ? 0 : 1;
 }

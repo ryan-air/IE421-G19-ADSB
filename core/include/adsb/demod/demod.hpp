@@ -118,7 +118,8 @@ struct DemodFrame {
 };
 
 struct DemodStats {
-  std::uint64_t samples = 0;
+  std::uint64_t samples = 0;        // fed
+  std::uint64_t skipped = 0;        // declared lost with skip()
   std::uint64_t gated = 0;          // positions passing the step-1 gate
   std::uint64_t preambles = 0;      // positions with at least one phase passing step 2
   std::uint64_t frames = 0;         // frames emitted
@@ -144,6 +145,13 @@ class Demodulator {
   // End of stream: scans the held-back samples (a message cut off by the end
   // is not reported).
   std::span<const DemodFrame> flush();
+  // A gap: `n` samples were lost (a dropped SDR block). Scans what is held
+  // as at the end of a stream, then continues at absolute sample index
+  // pos + n, so frame positions stay on the original sample clock. Returns
+  // the frames found before the gap. skip(0) does nothing.
+  std::span<const DemodFrame> skip(std::uint64_t n);
+  // Absolute index of the next sample feed() takes.
+  [[nodiscard]] std::uint64_t position() const noexcept { return pos_; }
 
   [[nodiscard]] const DemodStats& stats() const noexcept { return stats_; }
   [[nodiscard]] const DemodConfig& config() const noexcept { return cfg_; }
@@ -172,8 +180,11 @@ class Demodulator {
   [[nodiscard]] float noise_for(std::uint64_t block, bool final) const noexcept;
   void finish_noise_block() noexcept;
   float noise_ = 0.0f;                                // latest floor (for noise_floor())
-  std::vector<float> block_est_;                      // ring by block number
-  std::uint64_t n_blocks_ = 0;                        // complete blocks
+  std::vector<float> block_est_;                      // ring by (absolute) block number
+  std::vector<std::uint64_t> block_id_;               // which block each slot holds (~0 = none)
+  bool have_block_ = false;                           // any block complete yet
+  std::uint64_t last_block_ = 0;                      // the latest complete block
+  std::uint64_t pos_ = 0;                             // absolute index of the next sample fed
   std::array<float, kNoiseBlock / kNoiseWindow> sub_{};  // window means of this block
   std::size_t n_sub_ = 0;
   float win_sum_ = 0.0f;

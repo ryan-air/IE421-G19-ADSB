@@ -474,6 +474,7 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
   // Noise estimates: every block the buffer can hold at once, and the
   // history before the oldest of them.
   block_est_.assign(data_cap / kNoiseBlock + kNoiseHistory + 4, 0.0f);
+  block_id_.assign(block_est_.size(), ~std::uint64_t{0});
 }
 
 Demodulator::~Demodulator() = default;
@@ -530,36 +531,59 @@ float lowest_quarter_mean(const float* win, std::size_t n) {
 
 void Demodulator::finish_noise_block() noexcept {
   const float est = n_sub_ > 0 ? lowest_quarter_mean(sub_.data(), n_sub_) : 0.0f;
-  block_est_[n_blocks_ % block_est_.size()] = est;
-  ++n_blocks_;
+  const std::uint64_t id = (pos_ - 1) / kNoiseBlock;  // the block that just ended (pos_ is past it)
+  block_est_[id % block_est_.size()] = est;
+  block_id_[id % block_id_.size()] = id;
+  have_block_ = true;
+  last_block_ = id;
   n_sub_ = 0;
   noise_ = est;
 }
 
 float Demodulator::noise_for(std::uint64_t block, bool final) const noexcept {
-  if (block == 0 || n_blocks_ == 0) {
-    if (n_blocks_ > 0) return block_est_[0];
-    // A stream shorter than one block (only at the end): its own windows,
-    // the last one partial.
-    if (!final) return 0.0f;
-    std::array<float, 64> w = sub_;
-    std::size_t n = n_sub_;
-    if (win_count_ > 0) w[n++] = win_sum_ / static_cast<float>(win_count_);
-    return n > 0 ? lowest_quarter_mean(w.data(), n) : 0.0f;
+  // The 8 blocks before `block` (those still present: skip() leaves holes).
+  const std::uint64_t lo = block > kNoiseHistory ? block - kNoiseHistory : 0;
+  bool found = false;
+  float best = 0.0f;
+  for (std::uint64_t b = lo; b < block; ++b) {
+    const std::size_t slot = b % block_est_.size();
+    if (block_id_[slot] != b) continue;
+    best = found ? std::min(best, block_est_[slot]) : block_est_[slot];
+    found = true;
   }
-  const std::uint64_t hi = std::min(block, n_blocks_);  // blocks [lo, hi) exist
-  const std::uint64_t lo = hi > kNoiseHistory ? hi - kNoiseHistory : 0;
-  float best = block_est_[lo % block_est_.size()];
-  for (std::uint64_t b = lo + 1; b < hi; ++b) best = std::min(best, block_est_[b % block_est_.size()]);
-  // block_est_ holds every block the buffer can hold plus the history, so
-  // [lo, hi) has not been overwritten yet (n_blocks_ - lo <= its size).
-  return best;
+  if (found) return best;
+  // The start of the stream (or of the samples after a long gap): the block
+  // itself once complete, else the latest earlier block, else (at the end of
+  // a short stream) the partial block's own windows.
+  if (const std::size_t slot = block % block_est_.size(); block_id_[slot] == block) return block_est_[slot];
+  if (have_block_ && last_block_ < block) return block_est_[last_block_ % block_est_.size()];
+  if (!final) return 0.0f;
+  std::array<float, 64> w = sub_;
+  std::size_t n = n_sub_;
+  if (win_count_ > 0) w[n++] = win_sum_ / static_cast<float>(win_count_);
+  return n > 0 ? lowest_quarter_mean(w.data(), n) : 0.0f;
+}
+
+std::span<const DemodFrame> Demodulator::skip(std::uint64_t n) {
+  n_out_ = 0;
+  if (n == 0) return {};  // no gap: keep the held samples (a flush would lose frames across them)
+  scan(true);  // as at the end of a stream: the buffer is emptied (base_ == pos_)
+  // The partial noise window and block straddle the gap: drop them.
+  win_sum_ = 0.0f;
+  win_count_ = 0;
+  n_sub_ = 0;
+  pos_ += n;
+  base_ = pos_;
+  valid_ = 0;
+  next_ = base_;
+  stats_.skipped += n;
+  return {out_.data(), n_out_};
 }
 
 void Demodulator::append(std::size_t n) {
   const float* m = buf_.data() + valid_;
-  std::uint64_t g = stats_.samples;  // global index of m[0]
-  for (std::size_t k = 0; k < n; ++k, ++g) {
+  for (std::size_t k = 0; k < n; ++k) {
+    const std::uint64_t g = pos_++;  // absolute index of m[k]
     win_sum_ += m[k];
     if (++win_count_ == kNoiseWindow) {
       sub_[n_sub_++] = win_sum_ / static_cast<float>(kNoiseWindow);
@@ -591,7 +615,7 @@ void Demodulator::scan(bool final) {
   }
   // Until the first noise block is complete nothing can be judged (at the
   // end of a short stream the partial block is used).
-  if (n_blocks_ == 0 && !final) end = 0;
+  if (!have_block_ && !final) end = 0;
   const auto pulse_quiet = static_cast<float>(cfg_.min_pulse_quiet);
   const float chip_len = im.chip_len;
 

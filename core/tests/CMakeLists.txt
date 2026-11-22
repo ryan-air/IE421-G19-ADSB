@@ -26,6 +26,7 @@ set(ADSB_TEST_SOURCES
   test_dst.cpp
   test_iq.cpp
   test_demod.cpp
+  test_iq_source.cpp
 )
 
 add_executable(adsb_tests ${ADSB_TEST_SOURCES})

@@ -504,7 +504,7 @@ jobs:
           test "$(grep '^sweep hash' gcc.txt)" = "$(grep '^sweep hash' clang.txt)"
 
   iq:
-    name: synthetic IQ and demodulator (scored against the truth and readsb)
+    name: synthetic IQ, demodulator (against the truth and readsb), IQ into adsb-live
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -522,7 +522,7 @@ jobs:
       - name: Build
         run: |
           CXX=g++-14 cmake -S . -B build/iq -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
-          cmake --build build/iq --target adsb-iqsynth adsb-demod
+          cmake --build build/iq --target adsb-iqsynth adsb-demod adsb-live adsb-feed-cli
       # Determinism and formats, then readsb decodes cu8 and cs16 files
       # (clean 15-30 dB messages >= 97%, timestamps within one sample),
       # impairments, multipath echoes, and the gain trade-off.
@@ -533,3 +533,8 @@ jobs:
       # sample, and at least 98% of readsb's messages on the same files.
       - name: Demodulator
         run: scripts/check-demod.sh build/iq /tmp/readsb/readsb
+      # adsb-live --iq: the same frames as adsb-demod (file and stdin), a
+      # real-time run whose feed subscriber ends with the publisher's book,
+      # latency against block size, and blocks dropped and counted at 100x.
+      - name: IQ into the live pipeline
+        run: scripts/check-iq-live.sh build/iq

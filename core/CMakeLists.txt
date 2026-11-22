@@ -63,6 +63,7 @@ add_library(adsb_core STATIC
   src/sim/synth.cpp
   src/sim/iq.cpp
   src/demod/demod.cpp
+  src/ingest/iq_source.cpp
 )
 add_library(adsb::core ALIAS adsb_core)
 target_include_directories(adsb_core PUBLIC

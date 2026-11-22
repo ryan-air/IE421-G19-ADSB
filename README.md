@@ -17,7 +17,7 @@ receiver (RTL-SDR) → readsb ──Beast TCP──▶ adsb-live: decode + track
                        adsb-gateway (Node) ──WebSocket, conflated per client──▶ map in the browser (ads/)
 ```
 
-Recorded or synthetic traffic (`.adsbrec`) can stand in for the receiver: `adsb-publish` replays a recording onto the same feed, deterministically. `adsb-iqsynth` goes one step earlier: it writes the raw IQ samples an SDR would record for the same synthetic traffic (SigMF, with per-message truth), the test input for the demodulator and for other receivers ([core/README.md](core/README.md#synthetic-iq-workstream-a-readme_updatesmd-224)).
+Recorded or synthetic traffic (`.adsbrec`) can stand in for the receiver: `adsb-publish` replays a recording onto the same feed, deterministically. `adsb-iqsynth` goes one step earlier: it writes the raw IQ samples an SDR would record for the same synthetic traffic (SigMF, with per-message truth), the test input for our demodulator `adsb-demod` and for other receivers ([core/README.md](core/README.md#synthetic-iq-workstream-a-readme_updatesmd-224)).
 
 ## Results so far
 
@@ -34,6 +34,7 @@ These were measured on a laptop. They are medians, because laptop tails are unre
 | Shared-memory ring, write → read | — | p50 125 ns, p99 209 ns |
 | AF_XDP receive instead of the kernel socket | — | send → receive p50 1.71 → 1.13 µs |
 | Synthetic 1090 MHz IQ (Doppler, multipath, collisions, receiver impairments) decoded by readsb | — | 98.8% of clean messages at 15–30 dB SNR; timestamps within 0.3 µs of the truth |
+| Our demodulator on the same IQ files, against readsb | — | 1–20% more messages than readsb (+10% on weak signals), no false DF17; starts within 0.06 µs of the truth; 18–35× real time on one core |
 
 The comparison runs both systems on the same traffic through readsb, at 50–3,000 aircraft. Details are in [bench/results/legacy-baseline/](bench/results/legacy-baseline/README.md) and [core/README.md](core/README.md).
 

@@ -24,6 +24,7 @@ set(ADSB_TEST_SOURCES
   test_shm_ring.cpp
   test_uring.cpp
   test_dst.cpp
+  test_iq.cpp
 )
 
 add_executable(adsb_tests ${ADSB_TEST_SOURCES})

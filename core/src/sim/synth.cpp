@@ -237,6 +237,21 @@ SynthOutput generate(const SynthConfig& cfg) {
       const Frame f = build_frame(a, k, odd);
       const auto tx_ns = cfg.start_rx_ns + static_cast<std::uint64_t>(std::llround(t * 1e9));
       ++out.stats.transmitted;
+      if (cfg.keep_transmissions) {
+        Transmission tr;
+        tr.tx_ns = tx_ns;
+        tr.icao = a.info.icao;
+        tr.len = f.len;
+        std::memcpy(tr.bytes, f.bytes, f.len);
+        tr.lat = a.lat;
+        tr.lon = a.lon;
+        tr.alt_ft = a.alt_ft;
+        tr.ground_speed_kt = a.gs_kt;
+        tr.track_deg = a.track_deg;
+        tr.vertical_rate_fpm = a.vr_fpm;
+        tr.on_ground = a.info.on_ground;
+        out.transmissions.push_back(tr);
+      }
 
       if (k == Kind::kPosition) {
         TruthPoint tp;
@@ -297,6 +312,8 @@ SynthOutput generate(const SynthConfig& cfg) {
                    [](const record::Record& x, const record::Record& y) { return x.rx_ns < y.rx_ns; });
   std::stable_sort(out.truth.begin(), out.truth.end(),
                    [](const TruthPoint& x, const TruthPoint& y) { return x.tx_ns < y.tx_ns; });
+  std::stable_sort(out.transmissions.begin(), out.transmissions.end(),
+                   [](const Transmission& x, const Transmission& y) { return x.tx_ns < y.tx_ns; });
   return out;
 }
 

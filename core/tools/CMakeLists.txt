@@ -45,3 +45,7 @@ adsb_apply_compiler_options(adsb-tx-bench)
 add_executable(adsb-dst adsb_dst.cpp)
 target_link_libraries(adsb-dst PRIVATE adsb::core)
 adsb_apply_compiler_options(adsb-dst)
+
+add_executable(adsb-iqsynth adsb_iqsynth.cpp)
+target_link_libraries(adsb-iqsynth PRIVATE adsb::core)
+adsb_apply_compiler_options(adsb-iqsynth)

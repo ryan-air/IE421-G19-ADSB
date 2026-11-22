@@ -502,3 +502,29 @@ jobs:
           build/dst-gcc/tools/adsb-dst --seeds 40000 --start $START | tee gcc.txt
           build/dst-clang/tools/adsb-dst --seeds 40000 --start $START | tee clang.txt
           test "$(grep '^sweep hash' gcc.txt)" = "$(grep '^sweep hash' clang.txt)"
+
+  iq:
+    name: synthetic IQ generator (readsb decodes it, scored against the truth)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 libncurses-dev zlib1g-dev libzstd-dev
+      # The same pinned readsb as the bench image (bench/legacy/Dockerfile),
+      # without SDR libraries: it only reads IQ files.
+      - name: Build readsb
+        run: |
+          git clone --depth 1 --branch v3.16.21 https://github.com/wiedehopf/readsb.git /tmp/readsb
+          make -C /tmp/readsb -j"$(nproc)" RTLSDR=no
+      - name: Build
+        run: |
+          CXX=g++-14 cmake -S . -B build/iq -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/iq --target adsb-iqsynth
+      # Determinism and formats, then readsb decodes cu8 and cs16 files
+      # (clean 15-30 dB messages >= 97%, timestamps within one sample),
+      # impairments, multipath echoes, and the gain trade-off.
+      - name: Run
+        run: scripts/check-iq.sh build/iq /tmp/readsb/readsb

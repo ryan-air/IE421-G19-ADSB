@@ -16,10 +16,11 @@ About 40% of the plan is done, and everything listed here is on `main` with CI p
 | Core pipeline (C++) | Mode S / ADS-B decoder, track state engine, `.adsbrec` record and deterministic replay, synthetic traffic generator with ground truth, live ingest from readsb (`adsb-live`) | [core/README.md](core/README.md) |
 | Feed | Sequenced multicast feed (MoldUDP64-style) with retransmit and snapshot servers and a subscriber library; wire spec with generated C++/JS/Python; TLA+ model of gap recovery | [protocol/feed_spec.md](protocol/feed_spec.md), [spec/README.md](spec/README.md) |
 | Web | WebSocket gateway: pushes the feed to browsers, runs the Fall 2025 map without a database | [gateway/README.md](gateway/README.md) |
+| Synthetic IQ | `adsb-iqsynth`: the IQ an SDR would record for synthetic traffic, with Doppler, multipath, the radio horizon, collisions and receiver impairments; SigMF with per-message truth; readsb decodes it | [core/README.md](core/README.md#synthetic-iq-workstream-a-readme_updatesmd-224) |
 | Overload | Loss only at the input boundary and counted; publisher batching under load; tested at 0.5×, 2×, 10× saturation | [core/README.md](core/README.md#overload-semantics-workstream-f-readme_updatesmd-10) |
 | Benchmark | Fall 2025 vs. new pipeline on the same traffic: frame → map in the browser 1.1–1.6 s → about 70–90 ms (median, laptop) | [bench/results/legacy-baseline/README.md](bench/results/legacy-baseline/README.md) |
 
-Not started: the demodulator, A/B arbitration, hardware timestamps (on hold), ITCH, and camera fusion. (The shared-memory ring, the conflated feed, memory-model testing, the io_uring transport and AF_XDP on both sides are done.)
+Not started: the demodulator, A/B arbitration, hardware timestamps (on hold), ITCH, and camera fusion. The synthetic IQ generator (the demodulator's test input) is done. (The shared-memory ring, the conflated feed, memory-model testing, the io_uring transport and AF_XDP on both sides are done.)
 
 ---
 
@@ -40,8 +41,8 @@ This is the largest open Must item: goal 1 of the plan ("own the wire") depends 
 
 | Item | Tier | Hardware | Size |
 |---|---|---|---|
-| Synthetic IQ generator with ground truth (extend `adsb-synth`, `core/include/adsb/sim/`) | Must | None | M |
-| **Professor's request (plan §22.4):** grow the IQ generator into a scenario generator for testing SDRs: many aircraft at different altitudes and positions, Doppler, multipath, refraction, per-aircraft transmitter frequency offset and drift, colliding replies; IQ in cu8/cs8/cs16/cf32 with SigMF truth; checked against readsb and MATLAB's ADS-B receiver | Must | None | L |
+| ~~Synthetic IQ generator with ground truth (extend `adsb-synth`, `core/include/adsb/sim/`)~~ **Done (Ryan):** `adsb-iqsynth`, see `core/README.md` (*Synthetic IQ*) | Must | None | M |
+| **Professor's request (plan §22.4):** grow the IQ generator into a scenario generator for testing SDRs: many aircraft at different altitudes and positions, Doppler, multipath, refraction, per-aircraft transmitter frequency offset and drift, colliding replies; IQ in cu8/cs8/cs16/cf32 with SigMF truth; checked against readsb and MATLAB's ADS-B receiver. **Mostly done (Ryan):** all of the above except the MATLAB check (no licence on hand); readsb decodes 98.8% of clean messages at 15–30 dB SNR, timestamps within 0.3 µs (`core/scripts/check-iq.sh`, CI). Still open: Mode A/C replies, aircraft antenna patterns, terrain, the MATLAB check | Must | None | L |
 | Transponder frequency-stability study (plan §22.5): per-message frequency estimate, Doppler and receiver error removed, grouped by aircraft and type | Should | RTL-SDR at ≥ 2.4 MS/s, ideally a GPS-disciplined reference | M |
 | SIMD demodulator (AVX2 / NEON) tested against the synthetic IQ; target ≤ 10 cycles/sample | Must | None | L |
 | Real IQ recordings; sensitivity ≥ 90% of readsb's on the same recording; USB transfer-size sweep | Must | RTL-SDR (the Fall 2025 Pi setup) | M |

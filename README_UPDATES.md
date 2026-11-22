@@ -642,7 +642,9 @@ On `main`, with CI passing:
 - io_uring and AF_XDP transports (AF_XDP on both the publishing and the receiving side, copy mode);
 - deterministic simulation testing of the feed. Millions of seeded fault schedules found and fixed four recovery bugs in the subscriber.
 
-Not started: the demodulator and the IQ generator (A), A/B arbitration (B), hardware timestamps (§9.4), ITCH (J), and camera fusion (I).
+- the IQ scenario generator (§22.4): `adsb-iqsynth` writes SigMF recordings with per-message truth; pinned readsb decodes 98.8% of clean messages at 15–30 dB SNR, with timestamps within 0.3 µs of the truth (`core/scripts/check-iq.sh`, in CI).
+
+Not started: the demodulator (A), A/B arbitration (B), hardware timestamps (§9.4), ITCH (J), and camera fusion (I).
 
 ### 22.3 What MATLAB offers
 
@@ -658,7 +660,7 @@ MATLAB is still useful to us as an **independent oracle**: its receiver example 
 
 ### 22.4 IQ scenario generator (Workstream A)
 
-**Owner:** Role 1 (it extends the existing Must item "Synthetic IQ generator with ground truth"). Who builds which part is to be agreed in the team.
+**Owner:** Role 1 (it extends the existing Must item "Synthetic IQ generator with ground truth"). Built by Ryan (`adsb-iqsynth`, `core/include/adsb/sim/iq.hpp`; status and results in `core/README.md`, *Synthetic IQ*). Everything in the tables below is modelled (ducting only as a larger k-factor); not yet checked against MATLAB's receiver; Mode A/C replies are not generated.
 
 **Scenario.** Reuse `adsb-synth`'s traffic and ground truth. Each aircraft has a position, altitude, velocity, transmit power class, and its own transmitter frequency model. The receiver has a location, an antenna pattern, and a model of its own impairments.
 

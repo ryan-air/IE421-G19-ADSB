@@ -85,3 +85,5 @@ pids/
 
 # Large FAA data files
 ReleasableAircraft/
+
+__pycache__/

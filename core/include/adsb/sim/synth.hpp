@@ -60,6 +60,27 @@ struct SynthConfig {
 
   // Event-time origin for rx_ns (monotonic clock domain).
   std::uint64_t start_rx_ns = 1'000'000'000'000ULL;
+
+  // Also return every transmission before the reception model, with the
+  // aircraft's true state (SynthOutput::transmissions). The IQ generator
+  // (iq.hpp) renders these. Off by default: it costs memory and does not
+  // change anything else (no extra random numbers are drawn).
+  bool keep_transmissions = false;
+};
+
+// One transmitted frame with the transmitter's true state at that moment.
+struct Transmission {
+  std::uint64_t tx_ns = 0;        // same clock domain as rx_ns
+  std::uint32_t icao = 0;
+  std::uint8_t len = 0;           // 7 or 14
+  std::uint8_t bytes[14] = {};
+  double lat = 0.0;
+  double lon = 0.0;
+  double alt_ft = 0.0;            // barometric = geometric here (no pressure model)
+  double ground_speed_kt = 0.0;
+  double track_deg = 0.0;
+  double vertical_rate_fpm = 0.0;
+  bool on_ground = false;
 };
 
 // True aircraft state at the moment a position frame was transmitted.
@@ -94,6 +115,7 @@ struct SynthOutput {
   std::vector<record::Record> records;  // sorted by rx_ns
   std::vector<TruthPoint> truth;        // sorted by tx_ns
   std::vector<AircraftInfo> aircraft;
+  std::vector<Transmission> transmissions;  // sorted by tx_ns; only with keep_transmissions
   SynthStats stats;
 };
 

@@ -61,6 +61,7 @@ add_library(adsb_core STATIC
   src/feed/xdp_receiver.cpp
   src/record/recording.cpp
   src/sim/synth.cpp
+  src/sim/iq.cpp
 )
 add_library(adsb::core ALIAS adsb_core)
 target_include_directories(adsb_core PUBLIC

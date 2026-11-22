@@ -577,6 +577,26 @@ TEST(Demod, NonFiniteSamplesCountAsSilence) {
   for (const auto& fr : frames) EXPECT_TRUE(std::isfinite(fr.noise) && std::isfinite(fr.signal));
 }
 
+// The same through feed_magnitudes(): non-finite magnitudes are silence.
+TEST(Demod, NonFiniteMagnitudesCountAsSilence) {
+  const Frame f = position_frame(0x4840D6, 1);
+  const auto iq = render({{f, 100.0, 0.3}, {f, 1000.0, 0.3}}, 2.4e6, 4800, 0.01);
+  std::vector<float> mag(iq.size() / 2);
+  for (std::size_t k = 0; k < mag.size(); ++k) mag[k] = std::sqrt(iq[2 * k] * iq[2 * k] + iq[2 * k + 1] * iq[2 * k + 1]);
+  for (std::size_t k = 0; k < 1024; k += 16) mag[k] = std::numeric_limits<float>::quiet_NaN();
+  mag[3000] = std::numeric_limits<float>::infinity();
+  Demodulator d(DemodConfig{});
+  std::vector<DemodFrame> frames;
+  for (std::size_t off = 0; off < mag.size(); off += 1024) {
+    const auto got = d.feed_magnitudes(mag.data() + off, std::min<std::size_t>(1024, mag.size() - off));
+    frames.insert(frames.end(), got.begin(), got.end());
+  }
+  const auto rest = d.flush();
+  frames.insert(frames.end(), rest.begin(), rest.end());
+  ASSERT_EQ(frames.size(), 2u);
+  for (const auto& fr : frames) EXPECT_TRUE(std::isfinite(fr.noise) && std::isfinite(fr.signal));
+}
+
 TEST(Demod, FlushFindsAFrameAtTheEndButNotACutOne) {
   const Frame f = position_frame(0x111111);
   // Ends 2 us before the end of the data: found only by flush().
@@ -751,20 +771,41 @@ TEST(DemodScenario, MagnitudeApproximationsCostLittle) {
 // The output is a pure function of the input: frames, positions and levels
 // hash the same on every platform (float arithmetic with -ffp-contract=off,
 // no libm in the decisions).
-TEST(DemodScenario, OutputIsPinned) {
-  const Scenario sc = scenario(40, 1.0, 33);
-  const auto frames = demod_all(sc.cu8, SampleFormat::kCu8, DemodConfig{});
+// Every bit of every output field (%a: the exact float), plus the counts
+// of the decisions on the way (positions gated, preambles, detector
+// decodes, failed checks): a change that moves any value or any decision,
+// even by one rounding step, changes the hash. Equal on macOS Clang and
+// Linux GCC / Clang, x86-64 and ARM64.
+std::string pin_of(const std::vector<DemodFrame>& frames, const DemodStats& st) {
   std::string all;
   for (const DemodFrame& f : frames) {
-    char buf[128];
-    std::snprintf(buf, sizeof buf, "%s %.4f %.5f %.5f %a\n", hex(f).c_str(), f.sample_pos, static_cast<double>(f.signal),
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "%s %a %a %a %a\n", hex(f).c_str(), f.sample_pos, static_cast<double>(f.signal),
                   static_cast<double>(f.margin), static_cast<double>(f.noise));
     all += buf;
   }
+  all += std::to_string(st.gated) + " " + std::to_string(st.preambles) + " " + std::to_string(st.sequence_decoded) + " " +
+         std::to_string(st.bad_crc) + " " + std::to_string(st.unknown_address);
   adsb::Sha256 sha;
   sha.update(all.data(), all.size());
-  const std::string got = adsb::Sha256::hex(sha.finish()).substr(0, 16) + " " + std::to_string(frames.size());
-  EXPECT_EQ(got, "a93894fc6475a927 183");
+  return adsb::Sha256::hex(sha.finish()).substr(0, 16) + " " + std::to_string(frames.size());
+}
+
+TEST(DemodScenario, OutputIsPinned) {
+  const Scenario sc = scenario(40, 1.0, 33);
+  DemodStats st;
+  const auto frames = demod_all(sc.cu8, SampleFormat::kCu8, DemodConfig{}, 0, &st);
+  EXPECT_EQ(pin_of(frames, st), "7f3519b88bfb0b0f 183");
+}
+
+// Weak signals (noise figure 22 dB): many preambles fail the half-bit
+// reading, so the sequence detector decides a good share of the frames.
+TEST(DemodScenario, WeakSignalOutputIsPinned) {
+  const Scenario sc = scenario(60, 1.0, 34, 22.0);
+  DemodStats st;
+  const auto frames = demod_all(sc.cu8, SampleFormat::kCu8, DemodConfig{}, 0, &st);
+  EXPECT_GT(st.sequence_decoded, 5u);
+  EXPECT_EQ(pin_of(frames, st), "a65c4e5264a2da9c 48");
 }
 
 }  // namespace

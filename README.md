@@ -35,6 +35,7 @@ These were measured on a laptop. They are medians, because laptop tails are unre
 | AF_XDP receive instead of the kernel socket | — | send → receive p50 1.71 → 1.13 µs |
 | Synthetic 1090 MHz IQ (Doppler, multipath, collisions, receiver impairments) decoded by readsb | — | 98.8% of clean messages at 15–30 dB SNR; timestamps within 0.3 µs of the truth |
 | Our demodulator on the same IQ files, against readsb | — | 1–20% more messages than readsb (+10% on weak signals), no false DF17; starts within 0.06 µs of the truth; 18–35× real time on one core |
+| IQ sample → track state, through our demodulator (`adsb-live --iq`, 6.8 ms blocks) | — | p50 5.2 ms, p99 9.2 ms (mostly waiting for the rest of the block; 1.2 ms with 1.7 ms blocks) |
 
 The comparison runs both systems on the same traffic through readsb, at 50–3,000 aircraft. Details are in [bench/results/legacy-baseline/](bench/results/legacy-baseline/README.md) and [core/README.md](core/README.md).
 

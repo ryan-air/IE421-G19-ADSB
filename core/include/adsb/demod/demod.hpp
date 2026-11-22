@@ -187,7 +187,7 @@ class Demodulator {
   std::uint64_t pos_ = 0;                             // absolute index of the next sample fed
   std::array<float, kNoiseBlock / kNoiseWindow> sub_{};  // window means of this block
   std::size_t n_sub_ = 0;
-  float win_sum_ = 0.0f;
+  std::array<float, kNoiseWindow> win_buf_{};          // a window collected across calls
   std::size_t win_count_ = 0;
   DemodStats stats_;
   std::unique_ptr<Impl> impl_;

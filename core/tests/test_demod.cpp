@@ -466,6 +466,29 @@ TEST(Demod, WeakFramesFadeOutAndStrongOnesAllDecode) {
   EXPECT_EQ(rate(0.15, 140.0), 1.0);
 }
 
+// The sequence detector reads short (56-bit) frames too: one pass serves
+// both lengths (the path through the first 56 bits does not depend on the
+// rest), so weak DF11 replies gain as much as long frames do.
+TEST(Demod, TheSequenceDetectorAlsoReadsShortFrames) {
+  auto rate = [](bool sequence) {
+    std::vector<Burst> bursts;
+    for (int k = 0; k < 300; ++k) {
+      bursts.push_back({adsb::modes::encode_df11(0x500000 + static_cast<std::uint32_t>(k), 5), 20.0 + 200.0 * k, 0.055, 0.3 * k, 0});
+    }
+    DemodConfig c;
+    c.sequence_detector = sequence;
+    DemodStats st;
+    const auto frames = demod_floats(render(bursts, 2.4e6, static_cast<std::size_t>(2.4 * (200 * 300 + 200)), 0.01, 8), c, &st);
+    for (const auto& f : frames) EXPECT_EQ(f.len, 7);
+    return std::make_pair(static_cast<double>(frames.size()) / 300.0, st.sequence_decoded);
+  };
+  const auto [with, seq] = rate(true);
+  const auto [without, none] = rate(false);
+  EXPECT_EQ(none, 0u);
+  EXPECT_GT(seq, 20u);
+  EXPECT_GT(with, without + 0.1);
+}
+
 // ---------------------------------------------------------------------------
 // Streaming
 // ---------------------------------------------------------------------------
@@ -733,15 +756,15 @@ TEST(DemodScenario, OutputIsPinned) {
   const auto frames = demod_all(sc.cu8, SampleFormat::kCu8, DemodConfig{});
   std::string all;
   for (const DemodFrame& f : frames) {
-    char buf[96];
-    std::snprintf(buf, sizeof buf, "%s %.4f %.5f %.5f\n", hex(f).c_str(), f.sample_pos, static_cast<double>(f.signal),
-                  static_cast<double>(f.margin));
+    char buf[128];
+    std::snprintf(buf, sizeof buf, "%s %.4f %.5f %.5f %a\n", hex(f).c_str(), f.sample_pos, static_cast<double>(f.signal),
+                  static_cast<double>(f.margin), static_cast<double>(f.noise));
     all += buf;
   }
   adsb::Sha256 sha;
   sha.update(all.data(), all.size());
   const std::string got = adsb::Sha256::hex(sha.finish()).substr(0, 16) + " " + std::to_string(frames.size());
-  EXPECT_EQ(got, "e0552aa33caef088 183");
+  EXPECT_EQ(got, "a93894fc6475a927 183");
 }
 
 }  // namespace

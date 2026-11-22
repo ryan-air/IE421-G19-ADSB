@@ -183,6 +183,34 @@ TEST(IqBlockRing, ThreadsSeeWholeBlocksInOrder) {
 // Demodulator::skip
 // ---------------------------------------------------------------------------
 
+// After a gap of a length that is not a multiple of the 16-sample window,
+// windows no longer line up with the 1024-sample noise blocks: the floor
+// (and everything decided from it) must still not depend on the split.
+TEST(DemodSkip, AnUnalignedGapKeepsTheOutputIndependentOfTheSplit) {
+  const Scenario sc = scenario(40, 1.0, 60);
+  const std::size_t n = sc.cu8.size() / 2, gap_at = 100000, gap = 1007;
+  auto run = [&](std::size_t chunk) {
+    demod::DemodConfig c;
+    c.block_samples = 65536;
+    demod::Demodulator d(c);
+    std::vector<demod::DemodFrame> out;
+    auto take = [&](std::span<const demod::DemodFrame> f) { out.insert(out.end(), f.begin(), f.end()); };
+    for (std::size_t off = 0; off < gap_at; off += chunk) take(d.feed(sc.cu8.data() + 2 * off, std::min(chunk, gap_at - off), demod::SampleFormat::kCu8));
+    take(d.skip(gap));
+    for (std::size_t off = gap_at + gap; off < n; off += chunk) take(d.feed(sc.cu8.data() + 2 * off, std::min(chunk, n - off), demod::SampleFormat::kCu8));
+    take(d.flush());
+    return out;
+  };
+  const auto whole = run(65536), pieces = run(13);  // 13: every window collected sample by sample
+  ASSERT_GT(whole.size(), 100u);
+  ASSERT_EQ(whole.size(), pieces.size());
+  for (std::size_t i = 0; i < whole.size(); ++i) {
+    EXPECT_EQ(hex(whole[i].bytes, whole[i].len), hex(pieces[i].bytes, pieces[i].len));
+    EXPECT_EQ(whole[i].sample_pos, pieces[i].sample_pos);
+    EXPECT_EQ(whole[i].noise, pieces[i].noise);
+  }
+}
+
 TEST(DemodSkip, SkippingNothingChangesNothing) {
   const Scenario sc = scenario(30, 0.5, 59);
   demod::Demodulator d(demod::DemodConfig{});

@@ -272,7 +272,27 @@ Every start is within 0.14 samples (0.06 µs) of the truth, against readsb's 0.5
 
 At **2.0 MS/s** a half-bit is exactly one sample, and a frame that starts at a sample centre puts half of every pulse into each of two samples, so the half-bit comparison cannot read it (dump1090's 2 MS/s demodulator has the same blind phase). The sequence detector reads such frames when the signal is strong; in noise some are lost. Use 2.4 MS/s.
 
-**Speed** (one thread, M2 laptop, loaded): 12–23 ns per sample on these scenarios, 18–35 times real time at 2.4 MS/s. Magnitudes alone: exact `sqrt` 0.42 ns per sample (vectorized), the classic 64K-entry, 128 KB lookup table 0.78 ns (it does not fit in L1, §5.2), alpha-max-beta-min 0.47 ns (`bench_demod.cpp`). The plan's target of 10 cycles per sample (about 3 ns) needs the preamble check and sequence detector vectorized (not done).
+**Speed** (one thread, M2 laptop). Profiling by stage, then removing waste without changing any output, made it 1.4–1.65 times faster:
+
+| Recording | Before | Now | Real time |
+|---|---|---|---|
+| 150 aircraft, 40 s, 2.4 MS/s | 24.4 ns/sample | 15.0 ns | 28× |
+| Weak signals (noise figure 22 dB) | 21.7 | 13.2 | 32× |
+| 200 aircraft, 6 MS/s | 18.7 | 13.1 | 13× |
+| 400 aircraft, 2.0 MS/s, strong reflector | 75.1 | 53.3 | 9× |
+
+The changes:
+- the scan jumps over positions the gate closed (`memchr` over the gate bytes) instead of visiting all of them;
+- the gate's window sums have a fixed width, and the larger of each pulse's two windows is taken once per position;
+- noise-floor windows are summed straight from the buffer;
+- the sequence detector runs one Viterbi pass for both frame lengths (the path through the first 56 bits does not depend on the rest), with every sample's four possible errors computed once;
+- the timing climb reuses evaluations.
+
+Every output field is byte-identical to the previous version: four recordings compared byte for byte, plus the pinned hash, which now includes the noise floor. An independent review checked each claim; it caught one change that moved the noise floor's rounding and one that lost a real overlapping reply, and both were reverted.
+
+readsb decodes the 40 s recording in 0.78 s, about 8 ns per sample, so we are about 1.8 times slower than readsb and more sensitive. Where the time goes now: the sequence detector 30%, preamble checks and bit reading 39%, timing 14%, noise floor 9%, gate 4%, magnitudes 3%. Magnitudes alone: exact `sqrt` 0.42 ns per sample (vectorized), the classic 64K-entry, 128 KB lookup table 0.78 ns (it does not fit in L1, §5.2), alpha-max-beta-min 0.47 ns (`bench_demod.cpp`).
+
+The plan's target of 10 cycles per sample (about 3 ns) would need the per-candidate work (preamble, slicer, detector, timing) vectorized, or a cheaper second-stage test. Two such shortcuts were measured and rejected because they lost frames: reading only the clearest phase in a frame's tail (−8 of 25,035) and skipping the detector there (one lost overlapping reply).
 
 ```bash
 ./build/release/tools/adsb-demod /tmp/scene.sigmf-meta --beast /tmp/scene.beast      # SigMF: format and rate from the metadata

@@ -140,7 +140,8 @@ class Demodulator {
   // Feeds n <= block_samples samples. The returned frames (in time order)
   // stay valid until the next call.
   std::span<const DemodFrame> feed(const std::uint8_t* data, std::size_t n, SampleFormat f);
-  // The same with magnitudes already computed (relative to full scale).
+  // The same with magnitudes already computed (relative to full scale;
+  // NaN and infinity count as silence, as in feed()).
   std::span<const DemodFrame> feed_magnitudes(const float* mag, std::size_t n);
   // End of stream: scans the held-back samples (a message cut off by the end
   // is not reported).

@@ -1,9 +1,16 @@
 #include "adsb/demod/demod.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <limits>
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 #include "adsb/modes/crc24.hpp"
 
@@ -151,6 +158,31 @@ bool validate(const DemodConfig& c, std::string* why) {
 
 namespace {
 
+// Four floats in one register (GCC/Clang vector extension: element-wise
+// + - * are the IEEE operations on each lane, so a lane computes exactly
+// what the scalar code computed, in the same order; -ffp-contract=off keeps
+// multiply-adds unfused here as everywhere).
+using f4 = float __attribute__((vector_size(16)));
+
+inline f4 load4(const float* p) noexcept {
+  f4 v;
+  std::memcpy(&v, p, sizeof v);
+  return v;
+}
+inline void store4(float* p, f4 v) noexcept { std::memcpy(p, &v, sizeof v); }
+inline f4 splat4(float x) noexcept { return f4{x, x, x, x}; }
+
+// Correctly rounded square root of each lane (IEEE: equal to std::sqrt).
+inline f4 sqrt4(f4 v) noexcept {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  return std::bit_cast<f4>(vsqrtq_f32(std::bit_cast<float32x4_t>(v)));
+#elif defined(__SSE2__)
+  return std::bit_cast<f4>(_mm_sqrt_ps(std::bit_cast<__m128>(v)));
+#else
+  return f4{std::sqrt(v[0]), std::sqrt(v[1]), std::sqrt(v[2]), std::sqrt(v[3])};
+#endif
+}
+
 constexpr int kPreambleChips = 16;             // 8 us of 0.5 us chips
 constexpr double kClimbStepUs = 0.04;          // step-5 hill-climb step
 constexpr int kClimbSteps = 13;                // ... and its reach, in steps either way
@@ -243,6 +275,7 @@ struct Demodulator::Impl {
   std::uint32_t syn56[56] = {}, syn112[112] = {};
   AddressTable addresses;
   std::vector<double> templ;    // step-5 expected-magnitude template
+  std::size_t templ_limit = 0;  // ... of which a trial may use this many (the rest: room for zero adds past the end)
 
   // Sequence detector (see detect_sequence). For every phase, the samples
   // of a message in order: each overlaps chip c_lo by ov_lo and chip
@@ -261,7 +294,13 @@ struct Demodulator::Impl {
   // it belongs to: 1 = the previous bit's second half, 2 = this bit's first
   // half, 3 = its second half, 0 = neither (preamble, or past the frame).
   std::vector<std::uint8_t> sov_role;    // [(phase * sov_n + j) * 2 + {lo, hi}]
-  std::vector<std::uint8_t> trace;       // traceback, [bit * 2 + state]
+  // From the roles: for every sample, the pulse pattern of its two chips
+  // (0 none, 1 the second, 2 the first, 3 both) under each of the four
+  // (previous bit, this bit) hypotheses, lane prev * 2 + b; and the overlap
+  // the pattern gives (0, hi, lo, lo + hi), computed as before.
+  std::vector<std::uint8_t> sov_pat;     // [(phase * sov_n + j) * 4 + lane]
+  std::vector<float> sov_x;              // [(phase * sov_n + j) * 4 + pattern]
+  std::vector<float> errs;               // detector scratch: [j * 4 + pattern]
 
   // Maximum-likelihood bits for a frame of `bits` bits starting at phase p
   // of position t. Each sample's expected magnitude is sqrt((A x)^2 + mu^2),
@@ -277,7 +316,6 @@ struct Demodulator::Impl {
   // both lengths). Returns false if the preamble fit fails.
   bool detect_sequence(const float* mt, int p, int bits, std::uint8_t* bytes, std::uint8_t* bytes56) {
     const SampleOv* so = sov.data() + static_cast<std::size_t>(p) * sov_n;
-    const std::uint8_t* role = sov_role.data() + static_cast<std::size_t>(p) * sov_n * 2;
     const std::uint16_t* bb = bit_begin.data() + static_cast<std::size_t>(p) * 113;
     // Preamble fit: m = A x + mu.
     double sx = 0, sy = 0, sxx = 0, sxy = 0;
@@ -300,66 +338,71 @@ struct Demodulator::Impl {
     const float a2 = amp * amp, mu2 = mu * mu;
     float cost[2] = {0.0f, 1e30f};  // before bit 0: "previous bit" 1 = last chip (15) empty
     float cost56[2] = {0.0f, 0.0f};
+    // The squared error of every sample of the frame for each of its four
+    // possible pulse patterns: (y - sqrt(a2 x^2 + mu2))^2, x = its overlap
+    // with the chips that carry a pulse. Four lanes at once, each the same
+    // operations in the same order as one scalar evaluation.
+    const float* xs = sov_x.data() + static_cast<std::size_t>(p) * sov_n * 4;
+    const std::uint8_t* pat = sov_pat.data() + static_cast<std::size_t>(p) * sov_n * 4;
+    float* er = errs.data();
+    {
+      const f4 a2v = splat4(a2), mu2v = splat4(mu2);
+      for (std::size_t j = bb[0]; j < bb[bits]; ++j) {
+        const f4 x = load4(xs + 4 * j);
+        const f4 d = splat4(mt[sov_k0 + static_cast<std::ptrdiff_t>(j)]) - sqrt4(a2v * x * x + mu2v);
+        store4(er + 4 * j, d * d);
+      }
+    }
+    // Survivor paths: the bits of the best path into each state, bit i at
+    // (63 - i % 64) of word i / 64, so the frame's bytes are the words in
+    // big-endian order. Taking the survivor of the chosen predecessor is
+    // the same choice the traceback through the decisions made.
+    std::uint64_t path[2][2] = {{0, 0}, {0, 0}};
+    std::uint64_t path56[2][2] = {{0, 0}, {0, 0}};
     for (int i = 0; i < bits; ++i) {
-      // Squared error of every sample of this bit for each (previous bit,
-      // this bit): a sample's chips are its bit's two half-bits or the
-      // previous bit's second half-bit (role 1, 2, 3; 0 = no pulse there).
       // Path cost of each (previous bit, this bit), accumulated sample by
       // sample onto the previous path's cost, in float: exactly the sums
       // (and so the decisions) of a loop over the states.
-      float c[2][2] = {{cost[0], cost[0]}, {cost[1], cost[1]}};
+      float c00 = cost[0], c01 = cost[0], c10 = cost[1], c11 = cost[1];
       for (std::size_t j = bb[i]; j < bb[i + 1]; ++j) {
-        const float y = mt[sov_k0 + static_cast<std::ptrdiff_t>(j)];
-        const float lo = so[j].ov_lo, hi = so[j].ov_hi;
-        const std::uint8_t r_lo = role[2 * j], r_hi = role[2 * j + 1];
-        // The four predictions (pulse in neither / the second / the first /
-        // both of the sample's chips), each squared error computed once.
-        auto err = [&](float x) {
-          const float d = y - std::sqrt(a2 * x * x + mu2);
-          return d * d;
-        };
-        const float e[2][2] = {{err(lo * 0.0f + hi * 0.0f), err(lo * 0.0f + hi * 1.0f)},
-                                {err(lo * 1.0f + hi * 0.0f), err(lo * 1.0f + hi * 1.0f)}};
-        for (int prev = 0; prev < 2; ++prev) {
-          for (int b = 0; b < 2; ++b) {
-            auto on = [&](std::uint8_t r) -> int {
-              switch (r) {
-                case 1: return i == 0 ? 0 : 1 - prev;
-                case 2: return b;
-                case 3: return 1 - b;
-                default: return 0;
-              }
-            };
-            c[prev][b] += e[on(r_lo)][on(r_hi)];
-          }
-        }
+        const float* e = er + 4 * j;
+        const std::uint8_t* q = pat + 4 * j;
+        c00 += e[q[0]];
+        c01 += e[q[1]];
+        c10 += e[q[2]];
+        c11 += e[q[3]];
       }
+      const float c0[2] = {c00, c01}, c1[2] = {c10, c11};
       float next[2];
+      std::uint64_t npath[2][2];
+      const int w = i / 64;
+      const std::uint64_t bit = std::uint64_t{1} << (63 - i % 64);
       for (int b = 0; b < 2; ++b) {
-        const float via0 = cost[0] < 1e30f ? c[0][b] : 1e30f;
-        const float via1 = cost[1] < 1e30f ? c[1][b] : 1e30f;
+        const float via0 = cost[0] < 1e30f ? c0[b] : 1e30f;
+        const float via1 = cost[1] < 1e30f ? c1[b] : 1e30f;
         // Ties go to previous bit 0, as the earlier per-state loop did.
         const bool one = via1 < via0;
         next[b] = one ? via1 : via0;
-        trace[static_cast<std::size_t>(2 * i + b)] = static_cast<std::uint8_t>(one ? 1 : 0);
+        const std::uint64_t* from = path[one ? 1 : 0];
+        npath[b][0] = from[0];
+        npath[b][1] = from[1];
+        if (b) npath[b][w] |= bit;
       }
       cost[0] = next[0];
       cost[1] = next[1];
+      std::memcpy(path, npath, sizeof path);
       if (i == 55) {
         cost56[0] = cost[0];
         cost56[1] = cost[1];
+        std::memcpy(path56, path, sizeof path);
       }
     }
-    auto traceback = [&](int nb, const float* end_cost, std::uint8_t* out) {
-      int state = end_cost[1] < end_cost[0] ? 1 : 0;
-      std::memset(out, 0, 14);
-      for (int i = nb - 1; i >= 0; --i) {
-        if (state) out[i / 8] = static_cast<std::uint8_t>(out[i / 8] | (0x80u >> (i % 8)));
-        state = trace[static_cast<std::size_t>(2 * i + state)];
-      }
+    auto emit = [](const float* end_cost, const std::uint64_t (*paths)[2], std::uint8_t* out) {
+      const std::uint64_t* best = paths[end_cost[1] < end_cost[0] ? 1 : 0];
+      for (int k = 0; k < 14; ++k) out[k] = static_cast<std::uint8_t>(best[k / 8] >> (56 - 8 * (k % 8)));
     };
-    traceback(bits, cost, bytes);
-    if (bits == 112 && bytes56) traceback(56, cost56, bytes56);
+    emit(cost, path, bytes);
+    if (bits == 112 && bytes56) emit(cost56, path56, bytes56);
     return true;
   }
   std::uint64_t ttl = 0;
@@ -369,6 +412,40 @@ struct Demodulator::Impl {
   bool fixed4 = true;
   std::vector<float> w4;            // [(phase * kMaxChips + chip) * 4]
   std::vector<std::int32_t> first4;  // [phase * kMaxChips + chip]
+
+  // Chips c .. c + 3 of a phase at once (fixed4 only). Each lane is
+  // ((w0 x0 + w1 x1) + w2 x2) + w3 x3, the scalar chip()'s sum: the four
+  // products of each chip are formed in place, then transposed so that the
+  // additions run down the lanes in that order.
+  [[nodiscard]] f4 chip4(const float* m, std::ptrdiff_t t, int phase, int c) const noexcept {
+    const int base = phase * kMaxChips + c;
+    return chip4_of(m, t, base, base + 1, base + 2, base + 3);
+  }
+  // Any four chips, by index phase * kMaxChips + chip.
+  [[nodiscard]] f4 chip4_of(const float* m, std::ptrdiff_t t, int i0, int i1, int i2, int i3) const noexcept {
+    const f4 p0 = load4(w4.data() + 4 * i0) * load4(m + t + first4[static_cast<std::size_t>(i0)]);
+    const f4 p1 = load4(w4.data() + 4 * i1) * load4(m + t + first4[static_cast<std::size_t>(i1)]);
+    const f4 p2 = load4(w4.data() + 4 * i2) * load4(m + t + first4[static_cast<std::size_t>(i2)]);
+    const f4 p3 = load4(w4.data() + 4 * i3) * load4(m + t + first4[static_cast<std::size_t>(i3)]);
+    const f4 t0 = __builtin_shufflevector(p0, p1, 0, 4, 1, 5);
+    const f4 t1 = __builtin_shufflevector(p0, p1, 2, 6, 3, 7);
+    const f4 t2 = __builtin_shufflevector(p2, p3, 0, 4, 1, 5);
+    const f4 t3 = __builtin_shufflevector(p2, p3, 2, 6, 3, 7);
+    const f4 q0 = __builtin_shufflevector(t0, t2, 0, 1, 4, 5);
+    const f4 q1 = __builtin_shufflevector(t0, t2, 2, 3, 6, 7);
+    const f4 q2 = __builtin_shufflevector(t1, t3, 0, 1, 4, 5);
+    const f4 q3 = __builtin_shufflevector(t1, t3, 2, 3, 6, 7);
+    return ((q0 + q1) + q2) + q3;
+  }
+  // Chips [from, to) of a phase into out[from .. to), `from` and `to`
+  // multiples of 4 (kMaxChips is one).
+  void chips_into(const float* m, std::ptrdiff_t t, int phase, int from, int to, float* out) const noexcept {
+    if (fixed4) {
+      for (int c = from; c < to; c += 4) store4(out + c, chip4(m, t, phase, c));
+    } else {
+      for (int c = from; c < to; ++c) out[c] = chip(m, t, phase, c);
+    }
+  }
 
   [[nodiscard]] float chip(const float* m, std::ptrdiff_t t, int phase, int c) const noexcept {
     const auto idx = static_cast<std::size_t>(phase * kMaxChips + c);
@@ -459,7 +536,6 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
     im.sov_n = static_cast<std::size_t>(k_end - im.sov_k0 + 1);
     im.sov.assign(static_cast<std::size_t>(im.phases) * im.sov_n, {});
     im.bit_begin.assign(static_cast<std::size_t>(im.phases) * 113, 0);
-    im.trace.assign(2 * 112, 0);
     for (int p = 0; p < im.phases; ++p) {
       const double frac = static_cast<double>(p) / im.phases;
       Impl::SampleOv* so = im.sov.data() + static_cast<std::size_t>(p) * im.sov_n;
@@ -508,9 +584,36 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
         }
       }
     }
+    // Pulse patterns per hypothesis and their overlaps (see Impl). Role 1
+    // (the previous bit's second half) never occurs in bit 0.
+    im.sov_pat.assign(static_cast<std::size_t>(im.phases) * im.sov_n * 4, 0);
+    im.sov_x.assign(static_cast<std::size_t>(im.phases) * im.sov_n * 4, 0.0f);
+    im.errs.assign(im.sov_n * 4, 0.0f);
+    for (std::size_t pj = 0; pj < static_cast<std::size_t>(im.phases) * im.sov_n; ++pj) {
+      const std::uint8_t r_lo = im.sov_role[2 * pj], r_hi = im.sov_role[2 * pj + 1];
+      for (int prev = 0; prev < 2; ++prev) {
+        for (int b = 0; b < 2; ++b) {
+          auto on = [&](std::uint8_t r) -> int {
+            switch (r) {
+              case 1: return 1 - prev;
+              case 2: return b;
+              case 3: return 1 - b;
+              default: return 0;
+            }
+          };
+          im.sov_pat[4 * pj + static_cast<std::size_t>(prev * 2 + b)] = static_cast<std::uint8_t>(on(r_lo) * 2 + on(r_hi));
+        }
+      }
+      const float lo = im.sov[pj].ov_lo, hi = im.sov[pj].ov_hi;
+      im.sov_x[4 * pj + 0] = lo * 0.0f + hi * 0.0f;
+      im.sov_x[4 * pj + 1] = lo * 0.0f + hi * 1.0f;
+      im.sov_x[4 * pj + 2] = lo * 1.0f + hi * 0.0f;
+      im.sov_x[4 * pj + 3] = lo * 1.0f + hi * 1.0f;
+    }
   }
   im.ttl = static_cast<std::uint64_t>(cfg_.address_ttl_s * cfg_.sample_rate_hz);
-  im.templ.assign(static_cast<std::size_t>(im.need + im.back) + 16, 0.0);
+  im.templ_limit = static_cast<std::size_t>(im.need + im.back) + 16;
+  im.templ.assign(im.templ_limit + static_cast<std::size_t>(spu_ / 2) + 4, 0.0);
 
   // Everything is allocated here: room for a block, the held-back samples,
   // the up to 1023 samples that wait for the first noise block, and the
@@ -541,7 +644,10 @@ std::span<const DemodFrame> Demodulator::feed(const std::uint8_t* data, std::siz
 
 std::span<const DemodFrame> Demodulator::feed_magnitudes(const float* mag, std::size_t n) {
   n = std::min(n, cfg_.block_samples);
-  std::memcpy(buf_.data() + valid_, mag, n * sizeof(float));
+  // NaN / inf count as silence, as in magnitudes() (a NaN would otherwise
+  // reach the noise floor's comparisons).
+  float* dst = buf_.data() + valid_;
+  for (std::size_t k = 0; k < n; ++k) dst[k] = std::isfinite(mag[k]) ? mag[k] : 0.0f;
   append(n);
   scan(false);
   return {out_.data(), n_out_};
@@ -571,15 +677,28 @@ namespace {
 constexpr float kNoiseQuarterScale = 1.0f / 0.8338f;
 
 float lowest_quarter_mean(const float* win, std::size_t n) {
-  std::array<float, 65> tmp{};  // up to 64 windows and a partial one
-  std::copy(win, win + n, tmp.begin());
+  // The q smallest, ascending, by insertion into a sorted run of q (a value
+  // not below the run's largest is skipped). Equal values are the same
+  // float, so the sum below adds the same values in the same order as any
+  // other way of finding them (a partial sort did it before).
   const std::size_t q = std::max<std::size_t>(1, n / 4);
-  // The q smallest, ascending (what a partial sort gives, for less work):
-  // the sum below then adds the same values in the same order.
-  std::nth_element(tmp.begin(), tmp.begin() + static_cast<std::ptrdiff_t>(q - 1), tmp.begin() + static_cast<std::ptrdiff_t>(n));
-  std::sort(tmp.begin(), tmp.begin() + static_cast<std::ptrdiff_t>(q));
+  std::array<float, 17> run{};  // q <= 65 / 4
+  std::size_t k = 0;
+  for (; k < q && k < n; ++k) {
+    const float x = win[k];
+    std::size_t i = k;
+    for (; i > 0 && run[i - 1] > x; --i) run[i] = run[i - 1];
+    run[i] = x;
+  }
+  for (; k < n; ++k) {
+    const float x = win[k];
+    if (!(x < run[q - 1])) continue;
+    std::size_t i = q - 1;
+    for (; i > 0 && run[i - 1] > x; --i) run[i] = run[i - 1];
+    run[i] = x;
+  }
   float sum = 0.0f;
-  for (std::size_t i = 0; i < q; ++i) sum += tmp[i];
+  for (std::size_t i = 0; i < q; ++i) sum += run[i];
   return sum / static_cast<float>(q) * kNoiseQuarterScale;
 }
 }  // namespace
@@ -648,6 +767,25 @@ inline float window_sum16(const float* x) noexcept {
   for (int j = 0; j < 16; ++j) sum += x[j];
   return sum;
 }
+
+// window_sum16 of four consecutive windows (x[0..63]), one per lane: 4x4
+// blocks are transposed so that lane i adds window i's samples one after
+// another, from zero, as window_sum16 does.
+inline f4 window_sums4(const float* x) noexcept {
+  f4 acc{0.0f, 0.0f, 0.0f, 0.0f};
+  for (int j = 0; j < 16; j += 4) {
+    const f4 r0 = load4(x + j), r1 = load4(x + 16 + j), r2 = load4(x + 32 + j), r3 = load4(x + 48 + j);
+    const f4 t0 = __builtin_shufflevector(r0, r1, 0, 4, 1, 5);
+    const f4 t1 = __builtin_shufflevector(r0, r1, 2, 6, 3, 7);
+    const f4 t2 = __builtin_shufflevector(r2, r3, 0, 4, 1, 5);
+    const f4 t3 = __builtin_shufflevector(r2, r3, 2, 6, 3, 7);
+    acc += __builtin_shufflevector(t0, t2, 0, 1, 4, 5);
+    acc += __builtin_shufflevector(t0, t2, 2, 3, 6, 7);
+    acc += __builtin_shufflevector(t1, t3, 0, 1, 4, 5);
+    acc += __builtin_shufflevector(t1, t3, 2, 3, 6, 7);
+  }
+  return acc;
+}
 }  // namespace
 
 void Demodulator::append(std::size_t n) {
@@ -656,6 +794,16 @@ void Demodulator::append(std::size_t n) {
   std::size_t k = 0;
   while (k < n) {
     const std::uint64_t in_block = pos_ % kNoiseBlock;
+    if (win_count_ == 0 && k + 4 * kNoiseWindow <= n && in_block + 4 * kNoiseWindow <= kNoiseBlock) {
+      // Four whole windows inside one block: what four passes of the case
+      // below give (only the last can end the block).
+      const f4 sums = window_sums4(m + k) / splat4(static_cast<float>(kNoiseWindow));
+      for (int w = 0; w < 4; ++w) sub_[n_sub_++] = sums[w];
+      pos_ += 4 * kNoiseWindow;
+      k += 4 * kNoiseWindow;
+      if (in_block + 4 * kNoiseWindow == kNoiseBlock) finish_noise_block();
+      continue;
+    }
     if (win_count_ == 0 && k + kNoiseWindow <= n && in_block + kNoiseWindow <= kNoiseBlock) {
       // A whole window inside one block, straight from the buffer.
       sub_[n_sub_++] = window_sum16(m + k) / static_cast<float>(kNoiseWindow);
@@ -771,29 +919,46 @@ void Demodulator::scan(bool final) {
     int seq_phase = -1;
     float seq_quality = 0.0f;
     for (int p = 0; p < im.phases; ++p) {
+      // Chip energies of this phase, filled as far as they are needed.
+      alignas(16) float cv[kMaxChips];
       float pulse[4];
+      const int pb = p * kMaxChips;
+      if (im.fixed4) {
+        store4(pulse, im.chip4_of(m, t, pb + kPulseChips[0], pb + kPulseChips[1], pb + kPulseChips[2], pb + kPulseChips[3]));
+      } else {
+        for (int i = 0; i < 4; ++i) pulse[i] = im.chip(m, t, p, kPulseChips[i]);
+      }
       float pmin = 1e30f, psum = 0.0f;
       for (int i = 0; i < 4; ++i) {
-        pulse[i] = im.chip(m, t, p, kPulseChips[i]);
         pmin = std::min(pmin, pulse[i]);
         psum += pulse[i];
       }
       const float signal = psum / (4.0f * chip_len);
       if (signal < min_signal) continue;
+      float quiet_chips[12];
+      if (im.fixed4) {
+        for (int g = 0; g < 12; g += 4) {
+          store4(quiet_chips + g, im.chip4_of(m, t, pb + kQuietChips[g], pb + kQuietChips[g + 1], pb + kQuietChips[g + 2],
+                                              pb + kQuietChips[g + 3]));
+        }
+      } else {
+        for (int g = 0; g < 12; ++g) quiet_chips[g] = im.chip(m, t, p, kQuietChips[g]);
+      }
       float qsum = 0.0f;
-      for (int c : kQuietChips) qsum += im.chip(m, t, p, c);
+      for (float q : quiet_chips) qsum += q;
       const float quiet = qsum / 12.0f;
       if (pmin < quiet * pulse_quiet) continue;
       any_preamble = true;
 
-      // Step 3: bits.
+      // Step 3: bits. (The margin, the sum of |first - second half| in bit
+      // order, is needed only for a frame that passes: it is added up then.)
       std::uint8_t bytes[14] = {};
-      float margin = 0.0f;
-      auto bit = [&](int i) {
-        const float a = im.chip(m, t, p, kPreambleChips + 2 * i);
-        const float b = im.chip(m, t, p, kPreambleChips + 2 * i + 1);
-        margin += std::fabs(a - b);
-        if (a > b) bytes[i / 8] = static_cast<std::uint8_t>(bytes[i / 8] | (0x80u >> (i % 8)));
+      auto read_bits = [&](int from, int to) {
+        for (int i = from; i < to; ++i) {
+          const float a = cv[kPreambleChips + 2 * i];
+          const float b = cv[kPreambleChips + 2 * i + 1];
+          bytes[i / 8] = static_cast<std::uint8_t>(bytes[i / 8] | (a > b ? 0x80u >> (i % 8) : 0u));
+        }
       };
       // At the end of the stream the message must end inside the data.
       auto fits = [&](int nbits) {
@@ -836,12 +1001,15 @@ void Demodulator::scan(bool final) {
         return 0;
       };
 
-      for (int i = 0; i < 5; ++i) bit(i);
+      // The format (bits 0-4) first: chips 16-27.
+      im.chips_into(m, t, p, kPreambleChips, kPreambleChips + 12, cv);
+      read_bits(0, 5);
       unsigned df = bytes[0] >> 3;
       int bits = df >= 16 ? 112 : 56;
       int score = 0;
       if (supported_df(df) && fits(bits)) {
-        for (int i = 5; i < bits; ++i) bit(i);
+        im.chips_into(m, t, p, kPreambleChips + 12, kPreambleChips + 2 * bits, cv);
+        read_bits(5, bits);
         score = check(bytes, bits);
       }
       // Remember the most promising phase that failed, for step 3b.
@@ -853,6 +1021,8 @@ void Demodulator::scan(bool final) {
         if (unknown) saw_unknown_address = true;
         continue;
       }
+      float margin = 0.0f;
+      for (int i = 0; i < bits; ++i) margin += std::fabs(cv[kPreambleChips + 2 * i] - cv[kPreambleChips + 2 * i + 1]);
       margin /= static_cast<float>(bits) * signal * chip_len;
       if (score > best.score || (score == best.score && score > 0 && margin > best.margin)) {
         best.score = score;
@@ -942,6 +1112,7 @@ void Demodulator::scan(bool final) {
     const std::ptrdiff_t off = im.back;  // e[k + off] holds sample k (k >= -back)
     const double h = spu_ / 2;
     std::vector<double>& e = im.templ;
+    const int chip_span = static_cast<int>(std::floor(h)) + 2;
     // Score <m, e> / |e| and amplitude 2 <m, e> / |e|^2 (m ~ A/2 e + const).
     auto evaluate = [&](double rel, double& amp) {
       // Samples k (relative to t) cover [k - 0.5, k + 0.5); stored at e[k + off].
@@ -950,17 +1121,26 @@ void Demodulator::scan(bool final) {
       // The margins (back, need, templ's size) cover the climb's reach; a
       // trial outside them would touch memory it must not, so it never wins.
       if (k_lo + off < 0 || k_lo < -static_cast<std::ptrdiff_t>(t) ||
-          static_cast<std::size_t>(k_hi + off + 1) > e.size() || t + k_hi >= static_cast<std::ptrdiff_t>(valid_) + static_cast<std::ptrdiff_t>(final ? im.need + 8 : 0)) {
+          static_cast<std::size_t>(k_hi + off + 1) > im.templ_limit || t + k_hi >= static_cast<std::ptrdiff_t>(valid_) + static_cast<std::ptrdiff_t>(final ? im.need + 8 : 0)) {
         amp = 0.0;
         return -std::numeric_limits<double>::infinity();
       }
       std::fill(e.begin() + (k_lo + off), e.begin() + (k_hi + off + 1), 0.0);
+      // Every chip covers at most floor(h) + 2 samples: a fixed number of
+      // trials per chip (no unpredictable loop exit), the samples the loop
+      // would not have reached or with no overlap getting + 0.0, which
+      // leaves them unchanged (they are never -0.0: they start at +0.0 and
+      // only nonzero overlaps are added).
       for (int c = 0; c < nchips; ++c) {
         if (sign[c] == 0) continue;
         const double a = rel + c * h, bnd = a + h;
-        for (auto k = static_cast<std::ptrdiff_t>(std::floor(a + 0.5)); static_cast<double>(k) - 0.5 < bnd; ++k) {
+        const auto k0 = static_cast<std::ptrdiff_t>(std::floor(a + 0.5));
+        const double sg = sign[c];
+        for (int j = 0; j < chip_span; ++j) {
+          const std::ptrdiff_t k = k0 + j;
           const double ov = std::min(bnd, static_cast<double>(k) + 0.5) - std::max(a, static_cast<double>(k) - 0.5);
-          if (ov > 0) e[static_cast<std::size_t>(k + off)] += sign[c] * ov;
+          // (ov > 0 implies k - 0.5 < bnd, the old loop's condition.)
+          e[static_cast<std::size_t>(k + off)] += ov > 0 ? sg * ov : 0.0;
         }
       }
       double dot = 0.0, norm = 0.0;

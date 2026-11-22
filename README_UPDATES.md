@@ -644,7 +644,9 @@ On `main`, with CI passing:
 
 - the IQ scenario generator (§22.4): `adsb-iqsynth` writes SigMF recordings with per-message truth; pinned readsb decodes 98.8% of clean messages at 15–30 dB SNR, with timestamps within 0.3 µs of the truth (`core/scripts/check-iq.sh`, in CI).
 
-Not started: the demodulator (A), A/B arbitration (B), hardware timestamps (§9.4), ITCH (J), and camera fusion (I).
+- the demodulator (§5.2): `adsb-demod` decodes the generator's files with 1–20% more messages than readsb on the same files (+10% on weak signals), thanks to a sequence detector behind the half-bit slicer, and no false DF17; starts within 0.06 µs of the truth (`core/scripts/check-demod.sh`, in CI). Not yet: real RTL-SDR recordings, live SDR ingest (§5.1), SIMD.
+
+Not started: A/B arbitration (B), hardware timestamps (§9.4), ITCH (J), and camera fusion (I).
 
 ### 22.3 What MATLAB offers
 

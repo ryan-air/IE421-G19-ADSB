@@ -49,3 +49,7 @@ adsb_apply_compiler_options(adsb-dst)
 add_executable(adsb-iqsynth adsb_iqsynth.cpp)
 target_link_libraries(adsb-iqsynth PRIVATE adsb::core)
 adsb_apply_compiler_options(adsb-iqsynth)
+
+add_executable(adsb-demod adsb_demod.cpp)
+target_link_libraries(adsb-demod PRIVATE adsb::core)
+adsb_apply_compiler_options(adsb-demod)

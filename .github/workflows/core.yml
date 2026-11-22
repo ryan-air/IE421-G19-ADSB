@@ -88,7 +88,7 @@ jobs:
 
       - name: Fuzz
         run: |
-          for target in beast decoder packet feed; do
+          for target in beast decoder packet feed demod; do
             mkdir -p "/tmp/corpus_$target"
             cp fuzz/corpus/$target/* "/tmp/corpus_$target/"
             ./build/fuzz/fuzz/fuzz_$target -max_total_time=60 -print_final_stats=1 \
@@ -504,7 +504,7 @@ jobs:
           test "$(grep '^sweep hash' gcc.txt)" = "$(grep '^sweep hash' clang.txt)"
 
   iq:
-    name: synthetic IQ generator (readsb decodes it, scored against the truth)
+    name: synthetic IQ and demodulator (scored against the truth and readsb)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -522,9 +522,14 @@ jobs:
       - name: Build
         run: |
           CXX=g++-14 cmake -S . -B build/iq -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
-          cmake --build build/iq --target adsb-iqsynth
+          cmake --build build/iq --target adsb-iqsynth adsb-demod
       # Determinism and formats, then readsb decodes cu8 and cs16 files
       # (clean 15-30 dB messages >= 97%, timestamps within one sample),
       # impairments, multipath echoes, and the gain trade-off.
-      - name: Run
+      - name: Generator
         run: scripts/check-iq.sh build/iq /tmp/readsb/readsb
+      # adsb-demod on busy, weak, impaired, multipath and 2.0/12 MS/s
+      # scenarios: clean 15-30 dB >= 98%, no false DF17, starts within half a
+      # sample, and at least 98% of readsb's messages on the same files.
+      - name: Demodulator
+        run: scripts/check-demod.sh build/iq /tmp/readsb/readsb

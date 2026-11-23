@@ -542,6 +542,89 @@ TEST(Decoder, OperationalStatusSurfaceAndOlderVersions) {
   EXPECT_FALSE(m.has(kFieldOpStatus));
 }
 
+TEST(Decoder, NicSupplementsBAndC) {
+  // B: ME bit 8 of airborne positions (baro and GNSS); not read elsewhere.
+  for (const unsigned tc : {9u, 11u, 16u, 18u, 20u, 22u}) {
+    EXPECT_TRUE(decode_vec(df17_with({{1, 5, tc}, {8, 8, 1}})).nic_supplement_b) << tc;
+    EXPECT_FALSE(decode_vec(df17_with({{1, 5, tc}})).nic_supplement_b) << tc;
+  }
+  EXPECT_FALSE(decode_vec(df17_with({{1, 5, 7}, {8, 8, 1}})).nic_supplement_b) << "surface: bit 8 is movement";
+  // DF18: bit 8 is NIC-B for ADS-B (CF 0/1), the IMF flag for TIS-B / ADS-R (CF 2, 5, 6).
+  for (const unsigned cf : {0u, 1u, 2u, 5u, 6u}) {
+    auto f = df17_with({{1, 5, 16}, {8, 8, 1}});
+    set_bits(f, 1, 5, 18);
+    set_bits(f, 6, 8, cf);
+    fix_parity(f);
+    EXPECT_EQ(decode_vec(f).nic_supplement_b, cf <= 1) << "CF " << cf;
+  }
+  // C: capability class bit 20 of a version 2 surface status only.
+  EXPECT_TRUE(decode_vec(df17_with({{1, 5, 31}, {6, 8, 1}, {20, 20, 1}, {41, 43, 2}})).op_status.nic_supplement_c);
+  EXPECT_FALSE(decode_vec(df17_with({{1, 5, 31}, {6, 8, 1}, {20, 20, 1}, {41, 43, 1}})).op_status.nic_supplement_c);
+  EXPECT_FALSE(decode_vec(df17_with({{1, 5, 31}, {6, 8, 0}, {20, 20, 1}, {41, 43, 2}})).op_status.nic_supplement_c);
+  EXPECT_FALSE(decode_vec(df17_with({{1, 5, 31}, {6, 8, 1}, {41, 43, 2}})).op_status.nic_supplement_c);
+  // Only with capability class code 0 (bits 9-10), as readsb.
+  EXPECT_FALSE(decode_vec(df17_with({{1, 5, 31}, {6, 8, 1}, {9, 10, 1}, {20, 20, 1}, {41, 43, 2}})).op_status.nic_supplement_c);
+  EXPECT_FALSE(decode_vec(df17_with({{1, 5, 31}, {6, 8, 1}, {9, 10, 1}, {41, 43, 2}})).op_status.nic_supplement_c_valid);
+  EXPECT_TRUE(decode_vec(df17_with({{1, 5, 31}, {6, 8, 1}, {41, 43, 2}})).op_status.nic_supplement_c_valid);
+}
+
+TEST(Decoder, OperationalStatusOfReservedVersionsIsNotRead) {
+  for (const unsigned v : {3u, 5u, 7u}) {
+    const auto m = decode_vec(df17_with({{1, 5, 31}, {6, 8, 1}, {20, 20, 1}, {41, 43, v}, {44, 44, 1}, {45, 48, 9},
+                                         {51, 52, 3}, {54, 54, 1}, {55, 55, 1}}));
+    ASSERT_TRUE(m.has(kFieldOpStatus));
+    EXPECT_EQ(m.op_status.version, v);
+    EXPECT_FALSE(m.op_status.nic_supplement_a || m.op_status.nic_supplement_c || m.op_status.sil_per_sample);
+    EXPECT_EQ(m.op_status.nac_p, 0);
+    EXPECT_EQ(m.op_status.sil, 0);
+  }
+}
+
+// DO-260B Table 2-14 (airborne) and 2-15 (surface), with readsb's readings
+// for versions 0 and 1 (track.c compute_nic, v3.16.21).
+TEST(Decoder, PositionNicFollowsTheTables) {
+  // Type codes whose NIC needs no supplement, in every version.
+  const std::pair<unsigned, unsigned> fixed[] = {{5, 11}, {6, 10}, {9, 11}, {10, 10}, {12, 7}, {13, 6},
+                                                 {14, 5}, {15, 4}, {17, 1}, {18, 0}, {20, 11}, {21, 10}, {22, 0}};
+  for (const auto& [tc, nic] : fixed) {
+    for (unsigned v = 0; v <= 2; ++v) {
+      for (unsigned bits = 0; bits < 8; ++bits) {
+        ASSERT_EQ(position_nic(tc, v, bits & 1, bits & 2, bits & 4), nic) << tc << " v" << v << " " << bits;
+      }
+    }
+  }
+  // TC 11 (airborne, Rc 0.1 / 0.2 NM): version 2 needs A and B, version 1 A.
+  EXPECT_EQ(position_nic(11, 2, true, true, false), 9);
+  EXPECT_EQ(position_nic(11, 2, true, false, false), 8);
+  EXPECT_EQ(position_nic(11, 2, false, true, false), 8);
+  EXPECT_EQ(position_nic(11, 1, true, false, false), 9);
+  EXPECT_EQ(position_nic(11, 1, false, true, false), 8) << "bit 8 is the single antenna flag in version 1";
+  EXPECT_EQ(position_nic(11, 0, true, true, false), 8);
+  // TC 16 (Rc 4 / 8 NM): A and B, in every version (readsb).
+  EXPECT_EQ(position_nic(16, 2, true, true, false), 3);
+  EXPECT_EQ(position_nic(16, 2, true, false, false), 2);
+  EXPECT_EQ(position_nic(16, 0, true, true, false), 3);
+  EXPECT_EQ(position_nic(16, 1, false, true, false), 2);
+  // TC 7 (surface, Rc 0.1 / 0.2 NM): version 2 A without C, version 1 A.
+  EXPECT_EQ(position_nic(7, 2, true, false, false), 9);
+  EXPECT_EQ(position_nic(7, 2, true, false, true), 8);
+  EXPECT_EQ(position_nic(7, 2, false, false, false), 8);
+  EXPECT_EQ(position_nic(7, 1, true, false, true), 9);
+  EXPECT_EQ(position_nic(7, 0, true, false, false), 8);
+  // TC 8 (surface, Rc 0.6 NM or more): version 2 only.
+  EXPECT_EQ(position_nic(8, 2, true, false, true), 7);
+  EXPECT_EQ(position_nic(8, 2, true, false, false), 6);
+  EXPECT_EQ(position_nic(8, 2, false, false, true), 6);
+  EXPECT_EQ(position_nic(8, 2, false, false, false), 0);
+  EXPECT_EQ(position_nic(8, 1, true, false, true), 0);
+  // Reserved versions read as version 0 (as in readsb); non-position codes are 0.
+  EXPECT_EQ(position_nic(11, 3, true, true, false), 8);
+  EXPECT_EQ(position_nic(7, 5, true, false, false), 8);
+  for (const unsigned tc : {0u, 1u, 4u, 19u, 23u, 28u, 29u, 31u, 32u}) {
+    EXPECT_EQ(position_nic(tc, 2, true, true, true), 0) << tc;
+  }
+}
+
 DecodedMsg decode_ap(const char* s) {
   const auto f = hex(s);
   DecodedMsg m;

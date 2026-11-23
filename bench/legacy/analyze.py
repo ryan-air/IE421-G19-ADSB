@@ -142,6 +142,9 @@ def load_sbs(path, surface=False):
     return pos, ident
 
 
+TRACK_UPDATE_SIZE = 72  # feed v1 (protocol/schema/feed_v1.json); v0 was 64
+
+
 def load_new_updates(path):
     """TrackUpdate stream from adsb-replay --out -> positions and identity."""
     data = path.read_bytes()
@@ -150,7 +153,7 @@ def load_new_updates(path):
         (ln,) = struct.unpack_from("<H", data, off)
         msg = data[off + 2:off + 2 + ln]
         off += 2 + ln
-        if ln != 64 or msg[0] != ord("U"):
+        if ln != TRACK_UPDATE_SIZE or msg[0] != ord("U"):
             continue
         (mask, icao, ev_ts, _radio, lat_e7, lon_e7, alt, _gs, _trk, _vr, squawk) = struct.unpack_from(
             "<HIQQiiiHHhH", msg, 2)

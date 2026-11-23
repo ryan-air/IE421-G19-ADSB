@@ -40,6 +40,8 @@ enum TrackValid : std::uint16_t {
   kHasSquawk = 1u << 6,
   kHasCategory = 1u << 7,
   kHasAirGround = 1u << 8,
+  kHasHeading = 1u << 9,
+  kHasAirspeed = 1u << 10,
   kConfirmed = 1u << 15,  // seen in at least one CRC-verified frame
 };
 
@@ -67,6 +69,7 @@ struct CprSlot {
   std::uint64_t ts_ns = 0;
   bool valid = false;
   bool surface = false;
+  std::uint8_t nic = 0;  // of this frame (modes::position_nic at receipt, as readsb)
 };
 
 struct ColdTrack {
@@ -75,6 +78,18 @@ struct ColdTrack {
   std::uint64_t squawk_ts_ns = 0;
   std::uint64_t ground_ts_ns = 0;
   std::uint64_t radio_ts = 0;     // of the newest frame that produced an update; line id in the top bits
+  // Airborne velocity subtypes 3/4 (share HotTrack::vel_ts_ns).
+  std::uint16_t heading_cdeg = 0;
+  std::uint16_t airspeed_kt = 0;
+  // Integrity: operational status (TC 31) and the current position's NIC.
+  std::uint64_t opstatus_ts_ns = 0;
+  std::uint8_t adsb_version = 0xFF;  // 0xFF = no TC 31 yet (positions use version 0 rules)
+  bool nic_a = false;
+  bool nic_c = false;
+  bool heading_true_north = false;   // HRD of the latest version 1/2 TC 31
+  std::uint8_t nic = 0;
+  std::uint64_t nic_a_ts_ns = 0;     // NIC-A / NIC-C count for 60 s after the TC 31 that set them
+  std::uint64_t nic_c_ts_ns = 0;
   CprSlot cpr_even;
   CprSlot cpr_odd;
   std::uint8_t position_reject_streak = 0;

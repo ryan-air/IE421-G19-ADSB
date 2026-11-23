@@ -10,8 +10,8 @@
       "name": "TrackUpdate",
       "fields": {
         "msg_type": 85,
-        "version": 0,
-        "update_mask": 33,
+        "version": 1,
+        "update_mask": 545,
         "icao": 4735190,
         "event_ts_ns": "1763337600123456789",
         "radio_ts": "1152921504606846976",
@@ -24,17 +24,20 @@
         "squawk": 30464,
         "callsign": "KLM1023 ",
         "category": 160,
-        "nic": 0,
-        "flags": 0,
-        "reserved": 0,
-        "publish_ts_ns": "0"
+        "nic": 8,
+        "flags": 16,
+        "adsb_version": 2,
+        "publish_ts_ns": "0",
+        "heading_cdeg": 18105,
+        "airspeed_kt": 452,
+        "reserved": 0
       }
     },
     {
       "name": "TrackDelete",
       "fields": {
         "msg_type": 68,
-        "version": 0,
+        "version": 1,
         "reason": 1,
         "reserved": 0,
         "icao": 4735190,
@@ -42,5 +45,5 @@
       }
     }
   ],
-  "size": 104
+  "size": 112
 }

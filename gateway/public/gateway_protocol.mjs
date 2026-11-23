@@ -28,7 +28,7 @@ export const FrameFlags = Object.freeze({ kStale: 1, kEnded: 2 });
 
 const kUpdate = 0x55;
 const kDelete = 0x44;
-const kTrackUpdateSize = 64;
+const kTrackUpdateSize = 72;
 const kTrackDeleteSize = 16;
 
 export function encodeFrameHeader(kind, flags, count, asOfSeq) {
@@ -67,7 +67,7 @@ export function decodeFrame(data) {
   return { kind, flags, asOfSeq, messages };
 }
 
-// The browser's copy of the track table: icao -> Uint8Array(64) TrackUpdate.
+// The browser's copy of the track table: icao -> Uint8Array(72) TrackUpdate.
 export class TrackTable {
   constructor() {
     this.tracks = new Map();
@@ -106,9 +106,12 @@ export class TrackTable {
 const INT32_NULL = -2147483648;
 const U16_NULL = 0xffff;
 const I16_NULL = -32768;
+const U8_NULL = 0xff;
 
 // One TrackUpdate in the JSON shape the Fall 2025 map expects from
-// /api/aircraft (ads/server.js): null for unknown fields.
+// /api/aircraft (ads/server.js): null for unknown fields. Feed v1 adds
+// heading, airspeed (with their references), nic and adsb_version, which the
+// Fall 2025 API did not have.
 export function toAircraft(u, seenSec = null) {
   const v = new DataView(u.buffer, u.byteOffset, u.byteLength);
   const icao = v.getUint32(4, true);
@@ -119,6 +122,10 @@ export function toAircraft(u, seenSec = null) {
   const trk = v.getUint16(38, true);
   const vr = v.getInt16(40, true);
   const sq = v.getUint16(42, true);
+  const flags = u[54];
+  const ver = u[55];
+  const hdg = v.getUint16(64, true);
+  const ias = v.getUint16(66, true);
   let cs = '';
   for (let i = 44; i < 52; i++) cs += String.fromCharCode(u[i]);
   cs = cs.trim();
@@ -132,7 +139,13 @@ export function toAircraft(u, seenSec = null) {
     track: trk === U16_NULL ? null : Math.round(trk / 100),
     vertical_rate: vr === I16_NULL ? null : vr,
     squawk: sq === U16_NULL ? null : sq.toString(16).padStart(4, '0'),
-    on_ground: (u[54] & 2) !== 0,
+    on_ground: (flags & 2) !== 0,
+    heading: hdg === U16_NULL ? null : (Math.round(hdg / 10) / 10) % 360,
+    heading_ref: hdg === U16_NULL ? null : (flags & 16) !== 0 ? 'true' : 'magnetic',
+    airspeed: ias === U16_NULL ? null : ias,
+    airspeed_type: ias === U16_NULL ? null : (flags & 32) !== 0 ? 'tas' : 'ias',
+    nic: lat === INT32_NULL ? null : u[53],
+    adsb_version: ver === U8_NULL ? null : ver,
     seen: seenSec,
   };
 }

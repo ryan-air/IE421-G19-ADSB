@@ -28,7 +28,7 @@ void BM_ShmRingWrite(benchmark::State& state) {
   Ring r(1 << 16);
   void* mem = r.mem;
   benchmark::DoNotOptimize(mem);  // the region escapes: its stores cannot be dropped
-  std::uint8_t msg[64] = {'U'};
+  std::uint8_t msg[kShmMaxMessage] = {'U'};
   std::uint64_t seq = 1;
   for (auto _ : state) {
     r.view.write(seq++, msg, sizeof msg);
@@ -41,9 +41,9 @@ void BM_ShmRingRead(benchmark::State& state) {
   Ring r(1 << 16);
   void* mem = r.mem;
   benchmark::DoNotOptimize(mem);
-  std::uint8_t msg[64] = {'U'};
+  std::uint8_t msg[kShmMaxMessage] = {'U'};
   for (std::uint64_t s = 1; s <= r.cap; ++s) r.view.write(s, msg, sizeof msg);
-  std::uint8_t out[64];
+  std::uint8_t out[kShmMaxMessage];
   std::size_t len = 0;
   std::uint64_t seq = 1;
   for (auto _ : state) {

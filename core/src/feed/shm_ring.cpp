@@ -10,8 +10,12 @@
 #include <utility>
 
 #include "adsb/common/clock.hpp"
+#include "adsb/protocol/feed_messages.hpp"
 
 namespace adsb::feed {
+
+static_assert(kShmMaxMessage == protocol::TrackUpdate::kWireSize,
+              "a slot holds exactly the largest feed message");
 
 namespace {
 

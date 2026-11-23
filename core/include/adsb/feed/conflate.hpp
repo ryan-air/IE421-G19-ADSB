@@ -23,7 +23,7 @@
 // the same state; only update_mask (a union) and publish_ts_ns (stamped by the
 // conflated publisher) differ. FeedBook::state_digest() compares that.
 //
-// Hot path: on_update / on_delete do one hash lookup and a 64-byte copy, no
+// Hot path: on_update / on_delete do one hash lookup and a 72-byte copy, no
 // allocation (the table and the dirty list are sized at construction). If the
 // table is ever full, updates for aircraft it cannot hold pass straight
 // through, unconflated and counted: state is never lost. (The table also

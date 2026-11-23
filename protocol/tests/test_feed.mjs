@@ -9,8 +9,8 @@ import { fileURLToPath } from 'node:url';
 import * as fm from '../generated/feed_messages.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const raw = readFileSync(join(root, 'golden', 'packet_v0.bin'));
-const expected = JSON.parse(readFileSync(join(root, 'golden', 'packet_v0.json'), 'utf8'));
+const raw = readFileSync(join(root, 'golden', 'packet_v1.bin'));
+const expected = JSON.parse(readFileSync(join(root, 'golden', 'packet_v1.json'), 'utf8'));
 
 // JSON has no BigInt: compare 64-bit fields as strings.
 const norm = (obj) =>
@@ -74,14 +74,14 @@ test('rejects what the C++ parser rejects', () => {
 
 test('null constants and callsign padding', () => {
   assert.equal(fm.TrackUpdateNull.lat_e7, -(2 ** 31));
-  const view = new DataView(new ArrayBuffer(64));
+  const view = new DataView(new ArrayBuffer(fm.TrackUpdateSize));
   const { messages } = fm.decodePacket(new Uint8Array(raw));
   fm.encodeTrackUpdate({ ...messages[0].msg, callsign: 'AB' }, view, 0);
   assert.equal(fm.decodeTrackUpdate(view, 0).callsign, 'AB      ');
 });
 
 test('sizes and bit constants', () => {
-  assert.equal(fm.TrackUpdateSize, 64);
+  assert.equal(fm.TrackUpdateSize, 72);
   assert.equal(fm.PacketHeaderSize, 20);
   assert.equal(fm.UpdateMask.kNewTrack, 1 << 15);
   assert.equal(fm.kMaxUdpPayload, 1472);

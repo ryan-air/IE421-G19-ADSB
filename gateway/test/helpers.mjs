@@ -8,9 +8,10 @@ export const S1 = 'SESSION001';
 export const S2 = 'SESSION002';
 export const S3 = 'SESSION003';
 
-// A TrackUpdate (64 bytes) with the given fields; the rest are zero.
-export function trackUpdate({ icao, alt = 0, eventTs = 0, publishTs = 0, lat = null, lon = null, mask = 0, callsign = '' }) {
-  const b = Buffer.alloc(64);
+// A TrackUpdate (72 bytes) with the given fields; the rest are zero or null.
+export function trackUpdate({ icao, alt = 0, eventTs = 0, publishTs = 0, lat = null, lon = null, mask = 0, callsign = '',
+  flags = 0, nic = 0, version = 0xff, heading = 0xffff, airspeed = 0xffff }) {
+  const b = Buffer.alloc(72);
   b[0] = 0x55;
   b.writeUInt16LE(mask, 2);
   b.writeUInt32LE(icao, 4);
@@ -23,7 +24,12 @@ export function trackUpdate({ icao, alt = 0, eventTs = 0, publishTs = 0, lat = n
   b.writeInt16LE(-32768, 40);
   b.writeUInt16LE(0xffff, 42);
   b.write(callsign.padEnd(8, ' '), 44, 8, 'latin1');
+  b[53] = nic;
+  b[54] = flags;
+  b[55] = version;
   b.writeBigUInt64LE(BigInt(publishTs), 56);
+  b.writeUInt16LE(heading, 64);
+  b.writeUInt16LE(airspeed, 66);
   return b;
 }
 

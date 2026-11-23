@@ -1,12 +1,12 @@
 {
   "name": "adsb_feed",
-  "version": 0,
+  "version": 1,
   "status": "draft - review before depending on it",
   "endianness": "little",
   "doc": "Wire format of the ADS-B track feed. Framing follows Nasdaq MoldUDP64 (header + length-prefixed message blocks) with little-endian integers. See protocol/feed_spec.md.",
 
   "constants": [
-    {"name": "kVersion", "type": "u8", "value": 0, "doc": "Value of every message's `version` field"},
+    {"name": "kVersion", "type": "u8", "value": 1, "doc": "Value of every message's `version` field"},
     {"name": "kMaxUdpPayload", "type": "u16", "value": 1472, "doc": "1500-byte Ethernet MTU minus IPv4 (20) and UDP (8) headers"},
     {"name": "kHeartbeatCount", "type": "u16", "value": 0, "doc": "PacketHeader.count of a heartbeat"},
     {"name": "kEndOfSessionCount", "type": "u16", "value": 65535, "doc": "PacketHeader.count marking the end of a session"},
@@ -28,6 +28,9 @@
         {"name": "kSquawk",       "bit": 6,  "doc": "squawk"},
         {"name": "kCategory",     "bit": 7,  "doc": "category"},
         {"name": "kAirGround",    "bit": 8,  "doc": "flags.kOnGround"},
+        {"name": "kHeading",      "bit": 9,  "doc": "heading_cdeg or flags.kHeadingTrue"},
+        {"name": "kAirspeed",     "bit": 10, "doc": "airspeed_kt or flags.kAirspeedTrue"},
+        {"name": "kIntegrity",    "bit": 11, "doc": "nic or adsb_version"},
         {"name": "kNewTrack",     "bit": 15, "doc": "first update for this ICAO address in this session"}
       ]
     },
@@ -39,7 +42,9 @@
         {"name": "kAltitudeGnss",   "bit": 0, "doc": "alt_ft is GNSS height, not barometric"},
         {"name": "kOnGround",       "bit": 1, "doc": "aircraft reports being on the ground"},
         {"name": "kNonIcaoAddress", "bit": 2, "doc": "icao is an anonymous / TIS-B track-file address"},
-        {"name": "kSurfacePosition","bit": 3, "doc": "last position came from a surface position message"}
+        {"name": "kSurfacePosition","bit": 3, "doc": "last position came from a surface position message"},
+        {"name": "kHeadingTrue",    "bit": 4, "doc": "heading_cdeg is relative to true north (TC 31 HRD = 0); clear: magnetic north"},
+        {"name": "kAirspeedTrue",   "bit": 5, "doc": "airspeed_kt is true airspeed; clear: indicated airspeed"}
       ]
     }
   ],
@@ -87,18 +92,21 @@
         {"name": "squawk",        "type": "u16",     "null": 65535, "doc": "Mode A code as four octal digits in hex nibbles (7700 -> 0x7700)"},
         {"name": "callsign",      "type": "char[8]", "pad": " ", "doc": "Space-padded, all spaces if unknown"},
         {"name": "category",      "type": "u8",      "doc": "Emitter category, e.g. 0xA3 (set A, value 3); 0 if unknown"},
-        {"name": "nic",           "type": "u8",      "doc": "Navigation integrity category; 0 if unknown"},
+        {"name": "nic",           "type": "u8",      "doc": "Navigation integrity category of the current position, 0-11 (0 = unknown or no position)"},
         {"name": "flags",         "type": "u8",      "doc": "TrackFlags"},
-        {"name": "reserved",      "type": "u8",      "doc": "Zero"},
-        {"name": "publish_ts_ns", "type": "u64",     "doc": "Publisher software timestamp taken just before send (wall-clock domain); 0 inside the pipeline"}
+        {"name": "adsb_version",  "type": "u8",      "null": 255, "doc": "ADS-B version from operational status (TC 31): 0 DO-260, 1 DO-260A, 2 DO-260B; null until one is received (nic is then computed as for version 0)"},
+        {"name": "publish_ts_ns", "type": "u64",     "doc": "Publisher software timestamp taken just before send (wall-clock domain); 0 inside the pipeline"},
+        {"name": "heading_cdeg",  "type": "u16",     "null": 65535, "doc": "Heading, 0.01 degree, [0, 36000), from airborne velocity subtypes 3/4; north reference in flags.kHeadingTrue"},
+        {"name": "airspeed_kt",   "type": "u16",     "null": 65535, "doc": "Airspeed, knots, from airborne velocity subtypes 3/4; flags.kAirspeedTrue says TAS or IAS"},
+        {"name": "reserved",      "type": "u32",     "doc": "Zero"}
       ],
       "example": {
-        "msg_type": 85, "version": 0, "update_mask": 33, "icao": 4735190,
+        "msg_type": 85, "version": 1, "update_mask": 545, "icao": 4735190,
         "event_ts_ns": 1763337600123456789, "radio_ts": 1152921504606846976,
         "lat_e7": 522572021, "lon_e7": 39193725, "alt_ft": 38000,
         "gs_dkt": 4500, "track_cdeg": 18288, "vrate_fpm": -832, "squawk": 30464,
-        "callsign": "KLM1023 ", "category": 160, "nic": 0, "flags": 0, "reserved": 0,
-        "publish_ts_ns": 0
+        "callsign": "KLM1023 ", "category": 160, "nic": 8, "flags": 16, "adsb_version": 2,
+        "publish_ts_ns": 0, "heading_cdeg": 18105, "airspeed_kt": 452, "reserved": 0
       }
     },
     {
@@ -113,7 +121,7 @@
         {"name": "icao",        "type": "u32", "doc": "24-bit address"},
         {"name": "event_ts_ns", "type": "u64", "doc": "Event time at which the track was removed"}
       ],
-      "example": {"msg_type": 68, "version": 0, "reason": 1, "reserved": 0, "icao": 4735190, "event_ts_ns": 1763337660123456789}
+      "example": {"msg_type": 68, "version": 1, "reason": 1, "reserved": 0, "icao": 4735190, "event_ts_ns": 1763337660123456789}
     },
     {
       "name": "SnapshotBegin",
@@ -127,7 +135,7 @@
         {"name": "as_of_seq",   "type": "u64", "doc": "The snapshot reflects every message with seq <= as_of_seq"},
         {"name": "event_ts_ns", "type": "u64", "doc": "Event time of the last applied message"}
       ],
-      "example": {"msg_type": 83, "version": 0, "reserved": 0, "track_count": 2, "as_of_seq": 1000, "event_ts_ns": 1763337600000000000}
+      "example": {"msg_type": 83, "version": 1, "reserved": 0, "track_count": 2, "as_of_seq": 1000, "event_ts_ns": 1763337600000000000}
     },
     {
       "name": "SnapshotEnd",
@@ -140,7 +148,7 @@
         {"name": "reserved2", "type": "u32", "doc": "Zero"},
         {"name": "as_of_seq", "type": "u64", "doc": "Same value as the matching SnapshotBegin"}
       ],
-      "example": {"msg_type": 69, "version": 0, "reserved": 0, "reserved2": 0, "as_of_seq": 1000}
+      "example": {"msg_type": 69, "version": 1, "reserved": 0, "reserved2": 0, "as_of_seq": 1000}
     }
   ],
 

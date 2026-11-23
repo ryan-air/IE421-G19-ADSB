@@ -7,7 +7,7 @@
 // deterministically. Sequence numbers are Numbers: exact up to 2^53, which a
 // session cannot reach (a packet claiming more is rejected as malformed).
 //
-// The book keeps raw wire bytes (64-byte TrackUpdates), so the gateway can
+// The book keeps raw wire bytes (72-byte TrackUpdates), so the gateway can
 // forward them to browsers without re-encoding, and its digest equals the C++
 // FeedBook::digest() of the same state (SHA-256 over the tracks in ICAO order).
 
@@ -26,7 +26,7 @@ import {
   kSessionLength,
 } from '../../protocol/generated/feed_messages.mjs';
 
-export const kMaxMessageBytes = 64; // same as the C++ publisher's log entries
+export const kMaxMessageBytes = 72; // same as the C++ publisher's log entries
 const kUpdate = 0x55; // 'U'
 const kDelete = 0x44; // 'D'
 const kSnapBegin = 0x53; // 'S'
@@ -98,7 +98,7 @@ export const ApplyResult = Object.freeze({
 
 export class FeedBook {
   constructor() {
-    this.tracks = new Map(); // icao -> Buffer (64 bytes, a private copy)
+    this.tracks = new Map(); // icao -> Buffer (72 bytes, a private copy)
   }
 
   get size() {
@@ -137,7 +137,7 @@ export class FeedBook {
     return [...this.tracks.keys()].sort((a, b) => a - b);
   }
 
-  // Hex SHA-256 over every track's 64 wire bytes in ICAO order, as
+  // Hex SHA-256 over every track's 72 wire bytes in ICAO order, as
   // FeedBook::hex_digest() in C++.
   hexDigest() {
     return bookDigest(this.tracks);
@@ -587,7 +587,7 @@ export class SubscriberCore {
     this.snapLastNs = nowNs;
   }
 
-  // snap: { session, asOfSeq, tracks: [Buffer(64)] } (SnapshotParser.data)
+  // snap: { session, asOfSeq, tracks: [Buffer(72)] } (SnapshotParser.data)
   onSnapshot(snap, nowNs) {
     if (this.mode !== Mode.kSnapshot && !this.confirming) return; // not asked for
     // An answer to a request made before a session change is stale whatever

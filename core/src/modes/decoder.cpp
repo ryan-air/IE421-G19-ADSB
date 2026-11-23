@@ -128,6 +128,8 @@ void decode_surface_position(const FrameBits& b, DecodedMsg& out) noexcept {
 
 void decode_airborne_position(const FrameBits& b, DecodedMsg& out, bool gnss) noexcept {
   set_altitude(out, decode_ac12(u16(b.me(9, 20))), gnss);
+  // For TIS-B / ADS-R (DF18 CF 2, 5, 6) bit 8 is the IMF flag instead.
+  out.nic_supplement_b = (out.df == 17 || out.ca <= 1) && b.me_bit(8) != 0;
   decode_cpr(b, out, /*surface=*/false);
 }
 
@@ -246,14 +248,21 @@ void decode_operational_status(const FrameBits& b, DecodedMsg& out) noexcept {
   os.capability = u16(os.surface ? b.me(9, 20) : b.me(9, 24));
   os.operational_mode = u16(b.me(25, 40));
   os.version = u8(b.me(41, 43));
-  if (os.version >= 1) {
+  // Versions 3-7 are reserved: the rest of the field is not read (readsb
+  // decodes versions 1 and 2 only).
+  if (os.version == 1 || os.version == 2) {
     os.nic_supplement_a = b.me_bit(44) != 0;
     os.nac_p = u8(b.me(45, 48));
     os.sil = u8(b.me(51, 52));
     os.heading_true_north = b.me_bit(54) == 0;  // HRD: 0 true north, 1 magnetic
     if (!os.surface) os.nic_baro = b.me_bit(53) != 0;
-    if (os.version >= 2) {
+    if (os.version == 2) {
       os.sil_per_sample = b.me_bit(55) != 0;
+      // NIC-C is capability class bit 20 when the class code (bits 9-10) is 0.
+      if (os.surface && b.me(9, 10) == 0) {
+        os.nic_supplement_c = b.me_bit(20) != 0;
+        os.nic_supplement_c_valid = true;
+      }
       if (!os.surface) os.gva = u8(b.me(49, 50));
     }
   }
@@ -650,6 +659,34 @@ DecodeStatus decode(const std::uint8_t* frame, std::size_t len, DecodedMsg& out,
     }
     default:
       return DecodeStatus::kUnknownFormat;
+  }
+}
+
+std::uint8_t position_nic(unsigned tc, unsigned version, bool nic_a, bool nic_b, bool nic_c) noexcept {
+  switch (tc) {
+    case 5: case 9: case 20: return 11;
+    case 6: case 10: case 21: return 10;
+    case 7:  // surface
+      if (version == 2) return nic_a && !nic_c ? 9 : 8;
+      if (version == 1) return nic_a ? 9 : 8;
+      return 8;
+    case 8:  // surface
+      if (version == 2) {
+        if (nic_a && nic_c) return 7;
+        if (nic_a != nic_c) return 6;
+      }
+      return 0;
+    case 11:
+      if (version == 2) return nic_a && nic_b ? 9 : 8;
+      if (version == 1) return nic_a ? 9 : 8;
+      return 8;
+    case 12: return 7;
+    case 13: return 6;
+    case 14: return 5;
+    case 15: return 4;
+    case 16: return nic_a && nic_b ? 3 : 2;
+    case 17: return 1;
+    default: return 0;
   }
 }
 

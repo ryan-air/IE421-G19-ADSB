@@ -80,9 +80,10 @@ Frame encode_identification(std::uint32_t icao, const char callsign[8], std::uin
 }
 
 Frame encode_airborne_position(std::uint32_t icao, std::int32_t alt_ft, const CprFrame& cpr,
-                               unsigned tc, unsigned ca) noexcept {
+                               unsigned tc, unsigned ca, bool nic_b) noexcept {
   MeBuilder me;
   me.set(1, 5, tc);
+  me.set(8, 8, nic_b ? 1u : 0u);
   me.set(9, 20, encode_ac12(alt_ft).value_or(0));
   me.set(22, 22, cpr.odd ? 1u : 0u);
   me.set(23, 39, cpr.lat);
@@ -124,6 +125,53 @@ Frame encode_velocity(std::uint32_t icao, double east_kt, double north_kt,
   long vr = std::lround(std::fabs(static_cast<double>(vertical_rate_fpm)) / 64.0);
   if (vr > 510) vr = 510;
   me.set(38, 46, static_cast<std::uint64_t>(vr + 1));
+  return df17(icao, ca, me);
+}
+
+Frame encode_airspeed_heading(std::uint32_t icao, double heading_deg, double airspeed_kt, bool tas,
+                              std::int32_t vertical_rate_fpm, unsigned ca) noexcept {
+  MeBuilder me;
+  me.set(1, 5, 19);
+  me.set(6, 8, 3);  // subtype 3: airspeed and heading, subsonic
+  if (heading_deg >= 0.0) {
+    me.set(14, 14, 1);
+    me.set(15, 24, static_cast<std::uint64_t>(std::lround(heading_deg * 1024.0 / 360.0)) & 0x3FFu);
+  }
+  me.set(25, 25, tas ? 1u : 0u);
+  const long as = std::lround(std::fabs(airspeed_kt));
+  me.set(26, 35, static_cast<std::uint64_t>(as > 1021 ? 1022 : as + 1));
+  me.set(36, 36, 1);  // baro vertical rate
+  me.set(37, 37, vertical_rate_fpm < 0 ? 1u : 0u);
+  long vr = std::lround(std::fabs(static_cast<double>(vertical_rate_fpm)) / 64.0);
+  if (vr > 510) vr = 510;
+  me.set(38, 46, static_cast<std::uint64_t>(vr + 1));
+  return df17(icao, ca, me);
+}
+
+Frame encode_operational_status(std::uint32_t icao, const OperationalStatus& os, unsigned ca) noexcept {
+  MeBuilder me;
+  me.set(1, 5, 31);
+  me.set(6, 8, os.surface ? 1u : 0u);
+  if (os.surface) {
+    std::uint64_t cc = os.capability & 0xFFFu;
+    if (os.version == 2) cc = (cc & ~std::uint64_t{1}) | (os.nic_supplement_c ? 1u : 0u);
+    me.set(9, 20, cc);
+  } else {
+    me.set(9, 24, os.capability);
+  }
+  me.set(25, 40, os.operational_mode);
+  me.set(41, 43, os.version);
+  if (os.version >= 1) {
+    me.set(44, 44, os.nic_supplement_a ? 1u : 0u);
+    me.set(45, 48, os.nac_p);
+    me.set(51, 52, os.sil);
+    if (!os.surface) me.set(53, 53, os.nic_baro ? 1u : 0u);
+    me.set(54, 54, os.heading_true_north ? 0u : 1u);
+    if (os.version >= 2) {
+      if (!os.surface) me.set(49, 50, os.gva);
+      me.set(55, 55, os.sil_per_sample ? 1u : 0u);
+    }
+  }
   return df17(icao, ca, me);
 }
 

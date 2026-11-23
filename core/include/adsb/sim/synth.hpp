@@ -66,6 +66,16 @@ struct SynthConfig {
   // (iq.hpp) renders these. Off by default: it costs memory and does not
   // change anything else (no extra random numbers are drawn).
   bool keep_transmissions = false;
+
+  // Avionics variety (off by default; when off, no extra random numbers are
+  // drawn and the output is unchanged). Each aircraft gets an ADS-B version
+  // (0, 1 or 2), a position type code with NIC supplement bits and the NIC
+  // they mean (AircraftInfo::nic, from a table of DO-260B rows), and sends
+  // operational status (TC 31) every 2.4-2.6 s (version 1 and 2). A share
+  // of airborne aircraft sends airspeed and heading (velocity subtype 3)
+  // instead of ground speed.
+  bool avionics = false;
+  double airspeed_fraction = 0.3;
 };
 
 // One transmitted frame with the transmitter's true state at that moment.
@@ -84,6 +94,8 @@ struct Transmission {
 };
 
 // True aircraft state at the moment a position frame was transmitted.
+// heading_deg / airspeed_kt are what the aircraft would report in velocity
+// subtype 3 (only meaningful with AircraftInfo::airspeed_velocity).
 struct TruthPoint {
   std::uint32_t icao = 0;
   std::uint64_t tx_ns = 0;        // transmit time (same clock domain as rx_ns)
@@ -94,6 +106,8 @@ struct TruthPoint {
   double track_deg = 0.0;
   std::int32_t vertical_rate_fpm = 0;
   bool on_ground = false;
+  double heading_deg = 0.0;
+  double airspeed_kt = 0.0;
 };
 
 struct AircraftInfo {
@@ -102,6 +116,16 @@ struct AircraftInfo {
   std::uint8_t category = 0;
   std::uint16_t squawk = 0;
   bool on_ground = false;
+  // With SynthConfig::avionics (otherwise: version 0, TC 11 / TC 7, NIC 8).
+  std::uint8_t adsb_version = 0;
+  std::uint8_t position_tc = 11;
+  bool nic_a = false;
+  bool nic_b = false;
+  bool nic_c = false;
+  std::uint8_t nic = 8;              // what the position messages mean once TC 31 is known
+  bool heading_true_north = false;   // HRD (version >= 1); version 0: magnetic
+  bool airspeed_velocity = false;    // sends velocity subtype 3 (airspeed + heading)
+  bool airspeed_true = false;        // TAS (else IAS)
 };
 
 struct SynthStats {

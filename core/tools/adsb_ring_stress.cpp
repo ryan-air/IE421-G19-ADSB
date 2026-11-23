@@ -36,21 +36,22 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// 64 bytes, every word derived from seq: a torn or mixed copy is detectable.
+// 72 bytes (a full shm slot payload, the size of a TrackUpdate), every word
+// derived from seq: a torn or mixed copy is detectable.
 struct Msg {
   std::uint64_t seq;
-  std::uint64_t w[7];
+  std::uint64_t w[8];
 };
-static_assert(sizeof(Msg) == 64);
+static_assert(sizeof(Msg) == adsb::feed::kShmMaxMessage);
 
 Msg make(std::uint64_t seq) {
   Msg m{};
   m.seq = seq;
-  for (std::uint64_t i = 0; i < 7; ++i) m.w[i] = seq * 0x9E3779B97F4A7C15ULL ^ (i << 56) ^ 0xA5;
+  for (std::uint64_t i = 0; i < 8; ++i) m.w[i] = seq * 0x9E3779B97F4A7C15ULL ^ (i << 56) ^ 0xA5;
   return m;
 }
 bool intact(const Msg& m) {
-  for (std::uint64_t i = 0; i < 7; ++i) {
+  for (std::uint64_t i = 0; i < 8; ++i) {
     if (m.w[i] != (m.seq * 0x9E3779B97F4A7C15ULL ^ (i << 56) ^ 0xA5)) return false;
   }
   return true;
@@ -141,7 +142,7 @@ Result stress_shm(double seconds, std::uint64_t seed) {
     readers.emplace_back([&, t] {
       adsb::Rng rng(seed * 10 + t);
       std::uint64_t expect = 1, last = 0;
-      std::uint8_t buf[64];
+      std::uint8_t buf[adsb::feed::kShmMaxMessage];
       std::size_t len = 0;
       for (;;) {
         const RingView::Read r = ring.read(expect, buf, len);

@@ -285,6 +285,259 @@ TEST(TrackEngine, RefreshedTrackDoesNotExpire) {
 }
 
 // ---------------------------------------------------------------------------
+// Integrity (NIC, ADS-B version), heading and airspeed
+// ---------------------------------------------------------------------------
+
+modes::Frame position(double lat, double lon, bool odd, unsigned tc, bool nic_b = false) {
+  return modes::encode_airborne_position(kIcao, 35000, modes::cpr_encode(lat, lon, odd, false), tc, 5, nic_b);
+}
+
+modes::Frame opstatus(unsigned version, bool nic_a, bool true_north = false, bool surface = false,
+                      bool nic_c = false) {
+  modes::OperationalStatus os;
+  os.version = static_cast<std::uint8_t>(version);
+  os.surface = surface;
+  os.nic_supplement_a = nic_a;
+  os.nic_supplement_c = nic_c;
+  os.heading_true_north = true_north;
+  return modes::encode_operational_status(kIcao, os);
+}
+
+TEST(TrackEngine, NicFollowsTheTypeCodeAndTheSupplementsKnownAtReceipt) {
+  namespace um = protocol::update_mask;
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  const double lat = 41.9, lon = -87.9;
+  // No TC 31 yet: version 0 rules, adsb_version null. TC 11 = NIC 8.
+  feed(*e, position(lat, lon, false, 11, true), 10 * kSec, sink);
+  feed(*e, position(lat, lon, true, 11, true), 10 * kSec + kSec / 2, sink);
+  ASSERT_FALSE(sink.updates.empty());
+  EXPECT_EQ(sink.updates.back().nic, 8u);
+  EXPECT_EQ(sink.updates.back().adsb_version, TrackUpdate::kAdsbVersionNull);
+  EXPECT_TRUE(sink.updates.back().update_mask & um::kIntegrity);
+  // Version 2 with NIC-A: TC 11 with NIC-B means NIC 9 from now on.
+  feed(*e, opstatus(2, true), 11 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().adsb_version, 2u);
+  EXPECT_EQ(sink.updates.back().update_mask, um::kIntegrity) << "the version changed, nothing else";
+  EXPECT_EQ(sink.updates.back().nic, 8u) << "the current position's NIC was fixed at receipt";
+  // The next global fix pairs a NIC 9 frame with the NIC 8 one: the weaker counts.
+  feed(*e, position(lat + 0.01, lon, false, 11, true), 11 * kSec + kSec / 2, sink);
+  EXPECT_EQ(sink.updates.back().nic, 8u);
+  feed(*e, position(lat + 0.02, lon, true, 11, true), 12 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nic, 9u);
+  EXPECT_TRUE(sink.updates.back().update_mask & um::kIntegrity);
+  // Without NIC-B the same type code is NIC 8 in version 2.
+  feed(*e, position(lat + 0.03, lon, false, 11, false), 12 * kSec + kSec / 2, sink);
+  EXPECT_EQ(sink.updates.back().nic, 8u);
+  // Same NIC again: kIntegrity is not set.
+  feed(*e, position(lat + 0.04, lon, true, 11, false), 13 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nic, 8u);
+  EXPECT_FALSE(sink.updates.back().update_mask & um::kIntegrity);
+  // TC 9 is NIC 11 whatever the supplements.
+  feed(*e, position(lat + 0.05, lon, false, 9), 13 * kSec + kSec / 2, sink);
+  feed(*e, position(lat + 0.06, lon, true, 9), 14 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nic, 11u);
+}
+
+TEST(TrackEngine, OperationalStatusFromRebroadcastsOrOutOfOrderIsIgnored) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 10 * kSec, sink);
+  // DF18 CF=2 (TIS-B fine format) and CF=6 (ADS-R) are rebroadcasts: their
+  // version is the ground station's, not the aircraft's.
+  for (const unsigned cf : {2u, 6u}) {
+    modes::Frame f = opstatus(2, true);
+    f.bytes[0] = static_cast<std::uint8_t>((18u << 3) | cf);
+    modes::write_parity(f.bytes, 14, 0);
+    feed(*e, f, 11 * kSec, sink);
+  }
+  ASSERT_FALSE(sink.updates.empty()) << "the DF11 created the track";
+  EXPECT_EQ(sink.updates.back().adsb_version, TrackUpdate::kAdsbVersionNull);
+  EXPECT_EQ(sink.updates.size(), 1u) << "the rebroadcast statuses changed nothing";
+  feed(*e, opstatus(1, false), 12 * kSec, sink);
+  ASSERT_FALSE(sink.updates.empty());
+  EXPECT_EQ(sink.updates.back().adsb_version, 1u);
+  const std::size_t n = sink.updates.size();
+  feed(*e, opstatus(2, true), 11 * kSec + kSec / 2, sink);  // older than the last one
+  EXPECT_EQ(sink.updates.size(), n);
+  EXPECT_GE(e->stats().out_of_order, 1u);
+}
+
+TEST(TrackEngine, HeadingAndAirspeedComeFromVelocitySubtype3) {
+  namespace um = protocol::update_mask;
+  namespace tf = protocol::track_flags;
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_airspeed_heading(kIcao, 271.4, 452, true, -640), 10 * kSec, sink);
+  ASSERT_EQ(sink.updates.size(), 1u);
+  TrackUpdate u = sink.updates.back();
+  EXPECT_EQ(u.heading_cdeg, 27141u) << "772 x 360/1024 = 271.40625 deg, rounded to 0.01";
+  EXPECT_EQ(u.airspeed_kt, 452u);
+  EXPECT_TRUE(u.flags & tf::kAirspeedTrue);
+  EXPECT_FALSE(u.flags & tf::kHeadingTrue) << "magnetic until a TC 31 says otherwise";
+  EXPECT_EQ(u.vrate_fpm, -640);
+  EXPECT_EQ(u.gs_dkt, TrackUpdate::kGsDktNull) << "subtype 3 carries no ground speed";
+  EXPECT_TRUE(u.update_mask & um::kHeading);
+  EXPECT_TRUE(u.update_mask & um::kAirspeed);
+  // Indicated airspeed, same value: only the flag changes, under kAirspeed.
+  feed(*e, modes::encode_airspeed_heading(kIcao, 271.4, 452, false, -640), 11 * kSec, sink);
+  u = sink.updates.back();
+  EXPECT_FALSE(u.flags & tf::kAirspeedTrue);
+  EXPECT_EQ(u.update_mask, um::kAirspeed);
+  // HRD = true north (version 2): the reference changes under kHeading.
+  feed(*e, opstatus(2, false, /*true_north=*/true), 12 * kSec, sink);
+  u = sink.updates.back();
+  EXPECT_TRUE(u.flags & tf::kHeadingTrue);
+  EXPECT_EQ(u.update_mask, um::kHeading | um::kIntegrity);
+  // A version 0 status carries no HRD: the reference stays.
+  feed(*e, opstatus(0, false), 13 * kSec, sink);
+  EXPECT_TRUE(sink.updates.back().flags & tf::kHeadingTrue);
+  EXPECT_EQ(sink.updates.back().adsb_version, 0u);
+  // No heading in the message: the last one stays; airspeed updates.
+  feed(*e, modes::encode_airspeed_heading(kIcao, -1, 460, false, -640), 14 * kSec, sink);
+  u = sink.updates.back();
+  EXPECT_NEAR(u.heading_cdeg / 100.0, 271.4, 360.0 / 1024);
+  EXPECT_EQ(u.airspeed_kt, 460u);
+  EXPECT_EQ(u.update_mask, um::kAirspeed);
+}
+
+TEST(TrackEngine, AirspeedAndHeadingWithoutVerticalRateAreApplied) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  modes::Frame f = modes::encode_airspeed_heading(kIcao, 90, 300, true, 0);
+  // Clear the vertical rate (ME bits 38-46 = frame bits 70-78: "no information").
+  for (unsigned bit = 69; bit < 78; ++bit) f.bytes[bit / 8] = static_cast<std::uint8_t>(f.bytes[bit / 8] & ~(0x80u >> (bit % 8)));
+  modes::write_parity(f.bytes, 14, 0);
+  modes::DecodedMsg m;
+  ASSERT_EQ(modes::decode(f.bytes, 14, m), modes::DecodeStatus::kOk);
+  ASSERT_FALSE(m.has(modes::kFieldVerticalRate));
+  feed(*e, f, 10 * kSec, sink);
+  ASSERT_EQ(sink.updates.size(), 1u);
+  EXPECT_EQ(sink.updates.back().heading_cdeg, 9000u);
+  EXPECT_EQ(sink.updates.back().airspeed_kt, 300u);
+}
+
+TEST(TrackEngine, HeadingReferenceAloneIsNotAnUpdate) {
+  // HRD before any heading: the flag is kept for later, but nothing changed
+  // that a subscriber can see except the version.
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 10 * kSec, sink);
+  feed(*e, opstatus(2, false, /*true_north=*/true), 11 * kSec, sink);
+  ASSERT_FALSE(sink.updates.empty());
+  EXPECT_EQ(sink.updates.back().update_mask, protocol::update_mask::kIntegrity);
+  EXPECT_EQ(sink.updates.back().heading_cdeg, TrackUpdate::kHeadingCdegNull);
+  EXPECT_FALSE(sink.updates.back().flags & protocol::track_flags::kHeadingTrue) << "no heading, no reference";
+  // A status that only flips HRD while there is no heading changes nothing visible.
+  const std::size_t n = sink.updates.size();
+  feed(*e, opstatus(2, false, /*true_north=*/false), 11 * kSec + kSec / 2, sink);
+  feed(*e, opstatus(2, false, /*true_north=*/true), 11 * kSec + 3 * kSec / 4, sink);
+  EXPECT_EQ(sink.updates.size(), n);
+  feed(*e, modes::encode_airspeed_heading(kIcao, 90, 300, true, 0), 12 * kSec, sink);
+  EXPECT_TRUE(sink.updates.back().flags & protocol::track_flags::kHeadingTrue);
+}
+
+TEST(TrackEngine, SurfaceNicUsesNicC) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  const double lat = 40.04, lon = -88.28;
+  auto surf = [&](bool odd, double dlat) {
+    return modes::encode_surface_position(kIcao, 10, 90, modes::cpr_encode(lat + dlat, lon, odd, true), 8, 4);
+  };
+  EngineConfig cfg;
+  cfg.has_receiver = true;
+  cfg.receiver_lat = lat;
+  cfg.receiver_lon = lon;
+  e = std::make_unique<TrackEngine>(cfg);
+  feed(*e, opstatus(2, true, false, /*surface=*/true, /*nic_c=*/true), 10 * kSec, sink);
+  feed(*e, surf(false, 0), 10 * kSec + kSec / 2, sink);
+  feed(*e, surf(true, 0.00001), 11 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nic, 7u) << "TC 8 with NIC-A and NIC-C";
+  feed(*e, opstatus(2, true, false, true, false), 12 * kSec, sink);
+  feed(*e, surf(false, 0.00002), 12 * kSec + kSec / 2, sink);
+  feed(*e, surf(true, 0.00003), 13 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nic, 6u) << "TC 8 with NIC-A only";
+  // A status with capability class code != 0 does not carry NIC-C: the last one stays.
+  feed(*e, opstatus(2, true, false, true, true), 14 * kSec, sink);
+  modes::OperationalStatus os;
+  os.surface = true;
+  os.version = 2;
+  os.nic_supplement_a = true;
+  os.capability = 0x400;  // class code 1, bit 20 clear
+  feed(*e, modes::encode_operational_status(kIcao, os), 14 * kSec + kSec / 4, sink);
+  feed(*e, surf(false, 0.00004), 14 * kSec + kSec / 2, sink);
+  feed(*e, surf(true, 0.00005), 15 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nic, 7u);
+  // NIC-C expires a minute after the status that set it (NIC-A was refreshed since).
+  feed(*e, opstatus(2, true, false, true, false), 15 * kSec + kSec / 4, sink);  // refreshes A, sets C false
+  feed(*e, opstatus(2, true, false, true, true), 16 * kSec, sink);              // C true at 16 s
+  os.capability = 0x400;
+  for (std::uint64_t t = 20; t <= 80; t += 20) {  // A refreshed, C not (class code 1)
+    feed(*e, modes::encode_operational_status(kIcao, os), t * kSec, sink);
+  }
+  feed(*e, surf(false, 0.00006), 76 * kSec + kSec / 2, sink);
+  feed(*e, surf(true, 0.00007), 77 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nic, 6u) << "61 s after NIC-C was last set";
+}
+
+TEST(TrackEngine, ALocalFixAgainstTheTrackKeepsTheWeakerNic) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  const double lat = 41.9, lon = -87.9;
+  feed(*e, position(lat, lon, false, 11, true), 10 * kSec, sink);
+  feed(*e, position(lat, lon, true, 11, true), 10 * kSec + kSec / 2, sink);
+  ASSERT_EQ(sink.updates.back().nic, 8u);
+  feed(*e, opstatus(2, true), 11 * kSec, sink);
+  // Odd frames lost for longer than the pair window: the next even frame
+  // (NIC 9 on its own) is decoded locally against the track, as in readsb.
+  feed(*e, position(lat + 0.05, lon, false, 11, true), 22 * kSec, sink);
+  EXPECT_EQ(e->stats().cpr_local, 1u);
+  EXPECT_EQ(sink.updates.back().nic, 8u) << "min(this frame, the track's position)";
+  // A global fix from two NIC 9 frames raises it.
+  feed(*e, position(lat + 0.06, lon, true, 11, true), 22 * kSec + kSec / 2, sink);
+  feed(*e, position(lat + 0.07, lon, false, 11, true), 23 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nic, 9u);
+}
+
+TEST(TrackEngine, NicSupplementsExpireAMinuteAfterTheLastStatus) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  const double lat = 41.9, lon = -87.9;
+  feed(*e, opstatus(2, true), 10 * kSec, sink);
+  double d = 0;
+  std::uint64_t t = 10 * kSec;
+  bool odd = false;
+  auto step = [&](std::uint64_t to) {
+    for (; t < to; t += kSec / 2) {
+      feed(*e, position(lat + d, lon, odd, 11, true), t, sink);
+      odd = !odd;
+      d += 0.001;
+    }
+  };
+  step(69 * kSec);
+  EXPECT_EQ(sink.updates.back().nic, 9u) << "59 s after the status";
+  step(72 * kSec);
+  EXPECT_EQ(sink.updates.back().nic, 8u) << "NIC-A no longer counts";
+  EXPECT_EQ(sink.updates.back().adsb_version, 2u) << "the version does not expire (readsb keeps it too)";
+  feed(*e, opstatus(2, true), t, sink);
+  step(t + 2 * kSec);
+  EXPECT_EQ(sink.updates.back().nic, 9u);
+}
+
+TEST(TrackEngine, ReservedVersionsAreReportedButReadAsVersion0) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, opstatus(3, true, /*true_north=*/true), 10 * kSec, sink);
+  feed(*e, modes::encode_airspeed_heading(kIcao, 90, 300, true, 0), 10 * kSec + kSec / 4, sink);
+  feed(*e, position(41.9, -87.9, false, 16, true), 10 * kSec + kSec / 2, sink);
+  feed(*e, position(41.9, -87.9, true, 16, true), 11 * kSec, sink);
+  const TrackUpdate& u = sink.updates.back();
+  EXPECT_EQ(u.adsb_version, 3u);
+  EXPECT_EQ(u.nic, 2u) << "NIC-A of a reserved version is not read";
+  EXPECT_FALSE(u.flags & protocol::track_flags::kHeadingTrue);
+}
+
+// ---------------------------------------------------------------------------
 // End to end against ground truth
 // ---------------------------------------------------------------------------
 
@@ -394,6 +647,82 @@ TEST_F(EndToEnd, TracksMatchGroundTruth) {
   e->advance(s.records.back().rx_ns + 120 * kSec, sink);
   EXPECT_EQ(e->track_count(), 0u);
   EXPECT_EQ(sink.deletes.size(), tracked.size());
+}
+
+TEST_F(EndToEnd, NicHeadingAndAirspeedMatchTheSimulatedAvionics) {
+  sim::SynthConfig cfg = config();
+  cfg.avionics = true;
+  cfg.aircraft = 300;
+  cfg.ground_fraction = 0.2;
+  cfg.airspeed_fraction = 0.4;
+  const sim::SynthOutput s = sim::generate(cfg);
+  EngineConfig ecfg;
+  ecfg.has_receiver = true;
+  ecfg.receiver_lat = cfg.receiver_lat;
+  ecfg.receiver_lon = cfg.receiver_lon;
+  auto e = std::make_unique<TrackEngine>(ecfg);
+  CollectSink sink;
+  for (const auto& r : s.records) {
+    FrameMeta m;
+    m.rx_ns = r.rx_ns;
+    m.line = r.line;
+    e->on_frame(r.payload, r.len, m, sink);
+  }
+  std::map<std::uint32_t, const sim::AircraftInfo*> info;
+  for (const auto& a : s.aircraft) info[a.icao] = &a;
+  std::map<std::uint32_t, std::vector<const sim::TruthPoint*>> truth;
+  for (const auto& t : s.truth) truth[t.icao].push_back(&t);
+  std::map<std::uint32_t, TrackUpdate> last;
+  for (const auto& u : sink.updates) last[u.icao] = u;
+
+  // Every combination in the generator's table shows up.
+  std::set<std::uint8_t> nics, versions;
+  int nic_checked = 0, hdg_checked = 0;
+  for (const auto& [icao, u] : last) {
+    const auto* a = info.at(icao);
+    if (u.lat_e7 == TrackUpdate::kLatE7Null) continue;
+    // Version 0 has no TC 31; versions 1/2 are known after 90 s.
+    if (a->adsb_version == 0) {
+      EXPECT_EQ(u.adsb_version, TrackUpdate::kAdsbVersionNull) << std::hex << icao;
+    } else {
+      ASSERT_EQ(u.adsb_version, a->adsb_version) << std::hex << icao;
+      // The reference is shown with a heading only.
+      const bool shown = a->airspeed_velocity && a->heading_true_north;
+      EXPECT_EQ((u.flags & protocol::track_flags::kHeadingTrue) != 0, shown) << std::hex << icao;
+    }
+    ASSERT_EQ(u.nic, a->nic) << std::hex << icao << " tc " << int(a->position_tc) << " v" << int(a->adsb_version);
+    nics.insert(u.nic);
+    versions.insert(a->adsb_version);
+    ++nic_checked;
+  }
+  EXPECT_GT(nic_checked, 200);
+  EXPECT_EQ(versions.size(), 3u);
+  EXPECT_GE(nics.size(), 10u) << "NIC 0-11 nearly all present";
+
+  // Heading and airspeed against the truth at the nearest position (velocity
+  // frames are up to ~0.6 s away: turns <= 3 deg/s, plus 0.35 deg steps).
+  for (const auto& u : sink.updates) {
+    if (!(u.update_mask & protocol::update_mask::kHeading) || u.heading_cdeg == TrackUpdate::kHeadingCdegNull) continue;
+    const auto* a = info.at(u.icao);
+    ASSERT_TRUE(a->airspeed_velocity) << std::hex << u.icao;
+    const auto& pts = truth[u.icao];
+    const auto it = std::upper_bound(pts.begin(), pts.end(), u.event_ts_ns,
+                                     [](std::uint64_t t, const sim::TruthPoint* p) { return t < p->tx_ns; });
+    if (it == pts.begin()) continue;
+    const sim::TruthPoint& tp = **(it - 1);
+    ASSERT_NEAR(std::remainder(u.heading_cdeg / 100.0 - tp.heading_deg, 360.0), 0.0, 2.5) << std::hex << u.icao;
+    ASSERT_NEAR(u.airspeed_kt, tp.airspeed_kt, 1.5) << std::hex << u.icao;
+    ASSERT_EQ((u.flags & protocol::track_flags::kAirspeedTrue) != 0, a->airspeed_true);
+    ++hdg_checked;
+  }
+  EXPECT_GT(hdg_checked, 1000);
+  for (const auto& [icao, u] : last) {
+    if (!info.at(icao)->airspeed_velocity) {
+      EXPECT_EQ(u.heading_cdeg, TrackUpdate::kHeadingCdegNull);
+      EXPECT_EQ(u.airspeed_kt, TrackUpdate::kAirspeedKtNull);
+    }
+  }
+  EXPECT_EQ(e->stats().cpr_rejected, 0u);
 }
 
 TEST_F(EndToEnd, NaiveEngineProducesIdenticalOutput) {

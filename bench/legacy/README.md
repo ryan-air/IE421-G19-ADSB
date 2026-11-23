@@ -76,7 +76,7 @@ All timestamps are taken inside one container, so every probe shares one clock.
 | Only the new decoder | 45, all surface positions within 0.9 m of the truth, 38 of them among a ground track's first three (readsb prints a surface track only after a few positions) |
 | Only readsb | 347: 242 next to a corrupted frame of that aircraft (readsb repairs single-bit errors by default, the new decoder rejects them); 29 where a repaired frame completed readsb's even/odd CPR pair; 76 an unchanged position printed again (the track engine sends only changes); 0 unexplained |
 
-So the two decoders agree position for position; the difference is readsb's single-bit repair, which the new decoder deliberately leaves out (optional correction is a separate Role 2 item).
+So the two decoders agree position for position; the difference is readsb's single-bit repair, which the new decoder leaves out by default. `FIX=1 bench/legacy/compare-positions.sh 1000 60 7` runs the new decoder with `--fix` (single-bit repair of DF17/18; results in `positions-n1000-fix/`): it then has 0.9994 of readsb's positions; what remains is mostly readsb printing unchanged positions again, and frames with a wrong format bit, which are never repaired.
 
 Finally the recording is replayed through the new pipeline's core alone (`adsb-replay --pipeline --speed 1 --busy-wait`: no network, no readsb), for context.
 

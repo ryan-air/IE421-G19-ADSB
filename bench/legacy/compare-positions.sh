@@ -3,22 +3,24 @@
 # with readsb on the same synthetic frames (see compare_positions.py).
 #
 #   bench/legacy/compare-positions.sh [AIRCRAFT] [SECONDS] [SEED]    # default 300 90 5
+#   FIX=1 bench/legacy/compare-positions.sh ...   # new decoder with --fix (single-bit repair)
 #
 # Runs in the benchmark image (readsb v3.16.21): the recording is fed to
 # readsb in real time (SBS output tapped, as in the baseline benchmark) and
 # replayed through adsb-replay --out. Results in bench/legacy/out/positions-nN/.
 set -euo pipefail
+FIX="${FIX:-0}"
 N="${1:-300}"; DUR="${2:-90}"; SEED="${3:-5}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 if [[ "${IN_BENCH_IMAGE:-0}" != 1 ]]; then
   ROOT="$(cd "$HERE/../.." && pwd)"
-  OUT="$HERE/out/positions-n$N"
+  OUT="$HERE/out/positions-n$N"; [[ "$FIX" == 1 ]] && OUT="$OUT-fix"
   rm -rf "$OUT" && mkdir -p "$OUT"
   "$HERE/extract-fall2025.sh" "${FALL2025_REF:-fall2025-final}" >/dev/null  # the image build needs it
   (cd "$HERE" && docker compose build --quiet bench)
   image="$(cd "$HERE" && docker compose config --images | grep -E -- "-bench$" | head -1)"  # (lists every service)
-  docker run --rm -e IN_BENCH_IMAGE=1 -v "$ROOT":/repo:ro -v "$OUT":/w --entrypoint bash "$image" \
+  docker run --rm -e IN_BENCH_IMAGE=1 -e FIX="$FIX" -v "$ROOT":/repo:ro -v "$OUT":/w --entrypoint bash "$image" \
     /repo/bench/legacy/compare-positions.sh "$N" "$DUR" "$SEED"
   python3 "$HERE/compare_positions.py" "$OUT" | tee "$OUT/summary.txt"
   exit 0
@@ -30,7 +32,8 @@ cmake -S /repo/core -B /tmp/core-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build /tmp/core-build --target adsb-synth adsb-replay >/dev/null
 T=/tmp/core-build/tools
 "$T/adsb-synth" -o /w/t.adsbrec --aircraft "$N" --duration "$DUR" --seed "$SEED" --truth /w/truth.csv
-"$T/adsb-replay" /w/t.adsbrec --out /w/new.bin --hash-only >/dev/null
+fix=(); [[ "$FIX" == 1 ]] && fix=(--fix)
+"$T/adsb-replay" /w/t.adsbrec ${fix[@]+"${fix[@]}"} --out /w/new.bin --hash-only >/dev/null
 
 # The receiver position the generator uses by default (Willard Airport), as in run_bench.sh.
 readsb --net-only --net-bi-port 30004 --net-sbs-port 30003 --lat 40.0392 --lon -88.2781 --quiet >/w/readsb.log 2>&1 &

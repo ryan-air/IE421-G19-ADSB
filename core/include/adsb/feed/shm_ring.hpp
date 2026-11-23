@@ -18,7 +18,7 @@
 //                  seq      atomic u64  0 = never written; kBusy | s while
 //                                       message s is being written; s once it is
 //                  len      atomic u64  message length (low 16 bits)
-//                  words[8] atomic u64  the message bytes (up to 64)
+//                  words[9] atomic u64  the message bytes (up to 72)
 //
 // Slot protocol: a seqlock per slot. The payload is atomic too, so it is
 // data-race free under the C++ memory model:
@@ -64,10 +64,10 @@ namespace adsb::feed {
 
 // "ADSBSHM1" read as a little-endian u64 (the header stores it atomically).
 inline constexpr std::uint64_t kShmMagic = 0x314D485342534441ULL;
-inline constexpr std::uint32_t kShmVersion = 1;
+inline constexpr std::uint32_t kShmVersion = 2;  // 2: 72-byte payload (feed v1)
 inline constexpr std::size_t kShmHeaderBytes = 4096;
 inline constexpr std::size_t kShmSlotBytes = 128;
-inline constexpr std::size_t kShmMaxMessage = 64;
+inline constexpr std::size_t kShmMaxMessage = 72;  // = protocol::TrackUpdate::kWireSize (checked in shm_ring.cpp)
 inline constexpr std::uint64_t kShmBusy = 1ULL << 63;
 inline constexpr std::uint64_t kShmDefaultSlots = 1ULL << 16;  // 8 MiB of slots
 inline constexpr std::uint64_t kShmMaxSlots = 1ULL << 24;      // 2 GiB
@@ -169,7 +169,8 @@ class RingView {
 
   enum class Read : std::uint8_t { kOk, kEmpty, kLapped };
 
-  // Reads message `seq` into `out` (64 bytes) and its length into `len`.
+  // Reads message `seq` into `out` (kShmMaxMessage bytes: all of them are
+  // written, whatever the length) and its length into `len`.
   [[nodiscard]] Read read(std::uint64_t seq, std::uint8_t* out, std::size_t& len) const noexcept {
     const ShmSlot& s = slots_[seq & mask_];
     const std::uint64_t v1 = s.seq.load(std::memory_order_acquire);

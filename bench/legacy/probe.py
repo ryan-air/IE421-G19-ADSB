@@ -175,7 +175,7 @@ def run_ws(args, out, snap):
                 (mlen,) = struct.unpack_from("<H", payload, p)
                 m = payload[p + 2:p + 2 + mlen]
                 p += 2 + mlen
-                if mlen >= 64 and m[0] == 0x55:
+                if mlen >= 72 and m[0] == 0x55:  # TrackUpdate, feed v1
                     icao, = struct.unpack_from("<I", m, 4)
                     la, lo = struct.unpack_from("<ii", m, 24)
                     hx = f"{icao:06X}"

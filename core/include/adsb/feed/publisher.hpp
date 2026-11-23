@@ -43,8 +43,8 @@
 namespace adsb::feed {
 
 // Largest message the recovery log, retransmit store and subscriber buffer
-// hold. TrackUpdate (64 B) is the largest message in feed v0.
-inline constexpr std::size_t kMaxMessageBytes = 64;
+// hold. TrackUpdate (72 B) is the largest message in feed v1.
+inline constexpr std::size_t kMaxMessageBytes = protocol::TrackUpdate::kWireSize;
 
 // One sequenced message, as handed to the recovery thread.
 struct LogEntry {

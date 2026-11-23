@@ -204,7 +204,7 @@ TEST_F(ReplayFixture, CapturedOutputParsesAsFeedMessages) {
     std::memcpy(&len, cap.data() + off, 2);
     ASSERT_LE(off + 2 + len, cap.size());
     const std::uint8_t type = cap[off + 2];
-    ASSERT_TRUE((type == 'U' && len == 64) || (type == 'D' && len == 16));
+    ASSERT_TRUE((type == 'U' && len == 72) || (type == 'D' && len == 16));
     off += 2u + len;
     ++n;
   }

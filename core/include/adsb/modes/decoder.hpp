@@ -111,7 +111,9 @@ struct OperationalStatus {
   std::uint8_t version = 0;          // 0 DO-260, 1 DO-260A, 2 DO-260B
   std::uint16_t capability = 0;      // raw capability class (16 bits airborne, 12 surface)
   std::uint16_t operational_mode = 0;  // raw operational mode (16 bits)
-  bool nic_supplement_a = false;
+  bool nic_supplement_a = false;     // version >= 1
+  bool nic_supplement_c = false;     // version 2, surface (capability class bit 20)
+  bool nic_supplement_c_valid = false;  // NIC-C was read (version 2, surface, class code 0)
   std::uint8_t nac_p = 0;
   std::uint8_t sil = 0;
   bool sil_per_sample = false;       // version 2
@@ -184,6 +186,10 @@ struct DecodedMsg {
 
   CprFrame cpr;
   bool cpr_surface = false;
+  // Airborne position ME bit 8: NIC supplement-B in version 2, the single
+  // antenna flag in versions 0 and 1 (readsb reads it as NIC-B in every
+  // version; position_nic() decides where it counts).
+  bool nic_supplement_b = false;
 
   float ground_speed_kt = 0.0f;
   float track_deg = 0.0f;         // true track, [0, 360)
@@ -210,6 +216,15 @@ struct DecodedMsg {
 // Expected frame length in bytes (7 or 14) for a downlink format, from the
 // first byte of a frame. Returns 0 for unassigned formats.
 [[nodiscard]] std::size_t expected_frame_length(std::uint8_t first_byte) noexcept;
+
+// Navigation integrity category (0-11, 0 = unknown) of a position message with
+// type code `tc` (5-8 surface, 9-18 / 20-22 airborne), for an aircraft that
+// reported ADS-B `version` (0 until a TC 31 says otherwise) and the NIC
+// supplement bits A and C (TC 31) and B (the position message itself). This is
+// readsb's compute_nic() (track.c, v3.16.21), itself DO-260B Tables 2-14 and
+// 2-15 with the version 0 / 1 readings; any other type code gives 0.
+[[nodiscard]] std::uint8_t position_nic(unsigned tc, unsigned version, bool nic_a, bool nic_b,
+                                        bool nic_c) noexcept;
 
 // Decodes one frame. `len` must be 7 or 14 bytes. `out` is fully overwritten.
 [[nodiscard]] DecodeStatus decode(const std::uint8_t* frame, std::size_t len,

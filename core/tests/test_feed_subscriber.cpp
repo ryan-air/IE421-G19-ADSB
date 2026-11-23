@@ -188,13 +188,13 @@ TEST(Subscriber, ATruncatedAnswerIsFollowedUpAtOnceButDuplicatesAreNot) {
   f.feed(packet(kS1, 1, 1), 0);
   f.feed(heartbeat(kS1, 101), 0);
   ASSERT_EQ(f.io.reqs.size(), 1u);  // [2, 101)
-  f.reply(packet(kS1, 2, 22), 10);  // a full packet: the answer goes on
+  f.reply(packet(kS1, 2, 19), 10);  // a full packet: the answer goes on
   EXPECT_EQ(f.io.reqs.size(), 1u);
-  f.reply(packet(kS1, 24, 10), 20);  // short: the server stopped at 33 (its cap)
+  f.reply(packet(kS1, 21, 10), 20);  // short: the server stopped at 30 (its cap)
   ASSERT_EQ(f.io.reqs.size(), 2u);
-  EXPECT_EQ(f.io.reqs[1].seq, 34u);
-  f.reply(packet(kS1, 24, 10), 30);  // the same answer again (duplicated on the way)
-  f.reply(packet(kS1, 2, 22), 30);
+  EXPECT_EQ(f.io.reqs[1].seq, 31u);
+  f.reply(packet(kS1, 21, 10), 30);  // the same answer again (duplicated on the way)
+  f.reply(packet(kS1, 2, 19), 30);
   EXPECT_EQ(f.io.reqs.size(), 2u) << "duplicates of an earlier answer do not ask again";
   f.reply(packet(kS1, 40, 5), 40);   // reordered: ahead of expected, not the end of an answer
   EXPECT_EQ(f.io.reqs.size(), 2u);
@@ -220,9 +220,9 @@ TEST(Subscriber, LargeGapIsRequestedInChunks) {
   f.feed(heartbeat(kS1, 1001));
   ASSERT_EQ(f.io.reqs.size(), 1u);
   EXPECT_EQ(f.io.reqs[0].count, 100u);
-  // Full reply packets (22 TrackUpdates each), as the server builds them.
-  for (std::uint64_t q = 2; q < 102; q += 22) {
-    f.reply(packet(kS1, q, static_cast<std::uint16_t>(std::min<std::uint64_t>(22, 102 - q))));
+  // Full reply packets (19 TrackUpdates each), as the server builds them.
+  for (std::uint64_t q = 2; q < 102; q += 19) {
+    f.reply(packet(kS1, q, static_cast<std::uint16_t>(std::min<std::uint64_t>(19, 102 - q))));
   }
   ASSERT_EQ(f.io.reqs.size(), 2u) << "the next chunk is requested as soon as one completes";
   EXPECT_EQ(f.io.reqs[1].seq, 102u);
@@ -322,7 +322,7 @@ TEST(Subscriber, LateJoinBuffersFarAheadOfExpected) {
 
 TEST(Subscriber, PublisherRestartClearsTheBookAndDropsStalePackets) {
   Fixture f;
-  f.feed(packet(kS1, 1, 20));
+  f.feed(packet(kS1, 1, 19));
   ASSERT_EQ(f.sub.book().size(), 7u);
   f.feed(packet(kS2, 1, 3));  // new session from its start
   EXPECT_EQ(f.sub.session(), kS2);
@@ -591,7 +591,7 @@ TEST(Subscriber, UnknownMessageTypesAreSkippedButSequenced) {
   PacketBuilder b(kS1, 1);
   const auto m1 = msg_for(1);
   const std::uint8_t future[] = {'Q', 0, 1, 2, 3};
-  ASSERT_TRUE(b.add(m1.data(), 64));
+  ASSERT_TRUE(b.add(m1.data(), static_cast<std::uint16_t>(m1.size())));
   ASSERT_TRUE(b.add(future, sizeof future));
   const auto d = b.finish();
   f.feed(std::vector<std::uint8_t>(d.begin(), d.end()));

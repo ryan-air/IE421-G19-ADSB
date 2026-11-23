@@ -20,19 +20,20 @@ namespace {
 using namespace adsb::protocol;
 
 std::vector<std::uint8_t> read_golden() {
-  std::ifstream f(std::string(ADSB_GOLDEN_DIR) + "/packet_v0.bin", std::ios::binary);
+  std::ifstream f(std::string(ADSB_GOLDEN_DIR) + "/packet_v1.bin", std::ios::binary);
   EXPECT_TRUE(f.good()) << "missing golden packet; run python3 protocol/gen.py";
   return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
 }
 
 TEST(FeedMessages, LayoutMatchesSpec) {
-  EXPECT_EQ(sizeof(TrackUpdate), 64u);
-  EXPECT_EQ(TrackUpdate::kWireSize, 64u);
+  EXPECT_EQ(sizeof(TrackUpdate), 72u);
+  EXPECT_EQ(TrackUpdate::kWireSize, 72u);
   EXPECT_EQ(TrackDelete::kWireSize, 16u);
   EXPECT_EQ(PacketHeader::kWireSize, 20u);
   EXPECT_EQ(RetransmitRequest::kWireSize, 20u);
-  // A full packet of TrackUpdates fits exactly in one MTU-sized datagram.
-  EXPECT_EQ(PacketHeader::kWireSize + 22 * (2 + TrackUpdate::kWireSize), kMaxUdpPayload);
+  // 19 TrackUpdates fit in one MTU-sized datagram (22 in feed v0), a 20th does not.
+  EXPECT_LE(PacketHeader::kWireSize + 19 * (2 + TrackUpdate::kWireSize), kMaxUdpPayload);
+  EXPECT_GT(PacketHeader::kWireSize + 20 * (2 + TrackUpdate::kWireSize), kMaxUdpPayload);
 }
 
 TEST(FeedMessages, DefaultsAreNullValues) {
@@ -45,11 +46,16 @@ TEST(FeedMessages, DefaultsAreNullValues) {
   EXPECT_EQ(u.vrate_fpm, TrackUpdate::kVrateFpmNull);
   EXPECT_EQ(u.squawk, TrackUpdate::kSquawkNull);
   EXPECT_EQ(std::string(u.callsign.data(), 8), "        ");
+  EXPECT_EQ(u.nic, 0u);
+  EXPECT_EQ(u.adsb_version, TrackUpdate::kAdsbVersionNull);
+  EXPECT_EQ(u.heading_cdeg, TrackUpdate::kHeadingCdegNull);
+  EXPECT_EQ(u.airspeed_kt, TrackUpdate::kAirspeedKtNull);
+  EXPECT_EQ(u.reserved, 0u);
 }
 
 TEST(FeedMessages, GoldenPacketDecodesAndReencodesIdentically) {
   const auto golden = read_golden();
-  ASSERT_EQ(golden.size(), 104u);
+  ASSERT_EQ(golden.size(), 112u);
   const auto p = parse_packet(golden);
   ASSERT_TRUE(p.has_value());
   EXPECT_EQ(std::string(p->header.session.data(), 10), "ADSB000001");
@@ -71,9 +77,9 @@ TEST(FeedMessages, GoldenPacketDecodesAndReencodesIdentically) {
   });
   EXPECT_EQ(seqs, (std::vector<std::uint64_t>{1001, 1002}));
 
-  // Spot-check values from protocol/schema/feed_v0.json "example".
+  // Spot-check values from protocol/schema/feed_v1.json "example".
   EXPECT_EQ(u.icao, 0x4840D6u);
-  EXPECT_EQ(u.update_mask, update_mask::kPosition | update_mask::kCallsign);
+  EXPECT_EQ(u.update_mask, update_mask::kPosition | update_mask::kCallsign | update_mask::kHeading);
   EXPECT_EQ(u.lat_e7, 522572021);
   EXPECT_EQ(u.lon_e7, 39193725);
   EXPECT_EQ(u.alt_ft, 38000);
@@ -81,6 +87,11 @@ TEST(FeedMessages, GoldenPacketDecodesAndReencodesIdentically) {
   EXPECT_EQ(u.squawk, 0x7700);
   EXPECT_EQ(u.radio_ts >> 60, 1u) << "line id in the top 4 bits";
   EXPECT_EQ(std::string(u.callsign.data(), 8), "KLM1023 ");
+  EXPECT_EQ(u.nic, 8u);
+  EXPECT_EQ(u.adsb_version, 2u);
+  EXPECT_EQ(u.flags, track_flags::kHeadingTrue);
+  EXPECT_EQ(u.heading_cdeg, 18105u);
+  EXPECT_EQ(u.airspeed_kt, 452u);
   EXPECT_EQ(d.icao, 0x4840D6u);
   EXPECT_EQ(d.reason, 1u);
 
@@ -98,19 +109,19 @@ TEST(PacketBuilder, FillsToMtuAndContinuesSequence) {
   TrackUpdate u;
   int added = 0;
   while (b.add(u)) ++added;
-  EXPECT_EQ(added, 22);
-  EXPECT_EQ(b.next_seq(), 122u);
+  EXPECT_EQ(added, 19);
+  EXPECT_EQ(b.next_seq(), 119u);
   const auto pkt = b.finish();
-  EXPECT_EQ(pkt.size(), kMaxUdpPayload);
+  EXPECT_EQ(pkt.size(), PacketHeader::kWireSize + 19 * (2 + TrackUpdate::kWireSize));
   const auto p = parse_packet(pkt);
   ASSERT_TRUE(p);
   EXPECT_EQ(p->header.seq, 100u);
-  EXPECT_EQ(p->header.count, 22u);
+  EXPECT_EQ(p->header.count, 19u);
   // Next packet continues the sequence.
   ASSERT_TRUE(b.add(u));
   const auto p2 = parse_packet(b.finish());
   ASSERT_TRUE(p2);
-  EXPECT_EQ(p2->header.seq, 122u);
+  EXPECT_EQ(p2->header.seq, 119u);
 }
 
 TEST(PacketBuilder, HeartbeatAndEndOfSession) {

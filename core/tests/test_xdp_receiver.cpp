@@ -615,7 +615,7 @@ TEST(XdpReceiver, SubscriberClientRecoversAFeedReceivedOverAfXdp) {
   std::uint64_t seq = 1, packets = 0;
   while (seq <= kN) {
     PacketBuilder b(session, seq);
-    for (int k = 0; k < 20 && seq <= kN; ++k, ++seq) {
+    for (int k = 0; k < 19 && seq <= kN; ++k, ++seq) {  // 19 x 72 B fill a datagram
       adsb::protocol::TrackUpdate u;
       u.icao = static_cast<std::uint32_t>(seq % 97 + 1);
       u.alt_ft = static_cast<std::int32_t>(seq);

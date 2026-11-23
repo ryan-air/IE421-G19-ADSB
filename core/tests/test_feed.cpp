@@ -250,7 +250,7 @@ TEST(RecoveryState, ServesExactlyTheRequestedRangeAcrossPackets) {
   RecoveryState st = make_state(1024, 500);
   Replies r;
   st.handle_request(request(kSession, 100, 50), r);
-  // 50 TrackUpdates = 3 packets of at most 22.
+  // 50 TrackUpdates = 3 packets of at most 19.
   ASSERT_EQ(r.dgrams.size(), 3u);
   std::uint64_t next = 100;
   for (const auto& d : r.dgrams) {
@@ -428,9 +428,9 @@ TEST(Publisher, BatchFlushesWhenFullOrWhenTheDelayExpires) {
   CaptureOut out;
   Publisher<CaptureOut> pub(pub_cfg(50'000), out, nullptr, &fake_clock);
   for (std::uint32_t i = 0; i < 30; ++i) pub.on_update(update(i + 1, 1));  // same instant
-  ASSERT_EQ(out.dgrams.size(), 1u) << "22 TrackUpdates fill a 1472-byte datagram";
-  EXPECT_EQ(out.dgrams[0].size(), 1472u);
-  EXPECT_EQ(protocol::parse_packet(out.dgrams[0])->header.count, 22u);
+  ASSERT_EQ(out.dgrams.size(), 1u) << "19 TrackUpdates fill a datagram (a 20th would pass 1472 bytes)";
+  EXPECT_EQ(out.dgrams[0].size(), 20u + 19u * 74u);
+  EXPECT_EQ(protocol::parse_packet(out.dgrams[0])->header.count, 19u);
   g_now = 49'999;
   pub.poll();
   EXPECT_EQ(out.dgrams.size(), 1u);
@@ -438,8 +438,8 @@ TEST(Publisher, BatchFlushesWhenFullOrWhenTheDelayExpires) {
   pub.poll();
   ASSERT_EQ(out.dgrams.size(), 2u);
   const auto pv = protocol::parse_packet(out.dgrams[1]);
-  EXPECT_EQ(pv->header.seq, 23u);
-  EXPECT_EQ(pv->header.count, 8u);
+  EXPECT_EQ(pv->header.seq, 20u);
+  EXPECT_EQ(pv->header.count, 11u);
   // The delay is measured from the first message of the packet.
   g_now = 100'000;
   pub.on_update(update(99, 1));

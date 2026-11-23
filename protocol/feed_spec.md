@@ -2,7 +2,7 @@
 
 **Status:** v0 draft for team review. Changes are expected before v1. Once a field is in v1 it can only be appended to, never moved.
 
-**Source of truth:** [`schema/feed_v0.json`](schema/feed_v0.json). Field tables in this document are copied from the schema. If the two disagree, the schema wins. Generated code:
+**Source of truth:** [`schema/feed_v1.json`](schema/feed_v1.json). Field tables in this document are copied from the schema. If the two disagree, the schema wins. Generated code:
 
 | Language | File | Use |
 |---|---|---|
@@ -20,7 +20,7 @@ Regenerate after editing the schema with `python3 protocol/gen.py`. CI runs `pyt
 |---|---|
 | **MoldUDP64 framing** (Nasdaq) | A real exchange transport: sequenced, with gap recovery by retransmit request, and the same framing the ITCH workstream (README_UPDATES.md §14) replays. |
 | **Little-endian integers** | Every host we use is little-endian, so encode and decode are plain copies. This deliberately differs from MoldUDP64 (big-endian). ITCH payloads are carried unchanged in their own big-endian format. |
-| **Fixed-size messages, natural alignment** | No parsing branches. `TrackUpdate` is exactly one 64-byte cache line, and every field sits at an offset that is a multiple of its size. The generator rejects schemas that would need padding. |
+| **Fixed-size messages, natural alignment** | No parsing branches. `TrackUpdate` is 72 bytes (one 64-byte cache line until version 1 added heading and airspeed, §5), and every field sits at an offset that is a multiple of its size. The generator rejects schemas that would need padding. |
 | **Full state per update + change mask** | A subscriber can render a track from any single `TrackUpdate`. `update_mask` says what changed, so consumers that care about one field skip the rest. |
 | **Explicit null values** | Unknown fields hold a sentinel (e.g. `INT32_MIN`) rather than 0, which is a valid value for most fields. Generated as `TrackUpdate::kLatE7Null` (C++), `TrackUpdateNull` (JS), `TRACK_UPDATE_NULLS` (Python). |
 | **Event time** | `event_ts_ns` is the receive time of the frame that caused the update, never the time of publication. Replays are therefore deterministic (README_UPDATES.md §11.2). |
@@ -68,14 +68,14 @@ Rules:
 
 ## 3. Messages
 
-The first byte of every message is its ASCII type, and the second is the schema version (`kVersion = 0`).
+The first byte of every message is its ASCII type, and the second is the schema version (`kVersion = 1`). Version 1 (2026-11-23) grew `TrackUpdate` from 64 to 72 bytes for heading, airspeed and the populated `nic` / `adsb_version` (§5); every component in this repository speaks version 1 only, and the generated code has no version 0 reader.
 
-### `TrackUpdate` — `'U'`, 64 bytes
+### `TrackUpdate` — `'U'`, 72 bytes
 
 | Offset | Field | Type | Unit / meaning | Null |
 |---|---|---|---|---|
 | 0 | `msg_type` | u8 | `'U'` | |
-| 1 | `version` | u8 | 0 | |
+| 1 | `version` | u8 | 1 | |
 | 2 | `update_mask` | u16 | `UpdateMask` bits: fields that changed | |
 | 4 | `icao` | u32 | 24-bit address (low bits) | |
 | 8 | `event_ts_ns` | u64 | Receive time of the causing frame, ns | |
@@ -89,14 +89,21 @@ The first byte of every message is its ASCII type, and the second is the schema 
 | 42 | `squawk` | u16 | Mode A code, octal digits as hex nibbles (7700 → `0x7700`) | `0xFFFF` |
 | 44 | `callsign` | char[8] | Space-padded; all spaces if unknown | |
 | 52 | `category` | u8 | Emitter category, e.g. `0xA3`; 0 if unknown | |
-| 53 | `nic` | u8 | Navigation integrity category; 0 if unknown (not yet populated) | |
+| 53 | `nic` | u8 | Navigation integrity category of the current position, 0–11 (below); 0 = unknown or no position | |
 | 54 | `flags` | u8 | `TrackFlags` bits | |
-| 55 | `reserved` | u8 | 0 | |
+| 55 | `adsb_version` | u8 | ADS-B version from operational status (TC 31): 0 DO-260, 1 DO-260A, 2 DO-260B | `0xFF` (no TC 31 yet) |
 | 56 | `publish_ts_ns` | u64 | Publisher software timestamp just before send; 0 inside the pipeline | |
+| 64 | `heading_cdeg` | u16 | Heading, 0.01°, [0, 36000), from airborne velocity subtypes 3/4; reference in `flags.kHeadingTrue` | `0xFFFF` |
+| 66 | `airspeed_kt` | u16 | Airspeed, kt, from airborne velocity subtypes 3/4; `flags.kAirspeedTrue` = TAS, else IAS | `0xFFFF` |
+| 68 | `reserved` | u32 | 0 | |
 
-**`UpdateMask` bits:** 0 `kPosition`, 1 `kAltitude`, 2 `kGroundSpeed`, 3 `kTrack`, 4 `kVerticalRate`, 5 `kCallsign`, 6 `kSquawk`, 7 `kCategory`, 8 `kAirGround`, 15 `kNewTrack`.
+A datagram holds up to 19 `TrackUpdate`s (22 in version 0). The shared-memory ring's 128-byte slots carry 72-byte payloads since its layout version 2.
 
-**`TrackFlags` bits:** 0 `kAltitudeGnss`, 1 `kOnGround`, 2 `kNonIcaoAddress`, 3 `kSurfacePosition`.
+**`nic`.** Computed for every position message when it arrives, from its type code, the aircraft's ADS-B version and the NIC supplements: A and C from the latest operational status (TC 31 from DF17 or DF18 CF 0/1 only; version 1 or 2, since versions 3–7 are reserved and only reported; C only from a surface status with capability class code 0), each counting for 60 s after the status that set it; B from bit 8 of the airborne position message (DF17 or DF18 CF 0/1; for TIS-B and ADS-R that bit is the IMF flag). A global CPR fix carries the lower NIC of its two frames, a local fix against the track's previous position the lower of its frame's and the track's, a local fix against the receiver its frame's. Until a TC 31 arrives the version 0 rules apply (the NIC that the type code alone implies). `flags.kHeadingTrue` is set only while a heading is known. The rules are readsb's (`track.c`, `compute_nic`, v3.16.21), i.e. DO-260B Tables 2-14 and 2-15 with readsb's readings of versions 0 and 1; `modes::position_nic()` in `core/include/adsb/modes/decoder.hpp` implements them. A later TC 31 changes `adsb_version` at once but `nic` only with the next positions.
+
+**`UpdateMask` bits:** 0 `kPosition`, 1 `kAltitude`, 2 `kGroundSpeed`, 3 `kTrack`, 4 `kVerticalRate`, 5 `kCallsign`, 6 `kSquawk`, 7 `kCategory`, 8 `kAirGround`, 9 `kHeading` (heading or its reference), 10 `kAirspeed` (airspeed or TAS/IAS), 11 `kIntegrity` (`nic` or `adsb_version`), 15 `kNewTrack`.
+
+**`TrackFlags` bits:** 0 `kAltitudeGnss`, 1 `kOnGround`, 2 `kNonIcaoAddress`, 3 `kSurfacePosition`, 4 `kHeadingTrue` (heading is relative to true north: TC 31 HRD = 0, version 1 or later; otherwise magnetic), 5 `kAirspeedTrue` (true airspeed; otherwise indicated).
 
 ### `TrackDelete` — `'D'`, 16 bytes
 
@@ -153,7 +160,7 @@ Browsers do not join the multicast group. The WebSocket gateway (`gateway/`) is 
 
 ## 5. Open questions for review
 
-1. **`nic` / position quality:** populate from TC 31 (operational status) once it is decoded, or replace with NUCp derived from the position type code?
-2. **Heading and airspeed:** these are decoded (velocity subtypes 3/4) but not carried. Add them in v1, at the cost of a second cache line, or as a separate `'V'` message?
+1. ~~**`nic` / position quality:** populate from TC 31 (operational status) once it is decoded, or replace with NUCp derived from the position type code?~~ **Decided (v1):** `nic` is populated, with readsb's rules (§3), and `adsb_version` tells consumers which DO-260 revision it follows. Version 0 aircraft get the NIC their type code implies, which is the NUCp ordering on the NIC scale; NACp, SIL and NUCp themselves are not carried (they can be added in the `reserved` word).
+2. ~~**Heading and airspeed:** these are decoded (velocity subtypes 3/4) but not carried. Add them in v1, at the cost of a second cache line, or as a separate `'V'` message?~~ **Decided (v1):** in `TrackUpdate`, which grows to 72 bytes. A separate message would break the rule that one `TrackUpdate` is an aircraft's whole state, on which the conflated feed, snapshots, `FeedBook` and its digest, and the gateway's per-client conflation all rely; each of them would need a second message type kept consistent with the first. The cost: 19 instead of 22 updates per datagram, and the message spans two cache lines (the shared-memory slot was 128 bytes already).
 3. ~~**Conflated feed:** same messages on a separate multicast group, or a dedicated compact message?~~ **Decided:** the same messages on a separate group (§4, "The conflated feed"), so every subscriber and the gateway work on it unchanged. A compact message can still be added later as a new type.
 4. **Multicast group and ports:** defaults are `239.19.0.1:41900` for the incremental feed, UDP 41901 for retransmit requests, TCP 41902 for snapshots, `239.19.0.3:41910` (retransmit 41911, snapshot 41912) for the conflated feed, and `239.19.0.2` for fusion. Confirm these against the lab network.

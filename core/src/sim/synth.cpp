@@ -37,7 +37,59 @@ double wrap360(double d) {
   return d < 0 ? d + 360.0 : d;
 }
 
-enum class Kind : std::uint8_t { kPosition, kVelocity, kIdent, kDf11, kDf4, kDf5 };
+enum class Kind : std::uint8_t { kPosition, kVelocity, kIdent, kDf11, kDf4, kDf5, kOpStatus };
+constexpr int kKinds = 7;
+
+// Position encodings and the NIC each means (DO-260B Tables 2-14 / 2-15 and
+// their DO-260 / DO-260A readings). Written independently of
+// modes::position_nic, which the decoder uses: tests compare the two.
+struct NicRow {
+  std::uint8_t version;
+  bool surface;
+  std::uint8_t tc;
+  bool a, b, c;
+  std::uint8_t nic;
+};
+constexpr NicRow kNicRows[] = {
+    // version 2, airborne (b = NIC-B)
+    {2, false, 9, 0, 0, 0, 11}, {2, false, 10, 0, 0, 0, 10}, {2, false, 11, 1, 1, 0, 9},
+    {2, false, 11, 0, 0, 0, 8}, {2, false, 12, 0, 0, 0, 7}, {2, false, 13, 0, 1, 0, 6},
+    {2, false, 13, 0, 0, 0, 6}, {2, false, 14, 0, 0, 0, 5}, {2, false, 15, 0, 0, 0, 4},
+    {2, false, 16, 1, 1, 0, 3}, {2, false, 16, 0, 0, 0, 2}, {2, false, 17, 0, 0, 0, 1},
+    {2, false, 18, 0, 0, 0, 0}, {2, false, 20, 0, 0, 0, 11}, {2, false, 21, 0, 0, 0, 10},
+    // version 2, surface (c = NIC-C)
+    {2, true, 5, 0, 0, 0, 11}, {2, true, 6, 0, 0, 0, 10}, {2, true, 7, 1, 0, 0, 9},
+    {2, true, 7, 0, 0, 0, 8}, {2, true, 8, 1, 0, 1, 7}, {2, true, 8, 1, 0, 0, 6},
+    {2, true, 8, 0, 0, 1, 6}, {2, true, 8, 0, 0, 0, 0},
+    // version 1 (one NIC supplement, sent in TC 31 as NIC-A)
+    {1, false, 9, 0, 0, 0, 11}, {1, false, 11, 1, 0, 0, 9}, {1, false, 11, 0, 0, 0, 8},
+    {1, false, 13, 0, 0, 0, 6}, {1, false, 17, 0, 0, 0, 1}, {1, true, 6, 0, 0, 0, 10},
+    {1, true, 7, 1, 0, 0, 9}, {1, true, 7, 0, 0, 0, 8},
+    // version 0 (NUCp era: the containment radius of the type code)
+    {0, false, 9, 0, 0, 0, 11}, {0, false, 11, 0, 0, 0, 8}, {0, false, 12, 0, 0, 0, 7},
+    {0, false, 14, 0, 0, 0, 5}, {0, false, 18, 0, 0, 0, 0}, {0, true, 5, 0, 0, 0, 11},
+    {0, true, 7, 0, 0, 0, 8}, {0, true, 8, 0, 0, 0, 0},
+};
+
+void assign_avionics(const SynthConfig& cfg, AircraftInfo& info) {
+  // Own stream per aircraft, so spawning draws nothing extra from the aircraft streams.
+  Rng r(cfg.seed * 0x9E3779B97F4A7C15ULL ^ (std::uint64_t{info.icao} << 8) ^ 0xA710);
+  info.adsb_version = static_cast<std::uint8_t>(r.below(3));
+  const NicRow* rows[std::size(kNicRows)];
+  std::size_t n = 0;
+  for (const NicRow& row : kNicRows) {
+    if (row.version == info.adsb_version && row.surface == info.on_ground) rows[n++] = &row;
+  }
+  const NicRow& row = *rows[r.below(n)];
+  info.position_tc = row.tc;
+  info.nic_a = row.a;
+  info.nic_b = row.b;
+  info.nic_c = row.c;
+  info.nic = row.nic;
+  info.heading_true_north = info.adsb_version >= 1 && r.chance(0.3);
+  info.airspeed_velocity = !info.on_ground && r.chance(cfg.airspeed_fraction);
+  info.airspeed_true = r.chance(0.5);
+}
 
 struct Aircraft {
   AircraftInfo info;
@@ -52,8 +104,19 @@ struct Aircraft {
   bool odd_next = false;
   double t = 0;              // seconds since start, time of `state`
   // Next transmit time per message kind (seconds since start).
-  double next[6] = {};
+  double next[kKinds] = {};
+  // Avionics (SynthConfig::avionics): fixed offsets of heading from track
+  // (wind correction) and of true airspeed from ground speed (wind).
+  double crab_deg = 0;
+  double wind_kt = 0;
 };
+
+double true_heading(const Aircraft& a) { return wrap360(a.track_deg + a.crab_deg); }
+double reported_airspeed(const Aircraft& a) {
+  const double tas = std::max(60.0, a.gs_kt + a.wind_kt);
+  // IAS falls with altitude (density); a rough 2% per 1,000 ft.
+  return a.info.airspeed_true ? tas : tas / (1.0 + 0.02 * a.alt_ft / 1000.0);
+}
 
 void advance(Aircraft& a, double to_t) {
   const double dt = to_t - a.t;
@@ -88,6 +151,7 @@ double interval(Rng& rng, Kind k, double surveillance_rate_hz) {
     case Kind::kDf11: return rng.uniform(0.8, 1.2);
     case Kind::kDf4:
     case Kind::kDf5: return surveillance_rate_hz > 0 ? rng.uniform(0.5, 1.5) / surveillance_rate_hz : 1e18;
+    case Kind::kOpStatus: return rng.uniform(2.4, 2.6);
   }
   return 1e18;
 }
@@ -156,6 +220,17 @@ Aircraft spawn(const SynthConfig& cfg, Rng& master, std::set<std::uint32_t>& use
   for (int k = 0; k < 6; ++k) {
     a.next[k] = r.uniform(0, interval(r, static_cast<Kind>(k), cfg.surveillance_rate_hz));
   }
+  a.next[static_cast<int>(Kind::kOpStatus)] = 1e18;
+  if (cfg.avionics) {
+    assign_avionics(cfg, a.info);
+    Rng av(cfg.seed * 0xD1B54A32D192ED03ULL ^ a.info.icao);
+    a.crab_deg = av.uniform(-10.0, 10.0);
+    a.wind_kt = av.uniform(-60.0, 60.0);
+    // Version 0 has no operational status message.
+    if (a.info.adsb_version >= 1) a.next[static_cast<int>(Kind::kOpStatus)] = av.uniform(0.0, 2.5);
+  } else {
+    a.info.position_tc = a.info.on_ground ? 7 : 11;
+  }
   if (!cfg.df11_squitters) a.next[static_cast<int>(Kind::kDf11)] = 1e18;
   if (a.info.on_ground) a.next[static_cast<int>(Kind::kVelocity)] = 1e18;  // surface msg carries speed
   return a;
@@ -168,11 +243,27 @@ Frame build_frame(const Aircraft& a, Kind k, bool odd) {
     case Kind::kPosition: {
       const auto cpr = modes::cpr_encode(a.lat, a.lon, odd, a.info.on_ground);
       if (a.info.on_ground) {
-        return modes::encode_surface_position(icao, a.gs_kt, a.gs_kt > 0.5 ? a.track_deg : -1.0, cpr);
+        return modes::encode_surface_position(icao, a.gs_kt, a.gs_kt > 0.5 ? a.track_deg : -1.0, cpr,
+                                              a.info.position_tc);
       }
-      return modes::encode_airborne_position(icao, alt, cpr);
+      return modes::encode_airborne_position(icao, alt, cpr, a.info.position_tc, 5, a.info.nic_b);
+    }
+    case Kind::kOpStatus: {
+      modes::OperationalStatus os;
+      os.surface = a.info.on_ground;
+      os.version = a.info.adsb_version;
+      os.nic_supplement_a = a.info.nic_a;
+      os.nic_supplement_c = a.info.nic_c;
+      os.nac_p = a.info.nic >= 8 ? 9 : 7;
+      os.sil = 3;
+      os.heading_true_north = a.info.heading_true_north;
+      return modes::encode_operational_status(icao, os, a.info.on_ground ? 4u : 5u);
     }
     case Kind::kVelocity: {
+      if (a.info.airspeed_velocity) {
+        return modes::encode_airspeed_heading(icao, true_heading(a), reported_airspeed(a), a.info.airspeed_true,
+                                              static_cast<std::int32_t>(std::lround(a.vr_fpm)));
+      }
       const double e = a.gs_kt * std::sin(a.track_deg * kDeg);
       const double n = a.gs_kt * std::cos(a.track_deg * kDeg);
       return modes::encode_velocity(icao, e, n, static_cast<std::int32_t>(std::lround(a.vr_fpm)));
@@ -223,7 +314,7 @@ SynthOutput generate(const SynthConfig& cfg) {
     for (;;) {
       // Next event for this aircraft.
       int kind = 0;
-      for (int k = 1; k < 6; ++k) {
+      for (int k = 1; k < kKinds; ++k) {
         if (a.next[k] < a.next[kind]) kind = k;
       }
       const double t = a.next[kind];
@@ -264,6 +355,8 @@ SynthOutput generate(const SynthConfig& cfg) {
         tp.track_deg = a.track_deg;
         tp.vertical_rate_fpm = static_cast<std::int32_t>(std::lround(a.vr_fpm));
         tp.on_ground = a.info.on_ground;
+        tp.heading_deg = true_heading(a);
+        tp.airspeed_kt = reported_airspeed(a);
         out.truth.push_back(tp);
       }
 

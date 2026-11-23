@@ -61,7 +61,7 @@ Plan §7, §8 and §14.
 | ~~Decoder gaps: TC 29/31, Comm-B (BDS), optional single-bit error correction~~ **Done (Ryan):** TC 29 target state (DO-260B), TC 31 operational status (versions 0–2), Comm-B registers 1,0 1,7 2,0 3,0 4,0 5,0 6,0 inferred from their format rules (values only when one register fits; kept apart from the ADS-B fields), optional single-bit repair for DF17/18 (`--fix` on `adsb-replay` / `adsb-live`). Still open: using Comm-B values in the track engine, TC 29 subtype 0, DF19 | Must | None | M |
 | ~~Find out why our decoder reports about 8% more positions than readsb (`bench/results/legacy-baseline/README.md`, item 7)~~ **Done (Ryan):** a counting artifact: readsb reports surface positions as SBS `MSG,2`, and only `MSG,3` was counted. With both, ours has 0.3–0.4% fewer, all frames readsb repaired with its single-bit correction; every other position matches one to one (`bench/legacy/compare-positions.sh`) | Must | None | S |
 | ≥ 99.9% agreement with readsb on real traffic; settle the GNSS-height unit question (`core/include/adsb/modes/decoder.hpp`) | Must | Real recordings (OpenSky or our receiver) | S–M |
-| Populate `nic`; decide heading and airspeed for feed v1 (`protocol/feed_spec.md` §5) | Must | None | S |
+| ~~Populate `nic`; decide heading and airspeed for feed v1 (`protocol/feed_spec.md` §5)~~ **Done (Ryan):** feed v1: `TrackUpdate` is 72 bytes with `heading_cdeg`, `airspeed_kt` (TAS/IAS and true/magnetic flags) and `adsb_version`; `nic` is populated with readsb's rules (type code + TC 31 NIC-A/C + position NIC-B); `adsb-synth --avionics` generates mixed versions and NIC for tests | Must | None | S |
 | Nasdaq ITCH 5.0 L3 order book through our MoldUDP64 stack; target ≥ 20 M msg/s per core | Could | None (public sample files) | L |
 
 Start with: `core/README.md` (decoder and engine sections), `core/tests/test_decoder.cpp`, plan §7.
@@ -134,7 +134,7 @@ Branch names: `<area>/<topic>`, for example `demod/synthetic-iq`, `decoder/tc31`
   - the gateway tests if you touched `gateway/`;
   - `python3 protocol/gen.py --check` if you touched the protocol.
 - **CI builds with GCC and Clang at `-Werror`.** GCC catches warnings Clang does not, so if you develop on a Mac, expect CI to flag a few.
-- **Feed format changes:** edit `protocol/schema/feed_v0.json` only, then run `python3 protocol/gen.py`. Never edit the generated files.
+- **Feed format changes:** edit `protocol/schema/feed_v1.json` only, then run `python3 protocol/gen.py`. Never edit the generated files.
 - **Never commit** secrets, `.env` files, large recordings, or build output.
 
 ### 3. Commit

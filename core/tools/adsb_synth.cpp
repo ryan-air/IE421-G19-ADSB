@@ -4,6 +4,7 @@
 //   adsb-synth -o traffic.adsbrec [--aircraft 50] [--duration 60] [--seed 1]
 //              [--lines 1|2] [--max-range 150] [--corrupt 0.003]
 //              [--receiver LAT,LON] [--beast out.beast] [--truth truth.csv]
+//              [--avionics [--airspeed-share 0.3]]
 
 #include <cmath>
 #include <cstdio>
@@ -28,6 +29,10 @@ namespace {
                "  --corrupt P         share of frames with a flipped bit (default 0.003)\n"
                "  --ground F          share of aircraft taxiing at the airport (default 0.06)\n"
                "  --receiver LAT,LON  receiver position (default Willard Airport, CMI)\n"
+               "  --avionics          mixed ADS-B versions, position type codes / NIC and\n"
+               "                      operational status (TC 31); some aircraft send\n"
+               "                      airspeed + heading instead of ground speed\n"
+               "  --airspeed-share F  share of airborne aircraft sending airspeed (default 0.3)\n"
                "  --beast FILE        also write line 0 as a raw Beast byte stream\n"
                "  --truth FILE        also write ground truth (CSV) for every position frame\n");
   std::exit(code);
@@ -79,6 +84,13 @@ int main(int argc, char** argv) {
       if (comma == std::string::npos) usage(1);
       cfg.receiver_lat = num(v.substr(0, comma).c_str(), "--receiver");
       cfg.receiver_lon = num(v.substr(comma + 1).c_str(), "--receiver");
+    } else if (a == "--avionics") cfg.avionics = true;
+    else if (a == "--airspeed-share") {
+      cfg.airspeed_fraction = num(val(), "--airspeed-share");
+      if (cfg.airspeed_fraction < 0 || cfg.airspeed_fraction > 1) {
+        std::fprintf(stderr, "adsb-synth: --airspeed-share must be in [0, 1]\n");
+        return 1;
+      }
     } else if (a == "--beast") beast_path = val();
     else if (a == "--truth") truth_path = val();
     else {

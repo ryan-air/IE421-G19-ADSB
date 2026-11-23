@@ -16,8 +16,8 @@ import feed_messages as fm  # noqa: E402
 
 class GoldenPacket(unittest.TestCase):
     def setUp(self):
-        self.raw = (ROOT / "protocol" / "golden" / "packet_v0.bin").read_bytes()
-        self.expected = json.loads((ROOT / "protocol" / "golden" / "packet_v0.json").read_text())
+        self.raw = (ROOT / "protocol" / "golden" / "packet_v1.bin").read_bytes()
+        self.expected = json.loads((ROOT / "protocol" / "golden" / "packet_v1.json").read_text())
 
     def test_decode_matches_json(self):
         header, msgs = fm.decode_packet(self.raw)
@@ -65,7 +65,7 @@ class GoldenPacket(unittest.TestCase):
         self.assertEqual(fm.decode_track_update(fm.encode_track_update(msg))["callsign"], "AB      ")
 
     def test_sizes(self):
-        self.assertEqual(fm.TRACK_UPDATE_SIZE, 64)
+        self.assertEqual(fm.TRACK_UPDATE_SIZE, 72)
         self.assertEqual(fm.PACKET_HEADER_SIZE, 20)
         self.assertEqual(fm.UpdateMask.kNewTrack, 1 << 15)
 
@@ -75,7 +75,7 @@ class GoldenPacket(unittest.TestCase):
         except ImportError:
             self.skipTest("numpy not installed")
         dt = fm.numpy_dtype("TrackUpdate")
-        self.assertEqual(dt.itemsize, 64)
+        self.assertEqual(dt.itemsize, 72)
         rec = np.frombuffer(self.raw, dtype=dt, count=1, offset=22)[0]
         self.assertEqual(int(rec["icao"]), 0x4840D6)
         self.assertEqual(rec["callsign"], b"KLM1023 ")

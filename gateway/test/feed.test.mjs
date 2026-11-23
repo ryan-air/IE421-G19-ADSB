@@ -11,10 +11,11 @@ import { FrameFlags, FrameKind, TrackTable, decodeFrame, encodeFrameHeader, toAi
 import { ApplyResult, FeedBook, PacketKind, SnapshotParser, bookDigest, encodeRetransmitRequest, parsePacket } from '../src/feed.mjs';
 import { repoRoot } from '../src/gateway.mjs';
 import { S1, heartbeat, packet, serializeSnapshot, trackDelete, trackUpdate } from './helpers.mjs';
+import { TrackUpdateSize } from '../../protocol/generated/feed_messages.mjs';
 
 test('the golden packet parses like the generated decoders say', () => {
-  const raw = readFileSync(join(repoRoot, 'protocol', 'golden', 'packet_v0.bin'));
-  const expected = JSON.parse(readFileSync(join(repoRoot, 'protocol', 'golden', 'packet_v0.json'), 'utf8'));
+  const raw = readFileSync(join(repoRoot, 'protocol', 'golden', 'packet_v1.bin'));
+  const expected = JSON.parse(readFileSync(join(repoRoot, 'protocol', 'golden', 'packet_v1.json'), 'utf8'));
   const p = parsePacket(raw);
   assert.ok(p);
   assert.equal(p.session, expected.header.session);
@@ -59,11 +60,11 @@ test('book: updates, deletes, unknown types, malformed, longer messages', () => 
   const book = new FeedBook();
   assert.equal(book.apply(trackUpdate({ icao: 5, alt: 100 })), ApplyResult.kUpdate);
   assert.equal(book.apply(Buffer.concat([trackUpdate({ icao: 6 }), Buffer.from([9, 9])])), ApplyResult.kUpdate);
-  assert.equal(book.tracks.get(6).length, 64, 'appended fields are not stored');
+  assert.equal(book.tracks.get(6).length, 72, 'appended fields are not stored');
   assert.equal(book.apply(trackDelete(5)), ApplyResult.kDelete);
   assert.equal(book.apply(trackDelete(5)), ApplyResult.kDeleteUnknown);
   assert.equal(book.apply(Buffer.from([0x51, 0])), ApplyResult.kUnknownType);
-  assert.equal(book.apply(trackUpdate({ icao: 1 }).subarray(0, 63)), ApplyResult.kMalformed);
+  assert.equal(book.apply(trackUpdate({ icao: 1 }).subarray(0, 71)), ApplyResult.kMalformed);
   assert.equal(book.apply(Buffer.alloc(0)), ApplyResult.kMalformed);
   assert.equal(book.size, 1);
 });
@@ -150,17 +151,18 @@ test('snapshot parser rejects every malformed stream', () => {
   book.apply(trackUpdate({ icao: 4 }));
   const unsorted = serializeSnapshot(S1, 1, book);
   // serializeSnapshot sorts; swap the two track blocks by hand.
-  const a = unsorted.subarray(10 + 26, 10 + 26 + 66);
-  const b = unsorted.subarray(10 + 26 + 66, 10 + 26 + 132);
-  const swapped = Buffer.concat([unsorted.subarray(0, 36), b, a, unsorted.subarray(10 + 26 + 132)]);
+  const blk = 2 + TrackUpdateSize; // u16 length + TrackUpdate
+  const a = unsorted.subarray(10 + 26, 10 + 26 + blk);
+  const b = unsorted.subarray(10 + 26 + blk, 10 + 26 + 2 * blk);
+  const swapped = Buffer.concat([unsorted.subarray(0, 36), b, a, unsorted.subarray(10 + 26 + 2 * blk)]);
   assert.match(run(swapped), /order/);
   // The same ICAO twice (strictly increasing means no repeats).
   const dupBook = new FeedBook();
   dupBook.apply(trackUpdate({ icao: 4 }));
   dupBook.apply(trackUpdate({ icao: 5 }));
   const twoTracks = serializeSnapshot(S1, 1, dupBook);
-  const first = twoTracks.subarray(36, 36 + 66);
-  const dup = Buffer.concat([twoTracks.subarray(0, 36), first, first, twoTracks.subarray(36 + 132)]);
+  const first = twoTracks.subarray(36, 36 + blk);
+  const dup = Buffer.concat([twoTracks.subarray(0, 36), first, first, twoTracks.subarray(36 + 2 * blk)]);
   assert.match(run(dup), /order/);
   // Bytes fed after done.
   const p = new SnapshotParser();
@@ -176,7 +178,7 @@ test('gateway frames round-trip and the table follows them', () => {
     b.writeUInt16LE(n);
     return b;
   };
-  const snap = Buffer.concat([encodeFrameHeader(FrameKind.kSnapshot, 0, 2, 10), len(64), u1, len(64), u2]);
+  const snap = Buffer.concat([encodeFrameHeader(FrameKind.kSnapshot, 0, 2, 10), len(72), u1, len(72), u2]);
   const table = new TrackTable();
   assert.equal(table.apply(decodeFrame(snap)), null);
   assert.equal(table.tracks.size, 2);
@@ -193,7 +195,17 @@ test('gateway frames round-trip and the table follows them', () => {
   assert.equal(a.speed, null);
   assert.equal(a.track, null);
   assert.equal(a.seen, 5);
+  assert.equal(a.heading, null);
+  assert.equal(a.heading_ref, null);
+  assert.equal(a.airspeed, null);
+  assert.equal(a.adsb_version, null);
   assert.doesNotThrow(() => JSON.stringify(a));
+  // Feed v1 fields: heading 0.01 deg, airspeed kt, references in flags bits 4/5.
+  const v1 = toAircraft(trackUpdate({ icao: 1, lat: 40, lon: -88, nic: 8, version: 2, flags: 16 | 32, heading: 27140, airspeed: 452 }));
+  assert.deepEqual([v1.heading, v1.heading_ref, v1.airspeed, v1.airspeed_type, v1.nic, v1.adsb_version],
+    [271.4, 'true', 452, 'tas', 8, 2]);
+  const v1b = toAircraft(trackUpdate({ icao: 1, nic: 8, heading: 9000, airspeed: 300 }));
+  assert.deepEqual([v1b.heading_ref, v1b.airspeed_type, v1b.nic], ['magnetic', 'ias', null], 'no position: no nic');
   // Malformed frames.
   assert.throws(() => decodeFrame(snap.subarray(0, 15)), RangeError);
   assert.throws(() => decodeFrame(snap.subarray(0, snap.length - 1)), RangeError);

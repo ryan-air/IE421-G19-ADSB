@@ -292,7 +292,7 @@ DF17 type codes decoded:
 
 Byte order: **little-endian for our own ADS-B messages**, a deliberate deviation recorded in the spec. **ITCH payloads (§14) are carried unchanged in their native big-endian form**, because MoldUDP64 is ITCH's real transport, so the framing layer is shared exactly.
 
-**`TrackUpdate` (64 bytes, fixed). Draft layout:**
+**`TrackUpdate` (64 bytes, fixed). Draft layout** (superseded: feed v1 is 72 bytes, with heading, airspeed, `nic` and `adsb_version`; the current table is in `protocol/feed_spec.md` §3):
 | Offset | Field | Type | Unit |
 |---|---|---|---|
 | 0 | `msg_type` | u8 | `'U'` |

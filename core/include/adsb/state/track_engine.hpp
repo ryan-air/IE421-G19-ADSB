@@ -243,6 +243,10 @@ class BasicTrackEngine {
     if (h.valid & kHasSquawk) u.squawk = h.squawk;
     if (h.valid & kHasCallsign) std::memcpy(u.callsign.data(), c.callsign, 8);
     if (h.valid & kHasCategory) u.category = h.category;
+    if (h.valid & kHasHeading) u.heading_cdeg = c.heading_cdeg;
+    if (h.valid & kHasAirspeed) u.airspeed_kt = c.airspeed_kt;
+    if (h.valid & kHasPosition) u.nic = c.nic;
+    u.adsb_version = c.adsb_version;
     u.flags = h.wire_flags;
     return u;
   }
@@ -291,6 +295,17 @@ class BasicTrackEngine {
     }
   }
 
+  // Sets or clears a TrackFlags bit that qualifies a field, reporting a
+  // change under that field's `mask_bit`. Callers set it only while the
+  // field is known.
+  static void set_flag(HotTrack& h, std::uint8_t flag, bool on, std::uint16_t& mask,
+                       std::uint16_t mask_bit) noexcept {
+    const std::uint8_t want = on ? flag : 0;
+    if ((h.wire_flags & flag) == want) return;
+    h.wire_flags = static_cast<std::uint8_t>((h.wire_flags & ~flag) | want);
+    mask |= mask_bit;
+  }
+
   void apply_fields(HotTrack& h, ColdTrack& c, const modes::DecodedMsg& m, std::uint64_t rx,
                     std::uint16_t& mask) noexcept {
     namespace um = protocol::update_mask;
@@ -306,7 +321,8 @@ class BasicTrackEngine {
     }
 
     const bool has_vel = m.has(modes::kFieldGroundSpeed) || m.has(modes::kFieldTrack) ||
-                         m.has(modes::kFieldVerticalRate);
+                         m.has(modes::kFieldVerticalRate) || m.has(modes::kFieldHeading) ||
+                         m.has(modes::kFieldAirspeed);
     if (has_vel && fresh(h.vel_ts_ns, rx)) {
       if (m.has(modes::kFieldGroundSpeed)) {
         const auto gs = static_cast<std::uint16_t>(
@@ -321,6 +337,42 @@ class BasicTrackEngine {
       if (m.has(modes::kFieldVerticalRate)) {
         const auto vr = static_cast<std::int16_t>(std::clamp(m.vertical_rate_fpm, -32767, 32767));
         set_field(h.vrate_fpm, vr, h.valid, kHasVerticalRate, mask, um::kVerticalRate);
+      }
+      if (m.has(modes::kFieldHeading)) {
+        auto hd = static_cast<std::uint16_t>(std::lround(static_cast<double>(m.heading_deg) * 100.0));
+        if (hd >= 36000) hd = 0;
+        set_field(c.heading_cdeg, hd, h.valid, kHasHeading, mask, um::kHeading);
+        set_flag(h, tf::kHeadingTrue, c.heading_true_north, mask, um::kHeading);
+      }
+      if (m.has(modes::kFieldAirspeed)) {
+        const auto as = static_cast<std::uint16_t>(
+            std::min<long>(65534, std::lround(static_cast<double>(m.airspeed_kt))));
+        set_field(c.airspeed_kt, as, h.valid, kHasAirspeed, mask, um::kAirspeed);
+        set_flag(h, tf::kAirspeedTrue, m.airspeed_true, mask, um::kAirspeed);
+      }
+    }
+
+    // Operational status (TC 31) from an ADS-B source (DF17, or DF18 CF 0/1;
+    // not TIS-B or ADS-R rebroadcasts): version, NIC supplements A and C,
+    // and the heading reference. They apply to later positions only; the
+    // current position's NIC was fixed at receipt, as in readsb.
+    if (m.has(modes::kFieldOpStatus) && (m.df == 17 || (m.df == 18 && m.ca <= 1)) &&
+        fresh(c.opstatus_ts_ns, rx)) {
+      const modes::OperationalStatus& os = m.op_status;
+      if (c.adsb_version != os.version) {
+        c.adsb_version = os.version;
+        mask |= um::kIntegrity;
+      }
+      if (os.version == 1 || os.version == 2) {  // 3-7 are reserved
+        c.nic_a = os.nic_supplement_a;
+        c.nic_a_ts_ns = rx;
+        if (os.nic_supplement_c_valid) {
+          c.nic_c = os.nic_supplement_c;
+          c.nic_c_ts_ns = rx;
+        }
+        // The wire flag shows the reference only once there is a heading.
+        c.heading_true_north = os.heading_true_north;
+        if (h.valid & kHasHeading) set_flag(h, tf::kHeadingTrue, c.heading_true_north, mask, um::kHeading);
       }
     }
 
@@ -377,7 +429,12 @@ class BasicTrackEngine {
       ++stats_.out_of_order;
       return;
     }
-    slot = CprSlot{m.cpr, rx, true, surface};
+    // Supplements expire like readsb's (TRACK_EXPIRE, 60 s after the last TC 31).
+    constexpr std::uint64_t kSupplementTtlNs = 60'000'000'000ULL;
+    const unsigned version = c.adsb_version == 0xFF ? 0u : c.adsb_version;
+    const bool nic_a = c.nic_a && rx <= c.nic_a_ts_ns + kSupplementTtlNs;
+    const bool nic_c = c.nic_c && rx <= c.nic_c_ts_ns + kSupplementTtlNs;
+    slot = CprSlot{m.cpr, rx, true, surface, modes::position_nic(m.tc, version, nic_a, m.nic_supplement_b, nic_c)};
 
     const std::uint64_t window = surface ? cfg_.surface_pair_window_ns : cfg_.cpr_pair_window_ns;
     const bool have_pos = (h.valid & kHasPosition) != 0;
@@ -385,6 +442,7 @@ class BasicTrackEngine {
 
     std::optional<modes::LatLon> fix;
     bool global = false;
+    bool track_relative = false;  // local decode against the track's own position
 
     // 1. Global decode from an even/odd pair.
     if (other.valid && other.surface == surface && rx - other.ts_ns <= window) {
@@ -402,6 +460,7 @@ class BasicTrackEngine {
     if (!fix && have_pos && rx - h.pos_ts_ns <= cfg_.local_decode_max_age_ns &&
         ((h.wire_flags & protocol::track_flags::kSurfacePosition) != 0) == surface) {
       fix = surface ? modes::cpr_local_surface(m.cpr, prev) : modes::cpr_local_airborne(m.cpr, prev);
+      track_relative = fix.has_value();
     }
     // 3. Surface positions only: local decode against the receiver.
     if (!fix && surface && cfg_.has_receiver) {
@@ -433,6 +492,14 @@ class BasicTrackEngine {
     const auto lat_e7 = static_cast<std::int32_t>(std::lround(fix->lat * 1e7));
     const auto lon_e7 = static_cast<std::int32_t>(std::lround(fix->lon * 1e7));
     if (!have_pos || lat_e7 != h.lat_e7 || lon_e7 != h.lon_e7) mask |= protocol::update_mask::kPosition;
+    // As in readsb: a global fix rests on both frames, a local one against
+    // the track on this frame and the track's position (the weaker NIC
+    // counts); a local one against the receiver on this frame alone.
+    const std::uint8_t nic = global           ? std::min(slot.nic, other.nic)
+                             : track_relative ? std::min(slot.nic, c.nic)
+                                              : slot.nic;
+    if (nic != c.nic) mask |= protocol::update_mask::kIntegrity;
+    c.nic = nic;
     h.lat_e7 = lat_e7;
     h.lon_e7 = lon_e7;
     h.valid |= kHasPosition;

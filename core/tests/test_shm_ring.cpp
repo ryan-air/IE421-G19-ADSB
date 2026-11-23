@@ -53,11 +53,11 @@ struct HeapRing {
   ~HeapRing() { std::free(mem); }
 };
 
-// Message `seq`: 64 bytes, every 8-byte word derived from seq, so a torn copy
+// Message `seq`: a full slot (72 bytes), every 8-byte word derived from seq, so a torn copy
 // (words from two different messages) is detectable.
 std::vector<std::uint8_t> pattern(std::uint64_t seq) {
-  std::vector<std::uint8_t> m(64);
-  for (std::uint64_t i = 0; i < 8; ++i) {
+  std::vector<std::uint8_t> m(kShmMaxMessage);
+  for (std::uint64_t i = 0; i < kShmMaxMessage / 8; ++i) {
     const std::uint64_t w = seq * 0x9E3779B97F4A7C15ULL ^ (i << 56);
     std::memcpy(m.data() + 8 * i, &w, 8);
   }
@@ -65,7 +65,7 @@ std::vector<std::uint8_t> pattern(std::uint64_t seq) {
 }
 bool matches(std::uint64_t seq, const std::uint8_t* m) {
   const auto p = pattern(seq);
-  return std::memcmp(p.data(), m, 64) == 0;
+  return std::memcmp(p.data(), m, kShmMaxMessage) == 0;
 }
 
 std::string unique_name(const char* tag) {
@@ -75,13 +75,13 @@ std::string unique_name(const char* tag) {
 
 TEST(ShmRing, WritesAreReadInOrderAndEmptyUntilWritten) {
   HeapRing r(8);
-  std::uint8_t buf[64];
+  std::uint8_t buf[kShmMaxMessage];
   std::size_t len = 0;
   EXPECT_EQ(r.view.read(1, buf, len), Read::kEmpty);
-  for (std::uint64_t s = 1; s <= 5; ++s) r.view.write(s, pattern(s).data(), 64);
+  for (std::uint64_t s = 1; s <= 5; ++s) r.view.write(s, pattern(s).data(), kShmMaxMessage);
   for (std::uint64_t s = 1; s <= 5; ++s) {
     ASSERT_EQ(r.view.read(s, buf, len), Read::kOk) << s;
-    EXPECT_EQ(len, 64u);
+    EXPECT_EQ(len, kShmMaxMessage);
     EXPECT_TRUE(matches(s, buf));
   }
   EXPECT_EQ(r.view.read(6, buf, len), Read::kEmpty);
@@ -94,7 +94,7 @@ TEST(ShmRing, ShortMessagesKeepTheirLength) {
   HeapRing r(4);
   const std::uint8_t del[16] = {'D', 0, 1, 0, 7, 0, 0, 0};
   r.view.write(1, del, sizeof del);
-  std::uint8_t buf[64];
+  std::uint8_t buf[kShmMaxMessage];
   std::size_t len = 0;
   ASSERT_EQ(r.view.read(1, buf, len), Read::kOk);
   EXPECT_EQ(len, 16u);
@@ -103,8 +103,8 @@ TEST(ShmRing, ShortMessagesKeepTheirLength) {
 
 TEST(ShmRing, ALappedReaderIsToldSoNeverGivenNewerData) {
   HeapRing r(8);
-  for (std::uint64_t s = 1; s <= 20; ++s) r.view.write(s, pattern(s).data(), 64);
-  std::uint8_t buf[64];
+  for (std::uint64_t s = 1; s <= 20; ++s) r.view.write(s, pattern(s).data(), kShmMaxMessage);
+  std::uint8_t buf[kShmMaxMessage];
   std::size_t len = 0;
   EXPECT_EQ(r.view.read(3, buf, len), Read::kLapped) << "slot 3 now holds 19";
   EXPECT_EQ(r.view.read(12, buf, len), Read::kLapped) << "an 8-slot ring holds 13..20";
@@ -116,11 +116,11 @@ TEST(ShmRing, ALappedReaderIsToldSoNeverGivenNewerData) {
 
 TEST(ShmRing, ASlotBeingWrittenReadsAsEmptyAndALaterBusyOneAsLapped) {
   HeapRing r(4);
-  r.view.write(1, pattern(1).data(), 64);
+  r.view.write(1, pattern(1).data(), kShmMaxMessage);
   // Simulate the writer midway through message 2, then midway through 6 (slot 2 again).
   auto* slot = reinterpret_cast<ShmSlot*>(static_cast<std::uint8_t*>(r.mem) + kShmHeaderBytes);
   slot[2].seq.store(kShmBusy | 2, std::memory_order_relaxed);
-  std::uint8_t buf[64];
+  std::uint8_t buf[kShmMaxMessage];
   std::size_t len = 0;
   EXPECT_EQ(r.view.read(2, buf, len), Read::kEmpty);
   slot[2].seq.store(kShmBusy | 6, std::memory_order_relaxed);
@@ -131,14 +131,14 @@ TEST(ShmRing, ASlotBeingWrittenReadsAsEmptyAndALaterBusyOneAsLapped) {
   // helper moves forward.
   EXPECT_EQ(r.view.next_seq(), 2u);
   EXPECT_EQ(r.view.resume_after_lap(2), 3u);
-  for (std::uint64_t s = 2; s <= 9; ++s) r.view.write(s, pattern(s).data(), 64);
+  for (std::uint64_t s = 2; s <= 9; ++s) r.view.write(s, pattern(s).data(), kShmMaxMessage);
   EXPECT_EQ(r.view.resume_after_lap(2), 10u) << "normally the head";
 }
 
 TEST(ShmRing, EndOfSessionIsVisible) {
   HeapRing r(4);
   EXPECT_EQ(r.view.ended(), 0u);
-  r.view.write(1, pattern(1).data(), 64);
+  r.view.write(1, pattern(1).data(), kShmMaxMessage);
   r.view.end(2);
   EXPECT_EQ(r.view.ended(), 2u);
 }
@@ -159,7 +159,7 @@ TEST(ShmRing, NoTornReadsUnderConcurrencyAndLapsAreDetected) {
     readers.emplace_back([&, t] {
       while (!go.load()) {}
       std::uint64_t expect = 1, last = 0;
-      std::uint8_t buf[64];
+      std::uint8_t buf[kShmMaxMessage];
       std::size_t len = 0;
       while (expect <= kMessages) {
         const Read res = r.view.read(expect, buf, len);
@@ -183,7 +183,7 @@ TEST(ShmRing, NoTornReadsUnderConcurrencyAndLapsAreDetected) {
     });
   }
   go = true;
-  for (std::uint64_t s = 1; s <= kMessages; ++s) r.view.write(s, pattern(s).data(), 64);
+  for (std::uint64_t s = 1; s <= kMessages; ++s) r.view.write(s, pattern(s).data(), kShmMaxMessage);
   for (auto& th : readers) th.join();
   std::uint64_t ok = 0, laps = 0;
   for (const auto& c : counts) {
@@ -202,12 +202,12 @@ TEST(ShmRegion, CreateOpenAndValidate) {
   std::string err;
   ShmRegion w;
   ASSERT_TRUE(w.create(name, 16, kS1, 1, &err)) << err;
-  w.view().write(1, pattern(1).data(), 64);
+  w.view().write(1, pattern(1).data(), kShmMaxMessage);
   ShmRegion rd;
   ASSERT_TRUE(rd.open(name, &err)) << err;
   EXPECT_EQ(rd.view().capacity(), 16u);
   EXPECT_EQ(rd.view().session(), kS1);
-  std::uint8_t buf[64];
+  std::uint8_t buf[kShmMaxMessage];
   std::size_t len = 0;
   ASSERT_EQ(rd.view().read(1, buf, len), Read::kOk);
   EXPECT_TRUE(matches(1, buf));
@@ -224,7 +224,7 @@ TEST(ShmRegion, ReplacementGetsANewInstanceAndOldReadersKeepTheirMapping) {
   std::string err;
   auto w1 = std::make_unique<ShmRegion>();
   ASSERT_TRUE(w1->create(name, 8, kS1, 1, &err)) << err;
-  w1->view().write(1, pattern(1).data(), 64);
+  w1->view().write(1, pattern(1).data(), kShmMaxMessage);
   w1->view().end(2);
   ShmRegion rd;
   ASSERT_TRUE(rd.open(name, &err)) << err;
@@ -232,7 +232,7 @@ TEST(ShmRegion, ReplacementGetsANewInstanceAndOldReadersKeepTheirMapping) {
   ShmRegion w2;
   ASSERT_TRUE(w2.create(name, 8, kS2, 1, &err)) << err;  // a restarted publisher
   EXPECT_NE(ShmRegion::current_instance(name), old_id);
-  std::uint8_t buf[64];
+  std::uint8_t buf[kShmMaxMessage];
   std::size_t len = 0;
   EXPECT_EQ(rd.view().read(1, buf, len), Read::kOk) << "the old mapping stays readable";
   EXPECT_EQ(rd.view().ended(), 2u);
@@ -257,7 +257,7 @@ TEST(ShmRegion, AnotherProcessReadsWhatThisOneWrites) {
     const char one = 1;
     if (::write(ready[1], &one, 1) != 1) ::_exit(13);
     std::uint64_t expect = 1, ok = 0;
-    std::uint8_t buf[64];
+    std::uint8_t buf[kShmMaxMessage];
     std::size_t len = 0;
     const auto deadline = std::chrono::steady_clock::now() + 20s;
     while (expect <= kN && std::chrono::steady_clock::now() < deadline) {
@@ -280,7 +280,7 @@ TEST(ShmRegion, AnotherProcessReadsWhatThisOneWrites) {
   ::close(ready[0]);
   ::close(ready[1]);
   for (std::uint64_t s = 1; s <= kN; ++s) {
-    w.view().write(s, pattern(s).data(), 64);
+    w.view().write(s, pattern(s).data(), kShmMaxMessage);
     if (s % 1024 == 0) std::this_thread::sleep_for(1ms);
   }
   int status = 0;
@@ -385,7 +385,7 @@ TEST(ShmOut, PublisherMessagesAppearWithTheirSequenceNumbers) {
   RingView v = p.region.view();
   EXPECT_EQ(v.next_seq(), 101u);
   EXPECT_EQ(v.ended(), 101u);
-  std::uint8_t buf[64];
+  std::uint8_t buf[kShmMaxMessage];
   std::size_t len = 0;
   FeedBook book;
   for (std::uint64_t s = 1; s <= 100; ++s) {

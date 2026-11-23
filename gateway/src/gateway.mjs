@@ -61,7 +61,7 @@ const u16le = (n) => {
   b.writeUInt16LE(n, 0);
   return b;
 };
-const kLen64 = u16le(64);
+const kLenUpdate = u16le(72); // TrackUpdate::kWireSize
 const kLen16 = u16le(kDeleteEntryBytes);
 
 function deleteMessage(icao) {
@@ -287,9 +287,9 @@ export class Gateway {
     const snapshot = c.needSnapshot;
     if (snapshot) {
       for (const u of tracks.values()) {
-        parts.push(kLen64, u);
+        parts.push(kLenUpdate, u);
         count++;
-        bytes += 66;
+        bytes += 2 + 72; // u16 length + TrackUpdate
       }
       c.needSnapshot = false;
       c.dirty.clear();
@@ -299,8 +299,8 @@ export class Gateway {
       for (const icao of c.dirty) {
         const u = tracks.get(icao);
         if (u) {
-          parts.push(kLen64, u);
-          bytes += 66;
+          parts.push(kLenUpdate, u);
+          bytes += 2 + 72; // u16 length + TrackUpdate
           const pub = Number(u.readBigUInt64LE(56));
           if (pub !== 0) this.lat.feed_to_ws.record(nowPub - pub);
         } else {

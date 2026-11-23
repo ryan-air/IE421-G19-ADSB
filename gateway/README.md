@@ -45,7 +45,7 @@ Endpoints: `/` serves the map, `/gateway/ws` is the WebSocket, `/gateway/stats` 
 
 Served by the Fall 2025 `server.js`, there is no protocol module, so the page polls as before.
 
-`/api/aircraft`, `/api/aircraft/:hex/trail` (from an in-memory ring of 200 positions per aircraft), `/api/statistics` and `/api/health` are answered from memory in the Fall 2025 JSON shapes. `/api/collisions/kalman` returns an empty list: the gateway does not run the Fall 2025 collision model.
+`/api/aircraft`, `/api/aircraft/:hex/trail` (from an in-memory ring of 200 positions per aircraft), `/api/statistics` and `/api/health` are answered from memory in the Fall 2025 JSON shapes. Aircraft objects also carry the feed v1 fields the Fall 2025 API did not have: `heading` (degrees) with `heading_ref` (`true`/`magnetic`), `airspeed` (kt) with `airspeed_type` (`tas`/`ias`), `nic` and `adsb_version` (null when unknown). `/api/collisions/kalman` returns an empty list: the gateway does not run the Fall 2025 collision model.
 
 Static files: only known file types are served, never dotfiles (`ads/.env` holds the database password) or `node_modules`, and nothing outside the map directory.
 

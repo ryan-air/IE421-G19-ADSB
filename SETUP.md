@@ -192,7 +192,7 @@ It takes about 20 minutes and needs about 2 GB of free disk. On the benchmark ho
 
 ## 6. Feed protocol and TLA+ model
 
-The feed's wire format is defined once in `protocol/schema/feed_v0.json`. After editing it, regenerate the C++, JavaScript, and Python code and run the cross-language tests, from the repository root:
+The feed's wire format is defined once in `protocol/schema/feed_v1.json`. After editing it, regenerate the C++, JavaScript, and Python code and run the cross-language tests, from the repository root:
 
 ```bash
 python3 protocol/gen.py
@@ -299,7 +299,7 @@ The source is mounted read-only and the build goes to `/tmp` inside the containe
 - **Every decoder change needs a test vector.** Published examples are best, otherwise synthetic frames with a corrected CRC (see `fix_parity` in `tests/test_decoder.cpp`).
 - **Anything with threads or atomics must pass `tsan`.**
 - **Track engine changes:** run `scripts/check-determinism.sh` and the `EndToEnd` tests, which compare engine output against the synthetic generator's ground truth.
-- **Feed format changes:** edit `protocol/schema/feed_v0.json`, never the generated files, then run `python3 protocol/gen.py`.
+- **Feed format changes:** edit `protocol/schema/feed_v1.json`, never the generated files, then run `python3 protocol/gen.py`.
 
 ---
 

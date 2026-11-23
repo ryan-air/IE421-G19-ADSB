@@ -33,6 +33,7 @@ namespace {
                "  --no-flush        do not expire the remaining tracks after the last record\n"
                "  --allow-truncated read a recording that has no footer (recorder was killed)\n"
                "  --hash-only       print only the output hash\n"
+               "  --fix             repair one wrong bit in DF17/18 frames (as readsb does by default)\n"
                "  --book-digest     also print the digest of the final track book (what a feed\n"
                "                    subscriber reconstructs; compare with adsb-publish --no-publish-ts)\n");
   std::exit(code);
@@ -53,7 +54,7 @@ int main(int argc, char** argv) {
   std::string path, out_path;
   adsb::replay::ReplayOptions opt;
   opt.flush_at_end = true;
-  bool pipeline = false, allow_truncated = false, hash_only = false, book_digest = false;
+  bool pipeline = false, allow_truncated = false, hash_only = false, book_digest = false, fix = false;
   int reader_cpu = -1, worker_cpu = -1;
 
   for (int i = 1; i < argc; ++i) {
@@ -77,6 +78,7 @@ int main(int argc, char** argv) {
     else if (a == "--no-flush") opt.flush_at_end = false;
     else if (a == "--allow-truncated") allow_truncated = true;
     else if (a == "--hash-only") hash_only = true;
+    else if (a == "--fix") fix = true;
     else if (a == "--book-digest") book_digest = true;
     else if (!a.empty() && a[0] == '-') {
       std::fprintf(stderr, "adsb-replay: unknown option %s\n", a.c_str());
@@ -94,6 +96,7 @@ int main(int argc, char** argv) {
   }
 
   adsb::state::EngineConfig ecfg;
+  ecfg.fix_single_bit = fix;
   if (rd.info().has_receiver_position) {
     ecfg.has_receiver = true;
     ecfg.receiver_lat = rd.info().receiver_lat;
@@ -146,6 +149,7 @@ int main(int argc, char** argv) {
               r.wall_seconds > 0 ? static_cast<double>(r.records) / r.wall_seconds : 0.0);
   std::printf("frames      bad %llu, duplicates %llu, out-of-order %llu, A/P accepted %llu / rejected %llu\n",
               u(s.bad_frames), u(s.duplicates), u(s.out_of_order), u(s.ap_accepted), u(s.ap_rejected));
+  if (fix) std::printf("corrected   %llu frames (one bit repaired), %llu of them dropped (no confirmed track)\n", u(s.corrected), u(s.corrected_rejected));
   std::printf("positions   global %llu, local %llu, unresolved %llu, rejected %llu, re-anchored %llu\n",
               u(s.cpr_global), u(s.cpr_local), u(s.cpr_unresolved), u(s.cpr_rejected), u(s.cpr_reanchored));
   std::printf("tracks      created %llu, expired %llu, live %zu, table full %llu\n", u(s.tracks_created),

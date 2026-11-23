@@ -80,6 +80,77 @@ TEST(TrackEngine, CorruptedFramesNeverCreateTracks) {
   EXPECT_GT(e->stats().bad_frames, 19'000u);
 }
 
+// With single-bit repair one wrong bit no longer loses the frame, and it
+// still never invents an aircraft: every repaired frame is the real one.
+TEST(TrackEngine, SingleBitRepairRecoversFramesWithoutPhantoms) {
+  EngineConfig cfg;
+  cfg.fix_single_bit = true;
+  cfg.dedup_window_ns = 0;
+  auto e = std::make_unique<TrackEngine>(cfg);
+  CollectSink sink;
+  Rng rng(9);
+  int format_flips = 0;
+  // A clean frame confirms the aircraft first: repaired frames only update.
+  feed(*e, modes::encode_identification(kIcao, "TEST123 ", 0xA3), 50'000'000ULL, sink);
+  for (int i = 0; i < 20'000; ++i) {
+    modes::Frame f = modes::encode_identification(kIcao, "TEST123 ", 0xA3);
+    const auto bit = rng.below(112);
+    format_flips += bit < 5;
+    f.bytes[bit / 8] ^= static_cast<std::uint8_t>(0x80u >> (bit % 8));
+    feed(*e, f, (100 + static_cast<std::uint64_t>(i)) * 1'000'000ULL, sink);
+  }
+  EXPECT_EQ(e->track_count(), 1u);
+  EXPECT_EQ(e->stats().corrected, 20'000u - static_cast<std::uint64_t>(format_flips));
+  EXPECT_EQ(e->stats().corrected_rejected, 0u);
+  for (const auto& u : sink.updates) EXPECT_EQ(u.icao, kIcao);
+  ASSERT_FALSE(sink.updates.empty());
+  EXPECT_EQ(std::string(sink.updates.front().callsign.data(), 8), "TEST123 ");
+  // Off (the default), the same frames are all lost.
+  auto off = std::make_unique<TrackEngine>();
+  modes::Frame f = modes::encode_identification(kIcao, "TEST123 ", 0xA3);
+  f.bytes[9] ^= 0x04;
+  feed(*off, f, kSec, sink);
+  EXPECT_EQ(off->track_count(), 0u);
+  EXPECT_EQ(off->stats().corrected, 0u);
+}
+
+// Any frame one bit away from a valid one passes a repair, so garbage gets
+// through 107 times more often (about 6 in a million random DF17 frames
+// here): a repaired frame must never create or confirm a track.
+TEST(TrackEngine, RepairedFramesNeverCreateTracks) {
+  EngineConfig cfg;
+  cfg.fix_single_bit = true;
+  auto e = std::make_unique<TrackEngine>(cfg);
+  CollectSink sink;
+  Rng rng(21);
+  for (int i = 0; i < 1'000'000; ++i) {
+    std::uint8_t f[14];
+    for (auto& b : f) b = static_cast<std::uint8_t>(rng.below(256));
+    f[0] = static_cast<std::uint8_t>(0x88 | (f[0] & 0x07));  // DF17
+    FrameMeta meta;
+    meta.rx_ns = (100 + static_cast<std::uint64_t>(i)) * 1'000'000ULL;
+    e->on_frame(f, 14, meta, sink);
+  }
+  EXPECT_GT(e->stats().corrected_rejected, 0u);  // some garbage did "repair"
+  EXPECT_EQ(e->track_count(), 0u);
+  EXPECT_TRUE(sink.updates.empty());
+}
+
+// The same transmission clean on one line and repaired on another is a duplicate.
+TEST(TrackEngine, ARepairedCopyOfAFrameIsADuplicate) {
+  EngineConfig cfg;
+  cfg.fix_single_bit = true;
+  auto e = std::make_unique<TrackEngine>(cfg);
+  CollectSink sink;
+  const modes::Frame clean = modes::encode_identification(kIcao, "TEST123 ", 0xA3);
+  feed(*e, clean, kSec, sink, 0);
+  modes::Frame bad = clean;
+  bad.bytes[9] ^= 0x04;
+  feed(*e, bad, kSec + 1000, sink, 1);
+  EXPECT_EQ(e->stats().corrected, 1u);
+  EXPECT_EQ(e->stats().duplicates, 1u);
+}
+
 TEST(TrackEngine, DuplicatesAreDropped) {
   auto e = std::make_unique<TrackEngine>();
   CollectSink sink;

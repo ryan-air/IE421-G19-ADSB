@@ -67,6 +67,7 @@ void on_signal(int) { g_stop.store(true); }
                "  --busy-poll           spin on the socket instead of poll() (lowest latency, uses a core)\n"
                "  --cpus I,S[,R]        pin ingest, state, recorder threads (Linux only)\n"
                "  --line N              receiver line id to stamp on frames (default 0)\n"
+               "  --fix                 repair one wrong bit in DF17/18 frames (readsb's output is already repaired)\n"
                "IQ input (our demodulator instead of readsb; README_UPDATES.md §5):\n"
                "  --iq PATH             IQ samples: NAME.sigmf-meta / .sigmf-data (format and rate from the\n"
                "                        metadata), a raw file, or - for stdin; adsb-live stops at its end\n"
@@ -229,6 +230,7 @@ int main(int argc, char** argv) {
     else if (a == "--iq-speed") iq_cfg.speed = std::strtod(val().c_str(), nullptr);
     else if (a == "--iq-fix") iq_cfg.demod.fix_single_bit = true;
     else if (a == "--iq-drop") iq_cfg.drop_when_full = true;
+    else if (a == "--fix") eng_cfg.fix_single_bit = true;
     else if (a == "--line") src_cfg.line = static_cast<std::uint8_t>(std::strtol(val().c_str(), nullptr, 10) & 0xF);
     else if (a == "--receiver") {
       const std::string v = val();
@@ -597,6 +599,7 @@ int main(int argc, char** argv) {
   }
   std::printf("engine      %llu frames, %llu bad, %llu duplicates, A/P accepted %llu / rejected %llu\n",
               u(es.frames), u(es.bad_frames), u(es.duplicates), u(es.ap_accepted), u(es.ap_rejected));
+  if (eng_cfg.fix_single_bit) std::printf("corrected   %llu frames (one bit repaired), %llu of them dropped (no confirmed track)\n", u(es.corrected), u(es.corrected_rejected));
   std::printf("positions   global %llu, local %llu, unresolved %llu, rejected %llu\n", u(es.cpr_global),
               u(es.cpr_local), u(es.cpr_unresolved), u(es.cpr_rejected));
   std::printf("tracks      created %llu, expired %llu, live %zu\n", u(es.tracks_created), u(es.tracks_expired),

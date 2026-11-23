@@ -58,6 +58,10 @@ struct EngineConfig {
   // A position is replaced after this many consecutive rejected *global*
   // fixes: with 2, the third disagreeing global fix is accepted.
   std::uint8_t reanchor_after_rejects = 2;
+  // Repair one wrong bit in DF17/18 frames (modes::DecodeOptions; readsb
+  // does it by default). Off: a corrupted frame is dropped. A repaired
+  // frame only updates an already confirmed track (it never creates one).
+  bool fix_single_bit = false;
 };
 
 // Information about the frame that is not in DecodedMsg.
@@ -71,6 +75,8 @@ struct FrameMeta {
 struct EngineStats {
   std::uint64_t frames = 0;
   std::uint64_t bad_frames = 0;          // bad CRC / length / unknown format
+  std::uint64_t corrected = 0;           // DF17/18 frames with one bit repaired (fix_single_bit)
+  std::uint64_t corrected_rejected = 0;  // ... of which no confirmed track had the address: dropped
   std::uint64_t ap_accepted = 0;
   std::uint64_t ap_rejected = 0;         // Address/Parity with no confirmed track
   std::uint64_t duplicates = 0;
@@ -103,9 +109,18 @@ class BasicTrackEngine {
   template <typename Sink>
   void on_frame(const std::uint8_t* frame, std::size_t len, const FrameMeta& meta, Sink& sink) {
     modes::DecodedMsg m;
-    const modes::DecodeStatus st = modes::decode(frame, len, m);
+    const modes::DecodeStatus st = modes::decode(frame, len, m, modes::DecodeOptions{cfg_.fix_single_bit});
     FrameMeta mm = meta;
-    mm.payload_hash = payload_hash(frame, len);
+    if (m.corrected_bit >= 0 && len == 14) {
+      // Hash the repaired frame, so a clean copy of the same transmission
+      // (another receiver line) and this one are duplicates of each other.
+      std::uint8_t fixed[14];
+      std::memcpy(fixed, frame, 14);
+      fixed[m.corrected_bit / 8] = static_cast<std::uint8_t>(fixed[m.corrected_bit / 8] ^ (0x80u >> (m.corrected_bit % 8)));
+      mm.payload_hash = payload_hash(fixed, len);
+    } else {
+      mm.payload_hash = payload_hash(frame, len);
+    }
     on_decoded(st, m, mm, sink);
   }
 
@@ -115,6 +130,7 @@ class BasicTrackEngine {
   template <typename Sink>
   void on_decoded(modes::DecodeStatus st, const modes::DecodedMsg& m, const FrameMeta& meta, Sink& sink) {
     ++stats_.frames;
+    if (m.corrected_bit >= 0) ++stats_.corrected;
     advance(meta.rx_ns, sink);
 
     TrackRef t;
@@ -122,6 +138,14 @@ class BasicTrackEngine {
     switch (st) {
       case modes::DecodeStatus::kOk:
         t = store_.find(m.icao);
+        // A repaired frame is about as trustworthy as an Address/Parity one
+        // (any frame one bit away from a valid one "passes": 107 times more
+        // garbage gets through), so, as in readsb, it only updates a track a
+        // clean frame already confirmed; it never creates or confirms one.
+        if (m.corrected_bit >= 0 && (!t || !(t.hot->valid & kConfirmed))) {
+          ++stats_.corrected_rejected;
+          return;
+        }
         if (!t) {
           t = store_.insert(m.icao);
           if (!t) {

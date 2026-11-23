@@ -4,7 +4,9 @@
 
 #include <cstdint>
 #include <random>
+#include <initializer_list>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "adsb/modes/crc24.hpp"
@@ -401,6 +403,349 @@ TEST(Decoder, RandomValidFramesStayInPhysicalRanges) {
     }
   }
   EXPECT_EQ(decoded, 200'000);
+}
+
+// ---------------------------------------------------------------------------
+// TC 29, TC 31, Comm-B, single-bit repair
+// ---------------------------------------------------------------------------
+
+// Sets frame bits [first, last] (1-indexed, inclusive) to v.
+void set_bits(std::vector<std::uint8_t>& f, unsigned first, unsigned last, std::uint64_t v) {
+  for (unsigned b = last + 1; b-- > first;) {
+    const unsigned i = b - 1;
+    const auto mask = static_cast<std::uint8_t>(0x80u >> (i % 8));
+    f[i / 8] = static_cast<std::uint8_t>((v & 1u) ? (f[i / 8] | mask) : (f[i / 8] & ~mask));
+    v >>= 1;
+  }
+}
+
+// A DF17 frame from address 0xABCDEF with the given ME bits set (ME bit n
+// is frame bit 32 + n), parity fixed.
+std::vector<std::uint8_t> df17_with(std::initializer_list<std::tuple<unsigned, unsigned, std::uint64_t>> me) {
+  std::vector<std::uint8_t> f(14, 0);
+  set_bits(f, 1, 5, 17);
+  set_bits(f, 6, 8, 5);
+  set_bits(f, 9, 32, 0xABCDEF);
+  for (const auto& [a, z, v] : me) set_bits(f, 32 + a, 32 + z, v);
+  fix_parity(f);
+  return f;
+}
+
+DecodedMsg decode_vec(const std::vector<std::uint8_t>& f, DecodeStatus want = DecodeStatus::kOk) {
+  DecodedMsg m;
+  EXPECT_EQ(decode(f.data(), f.size(), m), want);
+  return m;
+}
+
+// pyModeS's target state and status example (CRC clean).
+TEST(Decoder, TargetStateAndStatusPublished) {
+  const auto m = decode_ok("8DA05629EA21485CBF3F8CADAEEB");
+  EXPECT_EQ(m.icao, 0xA05629u);
+  EXPECT_EQ(m.tc, 29);
+  EXPECT_EQ(m.subtype, 1);
+  ASSERT_TRUE(m.has(kFieldTargetState));
+  const TargetState& t = m.target;
+  EXPECT_EQ(t.valid, TargetState::kAltitude | TargetState::kBaro | TargetState::kHeading | TargetState::kModes);
+  EXPECT_EQ(t.selected_altitude_ft, 16992);
+  EXPECT_FALSE(t.altitude_from_fms);
+  EXPECT_NEAR(t.baro_setting_hpa, 1012.8, 1e-3);
+  EXPECT_NEAR(t.selected_heading_deg, 66.796875, 1e-4);
+  EXPECT_TRUE(t.autopilot);
+  EXPECT_TRUE(t.vnav);
+  EXPECT_FALSE(t.altitude_hold);
+  EXPECT_FALSE(t.approach);
+  EXPECT_TRUE(t.lnav);
+  EXPECT_TRUE(t.tcas_operational);
+  EXPECT_EQ(t.nac_p, 9);
+  EXPECT_TRUE(t.nic_baro);
+  EXPECT_EQ(t.sil, 3);
+  EXPECT_FALSE(t.sil_per_sample);
+}
+
+TEST(Decoder, TargetStateFieldsWithoutData) {
+  // Zero altitude and baro fields, heading and mode status bits clear: no
+  // values, but the frame still says what it can (TCAS, NACp, SIL).
+  auto m = decode_vec(df17_with({{1, 5, 29}, {6, 7, 1}, {8, 8, 1}, {9, 9, 1}, {40, 43, 10}, {45, 46, 2}, {53, 53, 1},
+                                 {48, 50, 7}}));
+  ASSERT_TRUE(m.has(kFieldTargetState));
+  EXPECT_EQ(m.target.valid, 0u);
+  EXPECT_FALSE(m.target.autopilot);  // mode bits ignored without their status bit
+  EXPECT_TRUE(m.target.tcas_operational);
+  EXPECT_TRUE(m.target.sil_per_sample);
+  EXPECT_EQ(m.target.nac_p, 10);
+  EXPECT_EQ(m.target.sil, 2);
+  // FMS source, lowest codes: 0 ft, 800 hPa, heading 0 and the top of the range.
+  m = decode_vec(df17_with({{1, 5, 29}, {6, 7, 1}, {9, 9, 1}, {10, 20, 1}, {21, 29, 1}, {30, 30, 1}, {31, 39, 511}}));
+  EXPECT_EQ(m.target.selected_altitude_ft, 0);
+  EXPECT_TRUE(m.target.altitude_from_fms);
+  EXPECT_NEAR(m.target.baro_setting_hpa, 800.0, 1e-4);
+  EXPECT_NEAR(m.target.selected_heading_deg, 511 * 180.0 / 256.0, 1e-4);
+  m = decode_vec(df17_with({{1, 5, 29}, {10, 20, 2047}, {21, 29, 511}}));  // subtype 0: DO-260A layout
+  EXPECT_EQ(m.subtype, 0);
+  EXPECT_FALSE(m.has(kFieldTargetState));
+  EXPECT_EQ(m.target.valid, 0u);
+  m = decode_vec(df17_with({{1, 5, 29}, {6, 7, 1}, {10, 20, 2047}}));
+  EXPECT_EQ(m.target.selected_altitude_ft, 2046 * 32);
+  // Each mode bit on its own (the published frame has several set at once).
+  m = decode_vec(df17_with({{1, 5, 29}, {6, 7, 1}, {47, 47, 1}, {54, 54, 1}}));
+  EXPECT_TRUE(m.target.lnav);
+  EXPECT_FALSE(m.target.tcas_operational || m.target.autopilot || m.target.vnav || m.target.altitude_hold || m.target.approach);
+  m = decode_vec(df17_with({{1, 5, 29}, {6, 7, 1}, {47, 47, 1}, {52, 52, 1}}));
+  EXPECT_TRUE(m.target.approach);
+  EXPECT_FALSE(m.target.lnav || m.target.tcas_operational || m.target.altitude_hold);
+  m = decode_vec(df17_with({{1, 5, 29}, {6, 7, 1}, {47, 47, 1}, {50, 50, 1}}));
+  EXPECT_TRUE(m.target.altitude_hold);
+  EXPECT_FALSE(m.target.vnav || m.target.approach);
+}
+
+TEST(Decoder, OperationalStatusAirborneVersion2) {
+  const auto m = decode_vec(df17_with({{1, 5, 31}, {6, 8, 0}, {9, 24, 0x002A}, {25, 40, 0x0300}, {41, 43, 2}, {44, 44, 1},
+                                       {45, 48, 9}, {49, 50, 2}, {51, 52, 3}, {53, 53, 1}, {54, 54, 1}, {55, 55, 1}}));
+  ASSERT_TRUE(m.has(kFieldOpStatus));
+  const OperationalStatus& o = m.op_status;
+  EXPECT_FALSE(o.surface);
+  EXPECT_EQ(o.version, 2);
+  EXPECT_EQ(o.capability, 0x002A);
+  EXPECT_EQ(o.operational_mode, 0x0300);
+  EXPECT_TRUE(o.nic_supplement_a);
+  EXPECT_EQ(o.nac_p, 9);
+  EXPECT_EQ(o.gva, 2);
+  EXPECT_EQ(o.sil, 3);
+  EXPECT_TRUE(o.nic_baro);
+  EXPECT_FALSE(o.heading_true_north);  // HRD 1 = magnetic north
+  EXPECT_TRUE(o.sil_per_sample);
+}
+
+TEST(Decoder, OperationalStatusSurfaceAndOlderVersions) {
+  // Surface, version 2: 12 capability bits, no GVA or NIC-baro (bit 53 is
+  // the track/heading flag there).
+  auto m = decode_vec(df17_with({{1, 5, 31}, {6, 8, 1}, {9, 24, 0xFFFF}, {41, 43, 2}, {45, 48, 8}, {49, 50, 3}, {53, 53, 1}}));
+  ASSERT_TRUE(m.has(kFieldOpStatus));
+  EXPECT_TRUE(m.op_status.surface);
+  EXPECT_EQ(m.op_status.capability, 0x0FFF);
+  EXPECT_EQ(m.op_status.nac_p, 8);
+  EXPECT_EQ(m.op_status.gva, 0);
+  EXPECT_FALSE(m.op_status.nic_baro);
+  // Version 1: no SIL supplement or GVA (bits 49-50 are BAQ).
+  m = decode_vec(df17_with({{1, 5, 31}, {41, 43, 1}, {45, 48, 7}, {49, 50, 3}, {55, 55, 1}}));
+  EXPECT_EQ(m.op_status.version, 1);
+  EXPECT_EQ(m.op_status.nac_p, 7);
+  EXPECT_EQ(m.op_status.gva, 0);
+  EXPECT_FALSE(m.op_status.sil_per_sample);
+  // Version 0: the rest of the field means something else.
+  m = decode_vec(df17_with({{1, 5, 31}, {41, 43, 0}, {45, 48, 7}, {51, 52, 3}}));
+  EXPECT_EQ(m.op_status.version, 0);
+  EXPECT_EQ(m.op_status.nac_p, 0);
+  EXPECT_EQ(m.op_status.sil, 0);
+  // Subtypes 2-7 are reserved.
+  m = decode_vec(df17_with({{1, 5, 31}, {6, 8, 2}, {41, 43, 2}}));
+  EXPECT_FALSE(m.has(kFieldOpStatus));
+}
+
+DecodedMsg decode_ap(const char* s) {
+  const auto f = hex(s);
+  DecodedMsg m;
+  EXPECT_EQ(decode(f.data(), f.size(), m), DecodeStatus::kAddressParity) << s;
+  EXPECT_TRUE(m.has(kFieldCommB)) << s;
+  return m;
+}
+
+// Published Comm-B replies (pyModeS test suite); the addresses recovered
+// from the parity are those of the aircraft that sent them.
+TEST(Decoder, CommBIdentification) {
+  auto m = decode_ap("A000083E202CC371C31DE0AA1CCF");
+  EXPECT_EQ(m.icao, 0x484163u);
+  EXPECT_TRUE(m.has(kFieldAltitude));  // the DF20 altitude is still decoded
+  EXPECT_EQ(m.comm_b.candidates, CommB::kBds20);
+  EXPECT_EQ(m.comm_b.bds, 0x20);
+  EXPECT_EQ(m.comm_b.valid, CommB::kCallsign);
+  EXPECT_EQ(std::string(m.comm_b.callsign, 8), "KLM1017 ");
+  EXPECT_FALSE(m.has(kFieldCallsign));  // Comm-B values stay out of the ADS-B fields
+  m = decode_ap("A0001993202422F2E37CE038738E");
+  EXPECT_EQ(m.icao, 0x4CA532u);
+  EXPECT_EQ(std::string(m.comm_b.callsign, 8), "IBK2873 ");
+}
+
+TEST(Decoder, CommBSelectedVerticalIntention) {
+  const auto m = decode_ap("A000029C85E42F313000007047D3");
+  EXPECT_EQ(m.comm_b.bds, 0x40);
+  EXPECT_EQ(m.comm_b.valid, CommB::kMcpAltitude | CommB::kFmsAltitude | CommB::kBaroSetting);
+  EXPECT_EQ(m.comm_b.mcp_altitude_ft, 3008);
+  EXPECT_EQ(m.comm_b.fms_altitude_ft, 3008);
+  EXPECT_NEAR(m.comm_b.baro_setting_hpa, 1020.0, 1e-3);
+}
+
+TEST(Decoder, CommBTrackAndTurn) {
+  const auto m = decode_ap("A000139381951536E024D4CCF6B5");
+  EXPECT_EQ(m.comm_b.bds, 0x50);
+  EXPECT_EQ(m.comm_b.valid, CommB::kRoll | CommB::kTrueTrack | CommB::kGroundSpeed | CommB::kTrackRate | CommB::kTrueAirspeed);
+  EXPECT_NEAR(m.comm_b.roll_deg, 2.109375, 1e-5);
+  EXPECT_NEAR(m.comm_b.true_track_deg, 114.2578125, 1e-4);
+  EXPECT_EQ(m.comm_b.ground_speed_kt, 438.0f);
+  EXPECT_NEAR(m.comm_b.track_rate_deg_s, 0.125, 1e-6);
+  EXPECT_EQ(m.comm_b.true_airspeed_kt, 424.0f);
+}
+
+TEST(Decoder, CommBHeadingAndSpeed) {
+  const auto m = decode_ap("A00004128F39F91A7E27C46ADC21");
+  EXPECT_EQ(m.comm_b.bds, 0x60);
+  EXPECT_NEAR(m.comm_b.magnetic_heading_deg, 42.71484375, 1e-4);
+  EXPECT_EQ(m.comm_b.indicated_airspeed_kt, 252.0f);
+  EXPECT_NEAR(m.comm_b.mach, 0.42, 1e-5);
+  EXPECT_EQ(m.comm_b.baro_vertical_rate_fpm, -1920);
+  EXPECT_EQ(m.comm_b.inertial_vertical_rate_fpm, -1920);
+}
+
+TEST(Decoder, CommBCapabilityReports) {
+  auto m = decode_ap("A800178D10010080F50000D5893C");  // DF21: the squawk is still decoded
+  EXPECT_TRUE(m.has(kFieldSquawk));
+  EXPECT_EQ(m.comm_b.bds, 0x10);
+  EXPECT_EQ(m.comm_b.valid, 0u);
+  m = decode_ap("A0000638FA81C10000000081A92F");
+  EXPECT_EQ(m.comm_b.bds, 0x17);
+}
+
+// MB fields built bit by bit (MB bit n = bit n of the 56-bit value, MSB first).
+CommB comm_b_of(std::initializer_list<std::tuple<unsigned, unsigned, std::uint64_t>> bits) {
+  std::vector<std::uint8_t> mb(7, 0);
+  for (const auto& [a, z, v] : bits) set_bits(mb, a, z, v);
+  CommB c;
+  decode_comm_b(mb.data(), c);
+  return c;
+}
+
+TEST(Decoder, CommBFormatRules) {
+  EXPECT_EQ(comm_b_of({}).candidates, 0u);  // empty MB: nothing
+  // 5,0 alone: roll, track, gs and tas consistent. (6,0 reads bits 14-23 as
+  // IAS with bit 13 its status: clear here, so 6,0 is ruled out.)
+  auto c = comm_b_of({{1, 1, 1}, {3, 11, 20}, {12, 12, 1}, {14, 23, 100}, {24, 24, 1}, {25, 34, 200}, {46, 46, 1},
+                      {47, 56, 190}});
+  EXPECT_EQ(c.candidates, CommB::kBds50);
+  // A value without its status bit rules a register out.
+  c = comm_b_of({{1, 1, 0}, {3, 11, 20}, {24, 24, 1}, {25, 34, 200}, {46, 46, 1}, {47, 56, 190}});
+  EXPECT_FALSE(c.candidates & CommB::kBds50);
+  // Roll beyond 50 degrees, or ground speed and airspeed 200 kt apart: not 5,0.
+  c = comm_b_of({{1, 1, 1}, {3, 11, 300}});
+  EXPECT_FALSE(c.candidates & CommB::kBds50);
+  c = comm_b_of({{24, 24, 1}, {25, 34, 300}, {46, 46, 1}, {47, 56, 150}});
+  EXPECT_FALSE(c.candidates & CommB::kBds50);
+  // Negative values (two's complement after the sign bit).
+  c = comm_b_of({{1, 1, 1}, {2, 2, 1}, {3, 11, 512 - 64}, {12, 12, 1}, {13, 13, 1}, {14, 23, 1024 - 512}});
+  ASSERT_EQ(c.bds, 0x50);
+  EXPECT_NEAR(c.roll_deg, -64 * 45.0 / 256.0, 1e-5);
+  EXPECT_NEAR(c.true_track_deg, 360.0 - 90.0, 1e-4);
+  // 6,0 with a negative heading (west of north) and climb rates: heading
+  // wraps to [0, 360). The IAS (13 status, 14-23) is 5,0's track value with
+  // bit 12, the heading's last bit (0 here), as its status: so not 5,0.
+  c = comm_b_of({{1, 1, 1}, {2, 2, 1}, {3, 12, 1024 - 64}, {13, 13, 1}, {14, 23, 250}, {35, 35, 1}, {37, 45, 20},
+                 {46, 46, 1}, {48, 56, 22}});
+  ASSERT_EQ(c.candidates, CommB::kBds60);
+  EXPECT_EQ(c.indicated_airspeed_kt, 250.0f);
+  EXPECT_NEAR(c.magnetic_heading_deg, 360.0 - 64 * 90.0 / 512.0, 1e-4);
+  EXPECT_EQ(c.baro_vertical_rate_fpm, 640);
+  EXPECT_EQ(c.inertial_vertical_rate_fpm, 704);
+  // 6,0: Mach above 1 or IAS above 500 kt rule it out.
+  c = comm_b_of({{24, 24, 1}, {25, 34, 300}});
+  EXPECT_FALSE(c.candidates & CommB::kBds60);
+  c = comm_b_of({{13, 13, 1}, {14, 23, 600}});
+  EXPECT_FALSE(c.candidates & CommB::kBds60);
+  // Baro and inertial rates 1,500 ft/min apart (a transient) are still 6,0;
+  // a rate beyond 6,000 ft/min is not.
+  c = comm_b_of({{1, 1, 1}, {3, 12, 300}, {13, 13, 1}, {14, 23, 250}, {35, 35, 1}, {37, 45, 10}, {46, 46, 1}, {48, 56, 57}});
+  EXPECT_EQ(c.candidates, CommB::kBds60);
+  c = comm_b_of({{35, 35, 1}, {36, 36, 1}, {37, 45, 512 - 190}});
+  EXPECT_FALSE(c.candidates & CommB::kBds60);
+  // 4,0: a reserved bit set rules it out; a baro setting outside 850-1100 too.
+  c = comm_b_of({{1, 1, 1}, {2, 13, 200}, {45, 45, 1}});
+  EXPECT_FALSE(c.candidates & CommB::kBds40);
+  c = comm_b_of({{27, 27, 1}, {28, 39, 3001}});  // 1100.1 hPa
+  EXPECT_FALSE(c.candidates & CommB::kBds40);
+  // A field both 5,0 and 6,0 accept: both are candidates and nothing is decoded.
+  c = comm_b_of({{1, 1, 1}, {3, 11, 10}});
+  EXPECT_TRUE(c.candidates & CommB::kBds50);
+  EXPECT_TRUE(c.candidates & CommB::kBds60);
+  EXPECT_EQ(c.bds, 0);
+  EXPECT_EQ(c.valid, 0u);
+  // 2,0 needs valid characters; 3,0 rejects threat type 3.
+  c = comm_b_of({{1, 8, 0x20}, {9, 14, 0}});
+  EXPECT_FALSE(c.candidates & CommB::kBds20);
+  c = comm_b_of({{1, 8, 0x30}, {29, 30, 3}});
+  EXPECT_FALSE(c.candidates & CommB::kBds30);
+  c = comm_b_of({{1, 8, 0x30}, {29, 30, 1}});
+  EXPECT_TRUE(c.candidates & CommB::kBds30);
+}
+
+TEST(Decoder, SingleBitRepairIsOffByDefault) {
+  auto f = hex("8D4840D6202CC371C32CE0576098");
+  f[6] ^= 0x10;
+  DecodedMsg m;
+  EXPECT_EQ(decode(f.data(), f.size(), m), DecodeStatus::kBadCrc);
+  EXPECT_EQ(m.corrected_bit, -1);
+}
+
+TEST(Decoder, SingleBitRepairFixesEveryBitOutsideTheFormatField) {
+  const auto clean = hex("8D4840D6202CC371C32CE0576098");
+  DecodedMsg ref;
+  ASSERT_EQ(decode(clean.data(), clean.size(), ref), DecodeStatus::kOk);
+  const DecodeOptions fix{true};
+  for (int i = 0; i < 112; ++i) {
+    auto f = clean;
+    f[static_cast<std::size_t>(i / 8)] ^= static_cast<std::uint8_t>(0x80u >> (i % 8));
+    DecodedMsg m;
+    const DecodeStatus st = decode(f.data(), f.size(), m, fix);
+    if (i < 5) {
+      // A flipped format bit makes it another format: never "repaired" into DF17.
+      EXPECT_FALSE(st == DecodeStatus::kOk && m.df == 17 && m.corrected_bit >= 0) << i;
+      continue;
+    }
+    ASSERT_EQ(st, DecodeStatus::kOk) << i;
+    EXPECT_EQ(m.corrected_bit, i);
+    EXPECT_EQ(m.icao, ref.icao) << i;
+    EXPECT_EQ(callsign(m), callsign(ref)) << i;
+    EXPECT_NE(m.syndrome, 0u);  // the received frame's
+  }
+}
+
+// A DF19 (military) reply with format bit 3 wrong reads as a DF17 whose
+// syndrome is exactly that of a format-bit error: it is not "repaired" into
+// DF19 (format bits are never repaired).
+TEST(Decoder, SingleBitRepairNeverTouchesTheFormatField) {
+  std::vector<std::uint8_t> f(14, 0);
+  set_bits(f, 1, 5, 19);
+  set_bits(f, 9, 32, 0xABCDEF);
+  fix_parity(f);
+  f[0] = static_cast<std::uint8_t>(f[0] ^ 0x10);  // bit 4 (1-indexed): DF19 -> DF17
+  ASSERT_EQ(f[0] >> 3, 17);
+  DecodedMsg m;
+  EXPECT_EQ(decode(f.data(), f.size(), m, DecodeOptions{true}), DecodeStatus::kBadCrc);
+  EXPECT_EQ(m.corrected_bit, -1);
+}
+
+TEST(Decoder, SingleBitRepairNeverTakesTwoWrongBits) {
+  // The Mode S CRC's distance is 6 at 112 bits: a two-bit error never has
+  // a single-bit syndrome, so it is never "repaired" into something else.
+  const auto clean = hex("8D40621D58C382D690C8AC2863A7");
+  const DecodeOptions fix{true};
+  int rejected = 0;
+  for (int i = 5; i < 112; ++i) {
+    for (int j = i + 1; j < 112; ++j) {
+      auto f = clean;
+      f[static_cast<std::size_t>(i / 8)] ^= static_cast<std::uint8_t>(0x80u >> (i % 8));
+      f[static_cast<std::size_t>(j / 8)] ^= static_cast<std::uint8_t>(0x80u >> (j % 8));
+      DecodedMsg m;
+      rejected += decode(f.data(), f.size(), m, fix) == DecodeStatus::kBadCrc;
+    }
+  }
+  EXPECT_EQ(rejected, 107 * 106 / 2);
+}
+
+TEST(Decoder, SingleBitRepairLeavesAddressParityFormatsAlone) {
+  auto f = hex("A000083E202CC371C31DE0AA1CCF");
+  f[8] ^= 0x01;
+  DecodedMsg m;
+  EXPECT_EQ(decode(f.data(), f.size(), m, DecodeOptions{true}), DecodeStatus::kAddressParity);
+  EXPECT_EQ(m.corrected_bit, -1);
+  EXPECT_NE(m.icao, 0x484163u);  // the syndrome, as always for these formats
 }
 
 }  // namespace

@@ -24,6 +24,9 @@ namespace {
                "  --duration SECONDS  simulated time (default 60)\n"
                "  --seed N            RNG seed (default 1); same seed = same output\n"
                "  --lines 1|2         receiver lines, 2 = A/B redundant receivers (default 1)\n"
+               "  --line-b-delay US   line B's extra latency over line A (default 250; negative = B faster)\n"
+               "  --outage L:FROM:TO  line L (0 or 1) receives nothing transmitted from FROM to TO seconds\n"
+               "                      (an unplugged receiver; repeat for the other line)\n"
                "  --max-range NM      reception range (default 150)\n"
                "  --corrupt P         share of frames with a flipped bit (default 0.003)\n"
                "  --ground F          share of aircraft taxiing at the airport (default 0.06)\n"
@@ -70,7 +73,19 @@ int main(int argc, char** argv) {
     else if (a == "--duration") cfg.duration_s = num(val(), "--duration");
     else if (a == "--seed") cfg.seed = static_cast<std::uint64_t>(integer(val(), "--seed", 0, 1LL << 53));
     else if (a == "--lines") cfg.lines = static_cast<int>(integer(val(), "--lines", 1, 2));
-    else if (a == "--max-range") cfg.max_range_nm = num(val(), "--max-range");
+    else if (a == "--line-b-delay") cfg.line_b_extra_latency_us = num(val(), "--line-b-delay");
+    else if (a == "--outage") {
+      int line = -1;
+      double from = 0, to = 0;
+      char end = 0;
+      if (std::sscanf(val(), "%d:%lf:%lf%c", &line, &from, &to, &end) != 3 || line < 0 || line > 1 ||
+          !(to > from)) {
+        std::fprintf(stderr, "adsb-synth: --outage needs LINE:FROM:TO with LINE 0 or 1 and TO > FROM\n");
+        return 1;
+      }
+      cfg.outage[line].start_s = from;
+      cfg.outage[line].end_s = to;
+    } else if (a == "--max-range") cfg.max_range_nm = num(val(), "--max-range");
     else if (a == "--corrupt") cfg.corrupt_rate = num(val(), "--corrupt");
     else if (a == "--ground") cfg.ground_fraction = num(val(), "--ground");
     else if (a == "--receiver") {
@@ -87,6 +102,11 @@ int main(int argc, char** argv) {
     }
   }
   if (out.empty()) usage(1);
+  if (cfg.rx_latency_us + cfg.line_b_extra_latency_us < 0) {
+    std::fprintf(stderr, "adsb-synth: --line-b-delay below -%g us would make line B receive before transmission\n",
+                 cfg.rx_latency_us);
+    return 1;
+  }
   if (cfg.aircraft < 1 || cfg.duration_s <= 0 || cfg.lines < 1 || cfg.lines > 2) {
     std::fprintf(stderr, "adsb-synth: need --aircraft >= 1, --duration > 0, --lines 1 or 2\n");
     return 1;
@@ -156,10 +176,11 @@ int main(int argc, char** argv) {
 
   std::printf("wrote %s: %zu records from %d aircraft over %.0f s (%d line%s)\n", out.c_str(),
               s.records.size(), cfg.aircraft, cfg.duration_s, cfg.lines, cfg.lines > 1 ? "s" : "");
-  std::printf("  transmitted %llu, received %llu, lost %llu, corrupted %llu\n",
+  std::printf("  transmitted %llu, received %llu, lost %llu, corrupted %llu, outage %llu\n",
               static_cast<unsigned long long>(s.stats.transmitted),
               static_cast<unsigned long long>(s.stats.received),
               static_cast<unsigned long long>(s.stats.lost),
-              static_cast<unsigned long long>(s.stats.corrupted));
+              static_cast<unsigned long long>(s.stats.corrupted),
+              static_cast<unsigned long long>(s.stats.outage));
   return 0;
 }

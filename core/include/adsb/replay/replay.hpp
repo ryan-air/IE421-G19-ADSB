@@ -30,6 +30,7 @@
 #include "adsb/common/hash.hpp"
 #include "adsb/common/histogram.hpp"
 #include "adsb/common/thread.hpp"
+#include "adsb/ingest/arbiter.hpp"
 #include "adsb/protocol/feed_messages.hpp"
 #include "adsb/record/recording.hpp"
 #include "adsb/state/track_engine.hpp"
@@ -75,6 +76,9 @@ struct ReplayOptions {
   double speed = 0.0;          // 0 = max speed; 1 = original timing; N = N times faster
   bool flush_at_end = false;   // expire every remaining track after the last record
   bool busy_wait = false;      // pace by spinning instead of sleeping (precise; uses a core)
+  // A/B line arbitration before decoding (README_UPDATES.md §6): only the
+  // frames it forwards reach the engine. finish() is called at the end.
+  ingest::Arbiter* arbiter = nullptr;
 };
 
 struct ReplayResult {
@@ -128,6 +132,7 @@ inline void wait_until(std::uint64_t target_ns, bool busy_wait = false) {
 
 template <typename Engine>
 void finish(Engine& eng, HashingSink& sink, std::uint64_t last_rx, const ReplayOptions& opt) {
+  if (opt.arbiter) opt.arbiter->finish();
   if (opt.flush_at_end && last_rx != 0) {
     // Past the end by the track timeout plus two wheel ticks: every track expires.
     eng.advance(last_rx + eng.config().track_timeout_ns + 2'000'000'000ULL, sink);
@@ -152,7 +157,7 @@ ReplayResult replay_inline(record::RecordingReader& rd, Engine& eng, const Repla
       const double offset = static_cast<double>(r.rx_ns - first_rx) / opt.speed;
       detail::wait_until(wall0 + static_cast<std::uint64_t>(offset), opt.busy_wait);
     }
-    eng.on_frame(r.payload, r.len, detail::meta_of(r), sink);
+    if (!opt.arbiter || opt.arbiter->offer(r)) eng.on_frame(r.payload, r.len, detail::meta_of(r), sink);
     last_rx = r.rx_ns;
     ++res.records;
   }
@@ -222,7 +227,9 @@ ReplayResult replay_pipeline(record::RecordingReader& rd, Engine& eng, const Rep
     for (;;) {
       if (queue->try_pop(it)) {
         const std::uint64_t t_deq = ticks();
-        eng.on_frame(it.rec.payload, it.rec.len, detail::meta_of(it.rec), sink);
+        if (!opt.arbiter || opt.arbiter->offer(it.rec)) {
+          eng.on_frame(it.rec.payload, it.rec.len, detail::meta_of(it.rec), sink);
+        }
         const std::uint64_t t_done = ticks();
         if (lat) {
           lat->queue_ns.record(conv.to_ns(tick_delta(t_deq, it.t_enqueue)));

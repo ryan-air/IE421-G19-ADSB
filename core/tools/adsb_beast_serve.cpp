@@ -58,7 +58,9 @@ void on_signal(int) { g_stop = 1; }
                "  --loop                restart the recording at the end (with --duration)\n"
                "  --duration S          stop after S seconds of sending\n"
                "  --chunk-us N          send what is due every N microseconds (default 100)\n"
-               "Serves one client, then exits. Only line 0 of the recording is sent.\n");
+               "  --line N              which receiver line of the recording to send (default 0)\n"
+               "Serves one client, then exits. Only one line of the recording is sent: for A/B, run\n"
+               "one server per line.\n");
   std::exit(code);
 }
 
@@ -77,6 +79,7 @@ int main(int argc, char** argv) {
   double rate = 0, speed = 1, duration = 0;
   std::uint64_t chunk_ns = 100'000;
   bool loop = false;
+  int line = 0;
   Burst burst;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -90,6 +93,10 @@ int main(int argc, char** argv) {
     else if (a == "--rate") rate = std::atof(val().c_str());
     else if (a == "--speed") speed = std::atof(val().c_str());
     else if (a == "--loop") loop = true;
+    else if (a == "--line") {
+      line = std::atoi(val().c_str());
+      if (line < 0 || line > 15) usage(2);
+    }
     else if (a == "--duration") duration = std::atof(val().c_str());
     else if (a == "--chunk-us") chunk_ns = static_cast<std::uint64_t>(std::atof(val().c_str()) * 1000);
     else if (a == "--burst") {
@@ -104,7 +111,7 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  // Pre-encode line 0 into one contiguous Beast byte stream.
+  // Pre-encode the line into one contiguous Beast byte stream.
   record::RecordingReader reader;
   std::string err;
   if (!reader.open(path, &err)) {
@@ -116,7 +123,7 @@ int main(int argc, char** argv) {
   std::vector<std::uint64_t> rx_ns;   // recording timing (for --speed)
   record::Record r;
   while (reader.next(r)) {
-    if (r.line != 0) continue;
+    if (r.line != line) continue;
     ingest::BeastFrame bf;
     bf.type = static_cast<ingest::BeastType>(r.type);
     bf.len = r.len;
@@ -132,7 +139,7 @@ int main(int argc, char** argv) {
   const std::size_t frames = rx_ns.size();
   offset.push_back(stream.size());
   if (frames == 0) {
-    std::fprintf(stderr, "adsb-beast-serve: no line-0 frames in %s\n", path.c_str());
+    std::fprintf(stderr, "adsb-beast-serve: no line-%d frames in %s\n", line, path.c_str());
     return 1;
   }
   const double rec_span_s = static_cast<double>(rx_ns.back() - rx_ns.front()) / 1e9;

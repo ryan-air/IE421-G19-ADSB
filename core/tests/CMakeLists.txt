@@ -16,6 +16,7 @@ set(ADSB_TEST_SOURCES
   test_track_store.cpp
   test_track_engine.cpp
   test_synth_replay.cpp
+  test_arbiter.cpp
   test_beast_tcp.cpp
   test_feed.cpp
   test_feed_subscriber.cpp

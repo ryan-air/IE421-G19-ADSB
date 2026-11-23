@@ -285,10 +285,11 @@ SynthOutput generate(const SynthConfig& cfg) {
         r.type = f.len == 14 ? '3' : '2';
         r.len = f.len;
         std::memcpy(r.payload, f.bytes, f.len);
+        bool corrupted = false;
         if (a.rng.chance(cfg.corrupt_rate)) {
           const auto bit = a.rng.below(f.len * 8u);
           r.payload[bit / 8] ^= static_cast<std::uint8_t>(0x80u >> (bit % 8));
-          ++out.stats.corrupted;
+          corrupted = true;
         }
         const double latency_us = cfg.rx_latency_us + (line == 1 ? cfg.line_b_extra_latency_us : 0.0) +
                                    a.rng.uniform(0, cfg.rx_jitter_us);
@@ -300,6 +301,12 @@ SynthOutput generate(const SynthConfig& cfg) {
                      0xFFFFFFFFFFFFULL;
         const double sig = 255.0 * std::clamp(1.0 - range / cfg.max_range_nm, 0.05, 1.0);
         r.signal = static_cast<std::uint8_t>(sig);
+        const SynthConfig::Outage& o = cfg.outage[line];
+        if (t >= o.start_s && t < o.end_s) {
+          ++out.stats.outage;
+          continue;
+        }
+        if (corrupted) ++out.stats.corrupted;  // counted only for frames in the output
         out.records.push_back(r);
         ++out.stats.received;
       }

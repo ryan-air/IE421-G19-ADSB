@@ -55,6 +55,15 @@ struct SynthConfig {
   double rx_jitter_us = 300.0;      // uniform jitter added to each frame
   double line_b_extra_latency_us = 250.0;  // line B is a little slower
 
+  // Line outages (fault injection, README_UPDATES.md §6.3): line L receives
+  // nothing transmitted in [start_s, end_s) (an unplugged dongle). Applied
+  // after every random draw, so all other frames stay exactly the same.
+  struct Outage {
+    double start_s = 0.0;
+    double end_s = 0.0;  // <= start_s: no outage
+  };
+  Outage outage[2] = {};
+
   // Radio clocks (12 MHz, Beast-style): per-line offset and drift.
   double line_drift_ppm[2] = {0.0, 18.0};
 
@@ -109,6 +118,7 @@ struct SynthStats {
   std::uint64_t received = 0;      // summed over lines
   std::uint64_t lost = 0;
   std::uint64_t corrupted = 0;
+  std::uint64_t outage = 0;        // frames a line would have received during its outage
 };
 
 struct SynthOutput {

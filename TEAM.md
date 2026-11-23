@@ -59,7 +59,7 @@ Plan §7, §8 and §14.
 | Item | Tier | Hardware | Size |
 |---|---|---|---|
 | Decoder gaps: TC 29/31, Comm-B (BDS), optional single-bit error correction | Must | None | M |
-| Find out why our decoder reports about 8% more positions than readsb (`bench/results/legacy-baseline/README.md`, item 7) | Must | None | S |
+| ~~Find out why our decoder reports about 8% more positions than readsb (`bench/results/legacy-baseline/README.md`, item 7)~~ **Done (Ryan):** a counting artifact: readsb reports surface positions as SBS `MSG,2`, and only `MSG,3` was counted. With both, ours has 0.3–0.4% fewer, all frames readsb repaired with its single-bit correction; every other position matches one to one (`bench/legacy/compare-positions.sh`) | Must | None | S |
 | ≥ 99.9% agreement with readsb on real traffic; settle the GNSS-height unit question (`core/include/adsb/modes/decoder.hpp`) | Must | Real recordings (OpenSky or our receiver) | S–M |
 | Populate `nic`; decide heading and airspeed for feed v1 (`protocol/feed_spec.md` §5) | Must | None | S |
 | Nasdaq ITCH 5.0 L3 order book through our MoldUDP64 stack; target ≥ 20 M msg/s per core | Could | None (public sample files) | L |

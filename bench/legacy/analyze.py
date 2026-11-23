@@ -118,8 +118,12 @@ def load_obs(path):
     return out
 
 
-def load_sbs(path):
-    """readsb SBS lines -> positions [(t, hex, lat, lon, alt)] and identity {hex: {...}}."""
+def load_sbs(path, surface=False):
+    """readsb SBS lines -> positions [(t, hex, lat, lon, alt)] and identity {hex: {...}}.
+
+    Positions come from MSG,3 (airborne position); with surface=True also from
+    MSG,2 (surface position), which is how SBS reports TC 5-8 positions. The
+    new decoder emits both kinds, so a count comparison needs both."""
     pos, ident = [], defaultdict(dict)
     with open(path) as f:
         next(f, None)
@@ -129,7 +133,7 @@ def load_sbs(path):
             if len(p) < 18 or p[0] != "MSG":
                 continue
             t, hx = int(t_s), p[4].strip().upper()
-            if p[1] == "3" and p[14] and p[15]:
+            if (p[1] == "3" or (surface and p[1] == "2")) and p[14] and p[15]:
                 pos.append((t, hx, float(p[14]), float(p[15]), int(p[11]) if p[11] else None))
             if p[10].strip():
                 ident[hx]["callsign"] = p[10].strip()
@@ -358,6 +362,9 @@ def scenario(d):
 
     # Decoder comparison: readsb vs the new decoder vs ground truth.
     new_pos, new_ident = load_new_updates(d / "new_updates.bin")
+    # Both decoders' airborne and surface positions (SBS puts surface ones in
+    # MSG,2: counting only MSG,3 made the new decoder look 8% ahead).
+    sbs_all_pos, _ = load_sbs(d / "sbs.csv", surface=True)
     rx_to_wall = lambda rx: truth.t0 + int((rx - truth.first_rx) / truth.speed)  # noqa: E731
     def accuracy(positions, timestamp_is_rx):
         within, total, alt_ok, alt_n = 0, 0, 0, 0
@@ -383,7 +390,7 @@ def scenario(d):
             both_sq += 1
             agree_sq += a["squawk"] == b["squawk"]
     m["decoder_comparison"] = {
-        "readsb": accuracy(sbs_pos, False) | {"aircraft": len({p[1] for p in sbs_pos})},
+        "readsb": accuracy(sbs_all_pos, False) | {"aircraft": len({p[1] for p in sbs_all_pos})},
         "new": accuracy(new_pos, True) | {"aircraft": len({p[1] for p in new_pos})},
         "callsign_agreement": agree_cs / both_cs if both_cs else None,
         "squawk_agreement": agree_sq / both_sq if both_sq else None,
@@ -476,7 +483,8 @@ def report(out):
         w("")
         w("\"Positions shown\": the share of transmitted airborne positions that ever reach the map (Fall 2025: via the database). "
           "The synthetic traffic models range-dependent reception loss, so no system reaches 100%: readsb itself decodes the share shown under \"readsb SBS\" coverage in metrics.json "
-          "(about 72% at 50 aircraft), and the new decoder resolves a few percent more positions than readsb from the same frames.")
+          "(about 72% at 50 aircraft). From the same frames the new decoder resolves 0.3-0.4% fewer positions than readsb, "
+          "which repairs single-bit errors (see compare-positions.sh).")
         w("")
         w("### Inside the new pipeline")
         w("")

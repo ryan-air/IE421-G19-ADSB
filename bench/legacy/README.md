@@ -61,7 +61,22 @@ All timestamps are taken inside one container, so every probe shares one clock.
 - **Coverage:** the share of transmitted positions that ever reach the database (before) or the WebSocket (after). The generator models reception loss, so neither reaches 100%.
 - **The map view:** how old the shown position is, and how far it is from where the aircraft actually is at that moment. The browser variant holds each snapshot until the next 2 s poll.
 - **Keeping up:** median database latency early against late in the run (growth means a backlog), CPU per process, and how late the feeder delivered frames.
-- **Decoder comparison:** readsb's positions, altitudes, callsigns, and squawks against the new C++ decoder's, both checked against ground truth.
+- **Decoder comparison:** readsb's positions, altitudes, callsigns, and squawks against the new C++ decoder's, both checked against ground truth. readsb's positions are its SBS `MSG,3` (airborne) and `MSG,2` (surface) lines; the new decoder emits both kinds.
+
+### Position by position: `compare-positions.sh`
+
+`bench/legacy/compare-positions.sh [AIRCRAFT] [SECONDS] [SEED]` (default 300, 90, 5; about a minute plus the duration) feeds one synthetic recording to readsb in this image and replays it through `adsb-replay --out`. `compare_positions.py` then matches every position one to one, by aircraft and coordinates (within 2e-5°, the SBS rounding), and explains whatever is left on each side. Results go to `bench/legacy/out/positions-nN/summary.txt`. At 1,000 aircraft for 60 s (seed 7):
+
+| | Positions |
+|---|---|
+| New decoder | 84,495 |
+| readsb `MSG,3` (airborne) | 77,803: the new decoder looks 8.6% ahead, the old finding |
+| readsb `MSG,2` (surface) | 6,994: with them, the new decoder has 0.36% **fewer** |
+| Matched one to one | 84,450 |
+| Only the new decoder | 45, all surface positions within 0.9 m of the truth, 38 of them among a ground track's first three (readsb prints a surface track only after a few positions) |
+| Only readsb | 347: 242 next to a corrupted frame of that aircraft (readsb repairs single-bit errors by default, the new decoder rejects them); 29 where a repaired frame completed readsb's even/odd CPR pair; 76 an unchanged position printed again (the track engine sends only changes); 0 unexplained |
+
+So the two decoders agree position for position; the difference is readsb's single-bit repair, which the new decoder deliberately leaves out (optional correction is a separate Role 2 item).
 
 Finally the recording is replayed through the new pipeline's core alone (`adsb-replay --pipeline --speed 1 --busy-wait`: no network, no readsb), for context.
 

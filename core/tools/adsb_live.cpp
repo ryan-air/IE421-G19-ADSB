@@ -3,7 +3,8 @@
 //
 //   adsb-live [--host 127.0.0.1] [--port 30005] [--record FILE.adsbrec]
 //             [--duration SECONDS] [--receiver LAT,LON] [--stats-every SECONDS]
-//             [--busy-poll] [--cpus INGEST,STATE[,RECORDER]] [--line N] [--quiet]
+//             [--busy-poll] [--cpus INGEST,STATE[,RECORDER[,INGEST_B]]] [--line N] [--quiet]
+//             [--b-host HOST --b-port PORT | --iq-b PATH] [--arb-window-us N]
 //             [--publish GROUP:PORT [--publish-interface ADDR] [--batch-us N] ...]
 //
 // Threads:
@@ -15,6 +16,9 @@
 //               -> StageQueue -> state thread
 //               -> recorder queue (if --record; dropped and counted if full,
 //                  so a slow disk never stalls ingest)
+//   ingest-b  (A/B, README_UPDATES.md §6) the same for line B, into its own
+//             queue. The state thread merges both queues by receive time and
+//             the arbiter forwards each frame's first copy only.
 //   state     decode + track engine; per-frame latency histogram from receive
 //             to track state updated; expires idle tracks on event time.
 //             With --publish, the engine's output also goes to the feed
@@ -26,6 +30,7 @@
 // Stop with Ctrl-C (or --duration): queues drain, the recording gets its
 // footer, and final counters are printed.
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <cstdio>
@@ -45,6 +50,7 @@
 #include "adsb/feed/recovery.hpp"
 #include "adsb/feed/shm_ring.hpp"
 #include "adsb/feed/tx.hpp"
+#include "adsb/ingest/arbiter.hpp"
 #include "adsb/ingest/beast_tcp.hpp"
 #include "adsb/ingest/iq_source.hpp"
 #include "adsb/record/recording.hpp"
@@ -65,9 +71,21 @@ void on_signal(int) { g_stop.store(true); }
                "  --receiver LAT,LON    receiver position (surface positions, recording header)\n"
                "  --stats-every SECONDS print counters this often (default 10, 0 = only at the end)\n"
                "  --busy-poll           spin on the socket instead of poll() (lowest latency, uses a core)\n"
-               "  --cpus I,S[,R]        pin ingest, state, recorder threads (Linux only)\n"
+               "  --cpus I,S[,R[,B]]    pin ingest, state, recorder, line-B ingest threads (Linux only)\n"
                "  --line N              receiver line id to stamp on frames (default 0)\n"
                "  --fix                 repair one wrong bit in DF17/18 frames (readsb's output is already repaired)\n"
+               "A/B lines (two receivers at one site, README_UPDATES.md §6):\n"
+               "  --b-host HOST         second Beast source, line B (line A is --host/--port; default 127.0.0.1)\n"
+               "  --b-port PORT         line B's Beast port (giving either option turns A/B on)\n"
+               "  --iq-b PATH           or: a second IQ input as line B (with --iq; same format options)\n"
+               "  --arb-window-us N     arbitration window: copies this close are the same frame (default:\n"
+               "                        60000 for Beast lines, which readsb sends in batches of up to 50 ms;\n"
+               "                        for IQ lines twice the block duration, at least 5000)\n"
+               "                        Lines are 0 (A) and 1 (B). Each frame's first copy is forwarded, later\n"
+               "                        copies are dropped and counted; --record keeps every copy that\n"
+               "                        passed the input boundary (overload drops are counted per line), so\n"
+               "                        adsb-replay --arb-window-us W (W as printed) repeats the run's\n"
+               "                        decisions exactly.\n"
                "IQ input (our demodulator instead of readsb; README_UPDATES.md §5):\n"
                "  --iq PATH             IQ samples: NAME.sigmf-meta / .sigmf-data (format and rate from the\n"
                "                        metadata), a raw file, or - for stdin; adsb-live stops at its end\n"
@@ -125,6 +143,10 @@ struct Shared {
   // because the decode/state stage was behind, and the deepest the input
   // queue got. Written by the ingest thread only.
   std::atomic<std::uint64_t> overload_dropped{0}, queue_high_water{0};
+  // Per line (A/B): the same two, line A in [0].
+  std::atomic<std::uint64_t> line_dropped[2]{}, line_high_water[2]{};
+  // A/B: copies the arbiter dropped, and receive times raised by the merge.
+  std::atomic<std::uint64_t> arb_dropped{0}, merge_clamped{0};
 };
 
 // UDP multicast and/or the same-host shared-memory ring (either may be absent).
@@ -170,7 +192,11 @@ int main(int argc, char** argv) {
   std::string record_path;
   double duration_s = 0, stats_every_s = 10;
   bool quiet = false;
-  int cpu_ingest = -1, cpu_state = -1, cpu_recorder = -1;
+  int cpu_ingest = -1, cpu_state = -1, cpu_recorder = -1, cpu_ingest_b = -1;
+  adsb::ingest::BeastTcpConfig b_cfg;   // line B (A/B)
+  bool b_beast = false, line_given = false, window_given = false;
+  std::string iq_b_path;
+  adsb::ingest::ArbiterConfig arb_cfg;
   std::string publish_to, session_id, shm_name;
   std::uint64_t shm_slots = adsb::feed::kShmDefaultSlots;
   adsb::feed::UdpSender::Options send_opt;
@@ -231,14 +257,25 @@ int main(int argc, char** argv) {
     else if (a == "--iq-fix") iq_cfg.demod.fix_single_bit = true;
     else if (a == "--iq-drop") iq_cfg.drop_when_full = true;
     else if (a == "--fix") eng_cfg.fix_single_bit = true;
-    else if (a == "--line") src_cfg.line = static_cast<std::uint8_t>(std::strtol(val().c_str(), nullptr, 10) & 0xF);
+    else if (a == "--line") {
+      src_cfg.line = static_cast<std::uint8_t>(std::strtol(val().c_str(), nullptr, 10) & 0xF);
+      line_given = true;
+    } else if (a == "--b-host") { b_cfg.host = val(); b_beast = true; }
+    else if (a == "--b-port") { b_cfg.port = parse_port(val()); b_beast = true; }
+    else if (a == "--iq-b") iq_b_path = val();
+    else if (a == "--arb-window-us") {
+      const long long w = std::strtoll(val().c_str(), nullptr, 10);
+      if (w < 1 || w > 1'000'000) usage(1);
+      arb_cfg.window_ns = static_cast<std::uint64_t>(w) * 1000;
+      window_given = true;
+    }
     else if (a == "--receiver") {
       const std::string v = val();
       if (std::sscanf(v.c_str(), "%lf,%lf", &eng_cfg.receiver_lat, &eng_cfg.receiver_lon) != 2) usage(1);
       eng_cfg.has_receiver = true;
     } else if (a == "--cpus") {
       const std::string v = val();
-      if (std::sscanf(v.c_str(), "%d,%d,%d", &cpu_ingest, &cpu_state, &cpu_recorder) < 2) usage(1);
+      if (std::sscanf(v.c_str(), "%d,%d,%d,%d", &cpu_ingest, &cpu_state, &cpu_recorder, &cpu_ingest_b) < 2) usage(1);
     } else if (a == "--publish") publish_to = val();
     else if (a == "--publish-interface") send_opt.interface_host = val();
     else if (adsb::feed::is_tx_flag(a)) { if (!adsb::feed::apply_tx_flag(a, val(), transport, tx_opt)) usage(1); }
@@ -254,36 +291,95 @@ int main(int argc, char** argv) {
     }
   }
 
-  // IQ input.
+  // A/B: two lines of the same kind (two readsb instances, or two IQ inputs).
+  const bool ab = b_beast || !iq_b_path.empty();
+  if (ab) {
+    if (b_beast && !iq_b_path.empty()) {
+      std::fprintf(stderr, "adsb-live: line B is either a Beast source (--b-host/--b-port) or IQ (--iq-b)\n");
+      return 1;
+    }
+    if (b_beast == !iq_path.empty()) {
+      std::fprintf(stderr, "adsb-live: both lines must be the same kind: --b-host/--b-port with a Beast line A, "
+                           "--iq-b with --iq\n");
+      return 1;
+    }
+    if (line_given) {
+      std::fprintf(stderr, "adsb-live: with A/B the lines are 0 (A) and 1 (B); --line does not apply\n");
+      return 1;
+    }
+    if (b_beast && b_cfg.host == src_cfg.host && b_cfg.port == src_cfg.port) {
+      std::fprintf(stderr, "adsb-live: line B is the same source as line A (%s:%u); give --b-port\n",
+                   b_cfg.host.c_str(), b_cfg.port);
+      return 1;
+    }
+    src_cfg.line = 0;
+    b_cfg.line = 1;
+    b_cfg.busy_poll = src_cfg.busy_poll;
+  }
+
+  // IQ input (one per line).
   const bool iq_mode = !iq_path.empty();
-  std::unique_ptr<adsb::ingest::IqSource> iq_source;
-  if (iq_mode) {
+  auto open_iq = [&](const std::string& path, std::uint8_t line,
+                     adsb::ingest::IqSourceConfig& cfg) -> std::unique_ptr<adsb::ingest::IqSource> {
     std::string err;
-    iq_cfg.path = iq_path;
-    if (iq_path.size() > 11 && (iq_path.ends_with(".sigmf-meta") || iq_path.ends_with(".sigmf-data"))) {
+    cfg.path = path;
+    const bool sigmf = path.size() > 11 && (path.ends_with(".sigmf-meta") || path.ends_with(".sigmf-data"));
+    if (sigmf) {
       double rate = 0;
-      if (!adsb::ingest::read_sigmf(iq_path, iq_cfg.path, iq_cfg.format, rate, &err)) {
+      if (!adsb::ingest::read_sigmf(path, cfg.path, cfg.format, rate, &err)) {
         std::fprintf(stderr, "adsb-live: %s\n", err.c_str());
-        return 1;
+        return nullptr;
       }
-      if (!iq_rate_given) iq_cfg.sample_rate_hz = rate;
-    } else if (iq_format.empty() || !adsb::demod::parse_format(iq_format, iq_cfg.format)) {
+      if (!iq_rate_given) cfg.sample_rate_hz = rate;
+    } else if (iq_format.empty() || !adsb::demod::parse_format(iq_format, cfg.format)) {
       std::fprintf(stderr, "adsb-live: raw --iq input needs --iq-format cu8|cs8|cs16|cf32\n");
-      return 1;
+      return nullptr;
     }
-    if (!iq_format.empty() && (iq_path.ends_with(".sigmf-meta") || iq_path.ends_with(".sigmf-data"))) {
+    if (!iq_format.empty() && sigmf) {
       std::fprintf(stderr, "adsb-live: --iq-format is for raw input; SigMF gives the format\n");
-      return 1;
+      return nullptr;
     }
-    iq_cfg.line = src_cfg.line;
-    if (!adsb::ingest::validate(iq_cfg, &err)) {
-      std::fprintf(stderr, "adsb-live: --iq: %s\n", err.c_str());
-      return 1;
+    cfg.line = line;
+    if (!adsb::ingest::validate(cfg, &err)) {
+      std::fprintf(stderr, "adsb-live: %s: %s\n", path.c_str(), err.c_str());
+      return nullptr;
     }
-    iq_source = std::make_unique<adsb::ingest::IqSource>(iq_cfg);
-    if (!iq_source->open(&err)) {
-      std::fprintf(stderr, "adsb-live: --iq: %s\n", err.c_str());
-      return 1;
+    auto src = std::make_unique<adsb::ingest::IqSource>(cfg);
+    if (!src->open(&err)) {
+      std::fprintf(stderr, "adsb-live: %s: %s\n", path.c_str(), err.c_str());
+      return nullptr;
+    }
+    return src;
+  };
+  if (ab && iq_mode && iq_cfg.speed <= 0 && !iq_cfg.drop_when_full) {
+    std::fprintf(stderr, "adsb-live: A/B with IQ needs paced input (--iq-speed > 0) or a live receiver (--iq-drop):\n"
+                         "unpaced, each line runs at its own speed on its own sample clock\n");
+    return 1;
+  }
+  std::unique_ptr<adsb::ingest::IqSource> iq_source, iq_source_b;
+  adsb::ingest::IqSourceConfig iq_cfg_b = iq_cfg;
+  if (iq_mode) {
+    iq_source = open_iq(iq_path, src_cfg.line, iq_cfg);
+    if (!iq_source) return 1;
+  }
+  if (!iq_b_path.empty()) {
+    iq_source_b = open_iq(iq_b_path, 1, iq_cfg_b);
+    if (!iq_source_b) return 1;
+  }
+  if (ab && !window_given) {
+    // The window must cover how unevenly the lines deliver: readsb flushes its
+    // Beast output every 50 ms or 1,280 bytes, and an IQ line hands over a
+    // block's frames together (rates from the SigMF metadata, now read).
+    // Squitters repeat identical payloads no sooner than ~400 ms.
+    if (b_beast) {
+      arb_cfg.window_ns = 60'000'000;
+    } else {
+      auto block_ns = [](const adsb::ingest::IqSourceConfig& c) {
+        const double speed = c.speed > 0 ? c.speed : 1.0;
+        return static_cast<double>(c.block_samples) / c.sample_rate_hz * 1e9 / speed;
+      };
+      const double blk = std::max(block_ns(iq_cfg), block_ns(iq_cfg_b));
+      arb_cfg.window_ns = std::max<std::uint64_t>(5'000'000, static_cast<std::uint64_t>(2 * blk));
     }
   }
 
@@ -365,26 +461,39 @@ int main(int argc, char** argv) {
   using StateQueue = adsb::StageQueue<Item, 65536>;
   using RecQueue = adsb::SpscRing<adsb::record::Record, 65536>;
   auto state_q = std::make_unique<StateQueue>();
+  auto state_qb = ab ? std::make_unique<StateQueue>() : nullptr;  // line B
   auto rec_q = record_path.empty() ? nullptr : std::make_unique<RecQueue>();
   auto engine = std::make_unique<adsb::DefaultTrackEngine>(eng_cfg);
+  auto arbiter = ab ? std::make_unique<adsb::ingest::Arbiter>(arb_cfg) : nullptr;
   auto recv_to_state = std::make_unique<adsb::LatencyHistogram>();
   auto queue_wait = std::make_unique<adsb::LatencyHistogram>();
   const adsb::TickConverter conv = adsb::TickConverter::calibrate();
   Shared shared;
   std::atomic<bool> ingest_done{false}, state_done{false};
+  std::atomic<int> ingest_running{ab ? 2 : 1};
 
   adsb::ingest::BeastTcpSource source(src_cfg);
+  auto source_b = b_beast ? std::make_unique<adsb::ingest::BeastTcpSource>(b_cfg) : nullptr;
   const std::uint64_t t_start = adsb::mono_ns();
 
-  std::thread ingest([&] {
-    adsb::set_current_thread_name("adsb-ingest");
-    if (cpu_ingest >= 0) adsb::pin_current_thread(cpu_ingest);
+  // One ingest thread per line. With A/B the state thread records (it sees
+  // both lines in the merged order), so the recorder queue keeps one producer.
+  auto ingest_line = [&](int line) {
+    adsb::set_current_thread_name(line == 0 ? "adsb-ingest" : "adsb-ingest-b");
+    const int cpu = line == 0 ? cpu_ingest : cpu_ingest_b;
+    if (cpu >= 0) adsb::pin_current_thread(cpu);
+    StateQueue& q = line == 0 ? *state_q : *state_qb;
+    adsb::ingest::IqSource* iq = line == 0 ? iq_source.get() : iq_source_b.get();
+    adsb::ingest::BeastTcpSource& beast = line == 0 ? source : *source_b;
+    const adsb::ingest::BeastTcpConfig& bc = line == 0 ? src_cfg : b_cfg;
+    const char* tag = !ab ? "" : line == 0 ? "line A " : "line B ";
+    const std::size_t li = static_cast<std::size_t>(line);
     Item it{};
     std::size_t high_water = 0;
     const std::size_t queue_limit =
         max_queue == 0 || max_queue > StateQueue::kCapacity ? StateQueue::kCapacity : max_queue;
     auto on_record = [&](const adsb::record::Record& r) {
-          if (rec_q) {
+          if (rec_q && !ab) {
             if (rec_q->try_push(r)) {
               shared.recorded.fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -396,36 +505,52 @@ int main(int argc, char** argv) {
           // Input boundary. Everything after it is lossless; this is the one
           // place a frame may be lost, and it is counted (README_UPDATES.md
           // §10.1). With --overload block the ingest stops reading instead.
-          const std::size_t depth = state_q->size_approx();
+          const std::size_t depth = q.size_approx();
           if (depth > high_water) {
             high_water = depth;
-            shared.queue_high_water.store(depth, std::memory_order_relaxed);
+            shared.line_high_water[li].store(depth, std::memory_order_relaxed);
+            // The overall high water is the larger of the lines'.
+            std::uint64_t cur = shared.queue_high_water.load(std::memory_order_relaxed);
+            while (depth > cur && !shared.queue_high_water.compare_exchange_weak(cur, depth)) {
+            }
           }
-          if (!overload_block && depth >= queue_limit) {
+          auto drop = [&] {
             shared.overload_dropped.fetch_add(1, std::memory_order_relaxed);
+            shared.line_dropped[li].fetch_add(1, std::memory_order_relaxed);
+          };
+          if (!overload_block && depth >= queue_limit) {
+            drop();
             return;
           }
-          while (!state_q->try_push(it)) {
+          while (!q.try_push(it)) {
             if (g_stop.load(std::memory_order_relaxed)) return;
             if (!overload_block) {  // full despite the check (limit == capacity)
-              shared.overload_dropped.fetch_add(1, std::memory_order_relaxed);
+              drop();
               return;
             }
             adsb::cpu_relax();
           }
         };
-    if (iq_source) {
-      iq_source->run(g_stop, on_record, [&](const char* status) {
-        if (!quiet) std::fprintf(stderr, "adsb-live: %s: %s\n", iq_path.c_str(), status);
+    if (iq) {
+      iq->run(g_stop, on_record, [&](const char* status) {
+        if (!quiet) std::fprintf(stderr, "adsb-live: %s%s: %s\n", tag, iq->config().path.c_str(), status);
       });
-      g_stop.store(true);  // the input has ended: stop like Ctrl-C (queues drain first)
     } else {
-      source.run(g_stop, on_record, [&](const char* status) {
-        if (!quiet) std::fprintf(stderr, "adsb-live: %s:%u %s\n", src_cfg.host.c_str(), src_cfg.port, status);
+      beast.run(g_stop, on_record, [&](const char* status) {
+        if (!quiet) std::fprintf(stderr, "adsb-live: %s%s:%u %s\n", tag, bc.host.c_str(), bc.port, status);
       });
     }
-    ingest_done.store(true, std::memory_order_release);
-  });
+    // The last line to finish ends the input. For IQ lines that is the end of
+    // the files: stop like Ctrl-C (queues drain first). One atomic decision,
+    // so two lines ending together cannot both leave it to the other.
+    if (ingest_running.fetch_sub(1) == 1) {
+      if (iq) g_stop.store(true);
+      ingest_done.store(true, std::memory_order_release);
+    }
+  };
+  std::thread ingest([&] { ingest_line(0); });
+  std::thread ingest_b;
+  if (ab) ingest_b = std::thread([&] { ingest_line(1); });
 
   adsb::feed::ConflatedFeed conflated;
   bool conf_failed = false;
@@ -457,14 +582,42 @@ int main(int argc, char** argv) {
       shared.positions.store(sink.positions, std::memory_order_relaxed);
       shared.bad.store(bad, std::memory_order_relaxed);
     };
-    Item it{};
+    // A/B: one frame of lookahead per line; the earlier receive time goes
+    // first, so the arbiter (and the recording) see time order. A frame that
+    // still arrives earlier than one already passed on (the other line's
+    // thread was a little behind) has its time raised to keep the order.
+    Item head[2]{};
+    bool has[2] = {false, false};
+    std::uint64_t last_rx = 0;
     std::uint64_t idle_spins = 0;
     for (;;) {
-      if (state_q->try_pop(it)) {
+      if (!has[0]) has[0] = state_q->try_pop(head[0]);
+      if (state_qb && !has[1]) has[1] = state_qb->try_pop(head[1]);
+      if (has[0] || has[1]) {
+        const int pick = has[0] && (!has[1] || head[0].rec.rx_ns <= head[1].rec.rx_ns) ? 0 : 1;
+        Item& it = head[pick];
+        has[pick] = false;
         idle_spins = 0;
         const std::uint64_t t_pop = adsb::ticks();
-        const auto& r = it.rec;
-        if (r.type == '2' || r.type == '3') {  // Mode S only; Mode A/C carries no address
+        auto& r = it.rec;
+        bool forward = true;
+        if (arbiter) {
+          if (r.rx_ns < last_rx) {
+            r.rx_ns = last_rx;
+            shared.merge_clamped.fetch_add(1, std::memory_order_relaxed);
+          }
+          last_rx = r.rx_ns;
+          if (rec_q) {
+            if (rec_q->try_push(r)) {
+              shared.recorded.fetch_add(1, std::memory_order_relaxed);
+            } else {
+              shared.record_dropped.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+          forward = arbiter->offer(r);
+          if (!forward) shared.arb_dropped.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (forward && (r.type == '2' || r.type == '3')) {  // Mode S only; Mode A/C carries no address
           adsb::state::FrameMeta m;
           m.rx_ns = r.rx_ns;
           m.radio_ts = r.radio_ts;
@@ -479,12 +632,16 @@ int main(int argc, char** argv) {
         queue_wait->record(conv.to_ns(adsb::tick_delta(t_pop, it.t_ingest)));
         // rx_ns was taken right after recv() (mono_ns domain): this covers
         // parse + handoff + decode + track state, i.e. receive -> state done.
+        // With A/B only forwarded frames count (a dropped copy updates nothing).
         const std::uint64_t done_ns = adsb::mono_ns();
-        recv_to_state->record(done_ns > r.rx_ns ? done_ns - r.rx_ns : 0);
+        if (forward) recv_to_state->record(done_ns > r.rx_ns ? done_ns - r.rx_ns : 0);
         shared.frames.fetch_add(1, std::memory_order_relaxed);
         publish(engine->stats().bad_frames);
       } else {
-        if (ingest_done.load(std::memory_order_acquire) && state_q->empty_approx()) break;
+        if (ingest_done.load(std::memory_order_acquire) && state_q->empty_approx() &&
+            (!state_qb || state_qb->empty_approx())) {
+          break;
+        }
         // Idle: let tracks expire on (event) time even when no frames arrive.
         if (++idle_spins % 4096 == 0) {
           engine->advance(adsb::mono_ns(), sink);
@@ -513,7 +670,7 @@ int main(int argc, char** argv) {
           // The writer refuses a record whose time goes backwards (or a bad
           // length); count it rather than lose it silently.
           if (!writer.append(r)) shared.record_rejected.fetch_add(1, std::memory_order_relaxed);
-        } else if (ingest_done.load(std::memory_order_acquire) && rec_q->empty_approx()) {
+        } else if ((ab ? state_done : ingest_done).load(std::memory_order_acquire) && rec_q->empty_approx()) {
           break;
         } else {
           std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -532,14 +689,15 @@ int main(int argc, char** argv) {
     if (stats_every_s > 0 && now >= next_report) {
       const std::uint64_t f = shared.frames.load();
       std::printf("[%6.1f s] %llu frames (%.0f/s), %llu tracks, %llu position updates, %llu bad frames, "
-                  "%llu dropped (overload)%s\n",
+                  "%llu dropped (overload)%s%s\n",
                   static_cast<double>(now - t_start) * 1e-9, static_cast<unsigned long long>(f),
                   static_cast<double>(f - last_frames) / (static_cast<double>(now - last_t) * 1e-9),
                   static_cast<unsigned long long>(shared.tracks.load()),
                   static_cast<unsigned long long>(shared.positions.load()),
                   static_cast<unsigned long long>(shared.bad.load()),
                   static_cast<unsigned long long>(shared.overload_dropped.load()),
-                  rec_q ? (", recorded " + std::to_string(shared.recorded.load())).c_str() : "");
+                  rec_q ? (", recorded " + std::to_string(shared.recorded.load())).c_str() : "",
+                  ab ? (", " + std::to_string(shared.arb_dropped.load()) + " A/B copies dropped").c_str() : "");
       std::fflush(stdout);
       last_frames = f;
       last_t = now;
@@ -548,6 +706,7 @@ int main(int argc, char** argv) {
   }
 
   ingest.join();
+  if (ingest_b.joinable()) ingest_b.join();
   state.join();
   if (recorder.joinable()) recorder.join();
   if (pub || conf) {
@@ -570,32 +729,54 @@ int main(int argc, char** argv) {
   const bool rec_ok = record_path.empty() || writer.close();
 
   // Final report (all worker threads have finished; reading their state is safe).
-  const auto s = source.stats();
+  if (arbiter) arbiter->finish();
   const auto& es = engine->stats();
   auto u = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
-  std::uint64_t input_frames = s.frames;
-  if (iq_source) {
-    const auto q = iq_source->stats();
-    input_frames = q.frames;
-    std::printf("source      IQ %s (%s, %.3f MS/s, %zu-sample blocks, %zu buffers, %s)%s\n", iq_cfg.path.c_str(),
-                adsb::demod::format_name(iq_cfg.format), iq_cfg.sample_rate_hz / 1e6, iq_cfg.block_samples,
-                iq_cfg.buffers,
-                iq_cfg.speed > 0 ? (std::to_string(iq_cfg.speed) + "x real time").c_str() : "unpaced",
-                q.read_error ? " READ ERROR" : "");
-    std::printf("iq          %llu blocks (%llu samples, %.2f s), %llu blocks dropped (%llu samples, %.4f%%), "
-                "ring high water %llu of %zu, max lateness %.3f ms\n",
-                u(q.blocks), u(q.samples), static_cast<double>(q.samples) / iq_cfg.sample_rate_hz, u(q.blocks_dropped),
-                u(q.samples_dropped), q.samples ? 100.0 * static_cast<double>(q.samples_dropped) / static_cast<double>(q.samples) : 0.0,
-                u(q.ring_high_water), iq_cfg.buffers, static_cast<double>(q.max_lateness_ns) * 1e-6);
-    std::printf("demod       %llu frames (%llu by the sequence detector, %llu fixed), %llu preambles, %llu failed; "
-                "%llu frame times raised to stay monotonic\n",
-                u(q.demod.frames), u(q.demod.sequence_decoded), u(q.demod.corrected), u(q.demod.preambles),
-                u(q.demod.bad_crc), u(q.time_clamped));
-  } else {
-    std::printf("source      %s:%u, %llu connects, %llu disconnects, %llu failed attempts\n", src_cfg.host.c_str(),
-                src_cfg.port, u(s.connects), u(s.disconnects), u(s.connect_failures));
-    std::printf("stream      %llu bytes, %llu frames, %llu truncated, %llu bad type, %llu bytes skipped\n",
-                u(s.bytes), u(s.frames), u(s.parser.truncated), u(s.parser.bad_type), u(s.parser.skipped_bytes));
+  std::uint64_t input_frames = 0;
+  auto report_line = [&](int line) {
+    adsb::ingest::IqSource* iq = line == 0 ? iq_source.get() : iq_source_b.get();
+    const adsb::ingest::IqSourceConfig& ic = line == 0 ? iq_cfg : iq_cfg_b;
+    const char* tag = !ab ? "" : line == 0 ? " (line A)" : " (line B)";
+    // "source      ..." as before for one line; "source (line A) ..." with A/B.
+    auto lab = [&](const char* name) {
+      std::string l = std::string(name) + tag;
+      l.resize(std::max<std::size_t>(l.size() + 1, 12), ' ');
+      return l;
+    };
+    if (iq) {
+      const auto q = iq->stats();
+      input_frames += q.frames;
+      std::printf("%sIQ %s (%s, %.3f MS/s, %zu-sample blocks, %zu buffers, %s)%s\n", lab("source").c_str(), ic.path.c_str(),
+                  adsb::demod::format_name(ic.format), ic.sample_rate_hz / 1e6, ic.block_samples, ic.buffers,
+                  ic.speed > 0 ? (std::to_string(ic.speed) + "x real time").c_str() : "unpaced",
+                  q.read_error ? " READ ERROR" : "");
+      std::printf("%s%llu blocks (%llu samples, %.2f s), %llu blocks dropped (%llu samples, %.4f%%), "
+                  "ring high water %llu of %zu, max lateness %.3f ms\n",
+                  lab("iq").c_str(), u(q.blocks), u(q.samples), static_cast<double>(q.samples) / ic.sample_rate_hz,
+                  u(q.blocks_dropped), u(q.samples_dropped),
+                  q.samples ? 100.0 * static_cast<double>(q.samples_dropped) / static_cast<double>(q.samples) : 0.0,
+                  u(q.ring_high_water), ic.buffers, static_cast<double>(q.max_lateness_ns) * 1e-6);
+      std::printf("%s%llu frames (%llu by the sequence detector, %llu fixed), %llu preambles, %llu failed; "
+                  "%llu frame times raised to stay monotonic\n",
+                  lab("demod").c_str(), u(q.demod.frames), u(q.demod.sequence_decoded), u(q.demod.corrected), u(q.demod.preambles),
+                  u(q.demod.bad_crc), u(q.time_clamped));
+    } else {
+      const auto st = line == 0 ? source.stats() : source_b->stats();
+      const adsb::ingest::BeastTcpConfig& bc = line == 0 ? src_cfg : b_cfg;
+      input_frames += st.frames;
+      std::printf("%s%s:%u, %llu connects, %llu disconnects, %llu failed attempts\n", lab("source").c_str(), bc.host.c_str(),
+                  bc.port, u(st.connects), u(st.disconnects), u(st.connect_failures));
+      std::printf("%s%llu bytes, %llu frames, %llu truncated, %llu bad type, %llu bytes skipped\n", lab("stream").c_str(),
+                  u(st.bytes), u(st.frames), u(st.parser.truncated), u(st.parser.bad_type),
+                  u(st.parser.skipped_bytes));
+    }
+  };
+  report_line(0);
+  if (ab) {
+    report_line(1);
+    std::fputs(adsb::ingest::arbiter_report(*arbiter).c_str(), stdout);
+    std::printf("merge       %llu receive times raised to keep the two lines in order\n",
+                u(shared.merge_clamped.load()));
   }
   std::printf("engine      %llu frames, %llu bad, %llu duplicates, A/P accepted %llu / rejected %llu\n",
               u(es.frames), u(es.bad_frames), u(es.duplicates), u(es.ap_accepted), u(es.ap_rejected));
@@ -633,11 +814,17 @@ int main(int argc, char** argv) {
     std::printf("conflated state digest %s\n", conf->recovery().state().book().hex_state_digest().c_str());
   }
   std::printf("overload    policy %s, %llu frames dropped at the input boundary (%.4f%%), "
-              "queue high water %llu of %zu\n",
+              "queue high water %llu of %zu%s\n",
               overload_block ? "block" : "drop", u(shared.overload_dropped.load()),
               input_frames ? 100.0 * static_cast<double>(shared.overload_dropped.load()) / static_cast<double>(input_frames) : 0.0,
               u(shared.queue_high_water.load()),
-              max_queue == 0 || max_queue > StateQueue::kCapacity ? StateQueue::kCapacity : max_queue);
+              max_queue == 0 || max_queue > StateQueue::kCapacity ? StateQueue::kCapacity : max_queue,
+              ab ? ("; line A " + std::to_string(shared.line_dropped[0].load()) + " dropped, high water " +
+                    std::to_string(shared.line_high_water[0].load()) + "; line B " +
+                    std::to_string(shared.line_dropped[1].load()) + " dropped, high water " +
+                    std::to_string(shared.line_high_water[1].load()))
+                       .c_str()
+                 : "");
   std::printf("build       %s\n", adsb::build_variant());
   std::printf("latency (receive -> track state updated%s, per frame):\n", pub ? " and published" : "");
   print_hist("queue wait", *queue_wait);

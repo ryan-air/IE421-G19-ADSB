@@ -29,7 +29,7 @@ This document describes how we are extending the Fall 2025 **ADS-B Aircraft Trac
 >
 > Ready to run on the benchmark host: `bench/lab/run.sh` (every benchmark in one command, including AF_XDP zero-copy over two cabled ports; see `bench/lab/README.md`).
 >
-> Not started: AF_XDP zero-copy numbers (need a NIC that supports it), hardware timestamps (§9.4, on hold), the arbiter (B), the demodulator (A), and fusion (I).
+> Not started: AF_XDP zero-copy numbers (need a NIC that supports it), hardware timestamps (§9.4, on hold), and fusion (I). The demodulator (A) and the A/B arbiter (B) are done on synthetic input (§22.2, §6.4).
 
 > **Core idea:** treat the 1090 MHz aircraft feed as a stand-in for an exchange market data feed, and own the whole path from **antenna to published decision**. We demodulate the radio samples ourselves, merge redundant A/B receiver lines, decode and maintain state on a lock-free pinned-core pipeline, and publish over kernel UDP, io_uring, AF_XDP, or shared memory. Every segment is measured in cycles and nanoseconds against hardware timestamps. We then show that the same infrastructure handles a real exchange feed (**Nasdaq ITCH 5.0**) at tens of millions of messages per second.
 
@@ -224,6 +224,11 @@ Exchanges publish every message on two redundant feeds (A and B). Feed handlers 
 - **Win rate and win margin:** the distribution of `t_late − t_early` for frames received on both lines. This is the latency saved by arbitration.
 - **Relative clock behavior of the two dongles:** at the same site, the true arrival-time difference is about 0. Comparing the two sample counters directly measures their crystal offset and drift, which is the groundwork for multilateration (§15.4).
 - Fault injection: unplug, detune, or attenuate one line, and show that the output feed has no gap.
+
+### 6.4 Status (built, on simulated lines)
+- `Arbiter` (`core/include/adsb/ingest/arbiter.hpp`): payload + length as identity, FIFO of entries with an open-addressing index, event-time window, up to four lines, the §6.3 counters, win-margin histograms, and a linear fit of the two radio clocks. In `adsb-live` the state thread merges two ingest queues (two readsb Beast streams, or two IQ inputs through our demodulator) by receive time; `adsb-replay --arbitrate` repeats a live run's decisions from its recording.
+- The window had to grow beyond 5 ms in `adsb-live`: readsb batches its Beast output for up to 50 ms, and an IQ line hands over a whole block's frames at once (6.8 ms at 16,384 samples), so copies arrive further apart than the radio path alone would suggest. Defaults: 60 ms for Beast lines, twice the block duration for IQ lines.
+- Fault injection is simulated (`adsb-synth --outage`, a Beast server stopped mid-run); unplugging a real dongle waits for the second RTL-SDR. Results: `core/README.md`, *A/B line arbitration*.
 
 ---
 
@@ -646,7 +651,9 @@ On `main`, with CI passing:
 
 - the demodulator (§5.2): `adsb-demod` decodes the generator's files with 1–20% more messages than readsb on the same files (+10% on weak signals), thanks to a sequence detector behind the half-bit slicer, and no false DF17; starts within 0.06 µs of the truth (`core/scripts/check-demod.sh`, in CI). `adsb-live --iq` runs the whole pipeline on IQ samples: a paced reader and a block ring that drops and counts whole blocks under overload, then the demodulator, track state and feed; last sample → track state p50 1.2 / 5.2 / 20 ms for 1.7 / 6.8 / 27 ms blocks (`core/scripts/check-iq-live.sh`, in CI). Speed: 6.1 ns per sample at 2.4 MS/s on one laptop core (profiling, then four-wide NEON / SSE2 SIMD, output byte-identical), readsb 5.35 ns. Not yet: real RTL-SDR recordings, a live `librtlsdr` source (§5.1), the 3 ns target.
 
-Not started: A/B arbitration (B), hardware timestamps (§9.4), ITCH (J), and camera fusion (I).
+- A/B line arbitration (§6): the arbiter in `adsb-live` (two readsb lines or two IQ inputs) and `adsb-replay --arbitrate`; on two synthetic IQ receivers it matches exactly the frames both demodulators decoded and forwards their union (`core/scripts/check-ab.sh`, in CI).
+
+Not started: hardware timestamps (§9.4), ITCH (J), and camera fusion (I).
 
 ### 22.3 What MATLAB offers
 

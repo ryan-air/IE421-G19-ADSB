@@ -34,6 +34,9 @@ namespace {
                "  --allow-truncated read a recording that has no footer (recorder was killed)\n"
                "  --hash-only       print only the output hash\n"
                "  --fix             repair one wrong bit in DF17/18 frames (as readsb does by default)\n"
+               "  --arbitrate       A/B line arbitration first: forward each frame's first copy only,\n"
+               "                    and report each line's contribution (README_UPDATES.md §6)\n"
+               "  --arb-window-us N arbitration window (default 5000)\n"
                "  --book-digest     also print the digest of the final track book (what a feed\n"
                "                    subscriber reconstructs; compare with adsb-publish --no-publish-ts)\n");
   std::exit(code);
@@ -56,6 +59,8 @@ int main(int argc, char** argv) {
   opt.flush_at_end = true;
   bool pipeline = false, allow_truncated = false, hash_only = false, book_digest = false, fix = false;
   int reader_cpu = -1, worker_cpu = -1;
+  bool arbitrate = false;
+  adsb::ingest::ArbiterConfig arb_cfg;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -80,6 +85,13 @@ int main(int argc, char** argv) {
     else if (a == "--hash-only") hash_only = true;
     else if (a == "--fix") fix = true;
     else if (a == "--book-digest") book_digest = true;
+    else if (a == "--arbitrate") arbitrate = true;
+    else if (a == "--arb-window-us") {
+      const long long w = std::strtoll(val().c_str(), nullptr, 10);
+      if (w < 1 || w > 1'000'000) usage(1);
+      arb_cfg.window_ns = static_cast<std::uint64_t>(w) * 1000;
+      arbitrate = true;
+    }
     else if (!a.empty() && a[0] == '-') {
       std::fprintf(stderr, "adsb-replay: unknown option %s\n", a.c_str());
       usage(1);
@@ -107,6 +119,12 @@ int main(int argc, char** argv) {
   std::vector<std::uint8_t> captured;
   std::vector<std::uint8_t>* capture = out_path.empty() && !book_digest ? nullptr : &captured;
   auto lat = std::make_unique<adsb::replay::PipelineLatency>();
+  std::unique_ptr<adsb::ingest::Arbiter> arbiter;
+  if (arbitrate) {
+    arb_cfg.radio_clock_hz = rd.info().radio_clock_hz;
+    arbiter = std::make_unique<adsb::ingest::Arbiter>(arb_cfg);
+    opt.arbiter = arbiter.get();
+  }
   const adsb::replay::ReplayResult r =
       pipeline ? adsb::replay::replay_pipeline(rd, *engine, opt, lat.get(), reader_cpu, worker_cpu, capture)
                : adsb::replay::replay_inline(rd, *engine, opt, capture);
@@ -163,6 +181,7 @@ int main(int argc, char** argv) {
     print_hist("decode+state", lat->process_ns);
     print_hist("total", lat->total_ns);
   }
+  if (arbiter) std::fputs(adsb::ingest::arbiter_report(*arbiter).c_str(), stdout);
   if (book_digest) {
     std::printf("book        %zu tracks\n", book_size);
     std::printf("book digest %s\n", book_hex.c_str());

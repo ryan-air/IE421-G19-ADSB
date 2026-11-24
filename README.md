@@ -76,7 +76,7 @@ To track real aircraft, run readsb with an RTL-SDR receiver and point `adsb-live
 | [`protocol/`](protocol/feed_spec.md) | The feed's wire format: one JSON schema, generated C++/JavaScript/Python code, golden packets |
 | [`spec/`](spec/README.md) | TLA+ model of gap recovery; GenMC models of the lock-free rings |
 | [`gateway/`](gateway/README.md) | WebSocket gateway (Node, no dependencies): feed subscriber, per-client conflation and flow control, serves the map |
-| `ads/` | The web map (Leaflet). It takes the live feed from the gateway, or polls the Fall 2025 server |
+| `ads/` | The web map (Leaflet) and the 3D globe (Cesium). Both take the live feed from the gateway, or poll the Fall 2025 server |
 | [`bench/`](bench/legacy/README.md) | Fall 2025 vs. new pipeline benchmark (Docker), live-ingest test against readsb, the benchmark-host suite ([`bench/lab/`](bench/lab/README.md)), results |
 | `ads-b-receiver/`, `data-generator/` | The Fall 2025 streamer and test data generator |
 

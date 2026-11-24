@@ -140,6 +140,8 @@ The application uses **Supabase** (PostgreSQL) to store aircraft data. The Raspb
 - `index.html` - Main HTML page
 - `styles.css` - Styling
 - `app.js` - Frontend JavaScript (map and data fetching)
+- `3d.html`, `cesium-app.js` - The 3D globe (Cesium)
+- `live-feed.js` - The live WebSocket feed both pages use when served by the gateway (`gateway/`); without it they poll the server as before
 - `server.js` - Backend Express server
 - `package.json` - Dependencies and scripts
 

@@ -36,12 +36,14 @@ Endpoints: `/` serves the map, `/gateway/ws` is the WebSocket, `/gateway/stats` 
 
 **Flow control.** A client that opts in keeps at most `window` frames unacknowledged. While it is behind, its changes are conflated into the next frame. Without this, a slow browser's backlog hides in kernel socket buffers, which on loopback autotune to megabytes. A client stalling 3 ms per frame then fell more than 18 s behind. With a window of 8 it stays about 20 ms behind (8 frames × its own 3 ms). The map (`ads/app.js`) and `adsb-ws-client` both use window 8 and acknowledge every 4 frames. Clients without flow control are still served: the gateway writes a frame only once the previous one is in the kernel (`--high-water 0`). A client stuck for 10 s (`--stuck-ms`) is disconnected.
 
-**The map.** `ads/` is served as it is. Its `app.js` takes the live feed itself (the "Live feed" section at its end; until November 2026 this was a separate shim that the gateway added to the page). When the page can load `/gateway/gateway_protocol.mjs`, it:
+**The map.** `ads/` is served as it is. Both pages, the 2D map (`index.html`, `app.js`) and the 3D globe (`3d.html`, `cesium-app.js`), take the live feed through `ads/live-feed.js` (until November 2026 the 2D map had a separate shim that the gateway added to the page, and the 3D globe only polled). When a page can load `/gateway/gateway_protocol.mjs`, it:
 - keeps a live table from the WebSocket;
 - redraws from that table when frames arrive, at most every 100 ms (`?render_ms=N`), on an animation frame, and stops polling `/api/aircraft` while in sync;
 - shows markers at their latest position instead of easing over 2 s (`?animate=1` restores the easing);
 - acknowledges frames for flow control;
 - reconnects with backoff, with the 2-second poll covering the time out of sync (back in sync about 1 s after a gateway restart).
+
+The 3D globe keeps its 2 s poll of `/api/aircraft/enriched` while in sync, but only for what the feed does not carry: the aircraft type (helicopter models), trails, and the Fall 2025 server's probability cones. It adds a trail point every 2 s (so trails still span about 100 s) and moves the camera in follow mode at most every 1.5 s. On the laptop, an update of 150 aircraft takes about 4 ms of the page's time (`window.__gateway.renderTimeMs`; the globe's entities are in `window.__globe`). `gateway/test/live_feed.test.mjs` runs `live-feed.js` as a page would, against a real gateway.
 
 Served by the Fall 2025 `server.js`, there is no protocol module, so the page polls as before.
 

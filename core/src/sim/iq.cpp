@@ -236,7 +236,8 @@ bool validate_iq_config(const IqConfig& c, std::string* why) {
       !check(c.oversample >= 1 && c.oversample <= 64, "oversample must be in [1, 64]") ||
       !in(c.antenna_height_m, 0, 1000, "antenna height") || !in(c.cable_loss_db, 0, 100, "cable loss") ||
       !in(c.noise_figure_db, 0, 50, "noise figure") || !in(c.full_scale_dbm, -200, 50, "full scale") ||
-      !in(c.rx_ppm, -1000, 1000, "ppm") || !in(c.dc_i, -1, 1, "DC offset I") || !in(c.dc_q, -1, 1, "DC offset Q") ||
+      !in(c.rx_ppm, -1000, 1000, "ppm") || !in(c.lo_drift_ppm_per_s, -1, 1, "LO drift") ||
+      !in(c.dc_i, -1, 1, "DC offset I") || !in(c.dc_q, -1, 1, "DC offset Q") ||
       !in(c.iq_gain_imbalance, -0.5, 0.5, "IQ gain imbalance") || !in(c.iq_phase_deg, -45, 45, "IQ phase") ||
       !in(c.tx_power_min_dbm, -50, 90, "tx power min") || !in(c.tx_power_max_dbm, c.tx_power_min_dbm, 90, "tx power max") ||
       !in(c.tx_offset_sd_hz, 0, 1e6, "tx offset spread") || !in(c.tx_drift_sd_hz_per_s, 0, 1e4, "tx drift spread") ||
@@ -384,6 +385,12 @@ IqPlan plan_iq(const SynthConfig& synth, const SynthOutput& traffic, const IqCon
 
     IqMessage m;
     m.link = compute_link(site, e, cfg);
+    if (cfg.lo_drift_ppm_per_s != 0.0) {
+      // The LO is higher by center * drift * t: every path's baseband is lower.
+      const double shift = cfg.center_hz * cfg.lo_drift_ppm_per_s * 1e-6 * t;
+      m.link.baseband_hz -= shift;
+      for (int p = 0; p < m.link.n_paths; ++p) m.link.paths[p].freq_hz -= shift;
+    }
     if (m.link.ground_distance_m > m.link.horizon_m) ++plan.stats.beyond_horizon;
     m.snr_db = m.link.power_dbm - plan.noise_dbm;
     // Skipped only if every path is weak (an echo can outlive the direct path).
@@ -582,10 +589,12 @@ std::string sigmf_meta(const SynthConfig& synth, const IqConfig& cfg, const IqPl
   j.add("    \"core:extensions\": [{\"name\": \"adsb\", \"version\": \"0.1.0\", \"optional\": true}],\n");
   j.add("    \"adsb:receiver\": {\"lat\": %.7f, \"lon\": %.7f, \"ground_alt_m\": %d, \"antenna_height_m\": %.2f, "
         "\"antenna\": \"%s\", \"cable_loss_db\": %.2f, \"noise_figure_db\": %.2f, \"full_scale_dbm\": %.2f, "
-        "\"ppm\": %.4f, \"dc_i\": %.5f, \"dc_q\": %.5f, \"iq_gain_imbalance\": %.5f, \"iq_phase_deg\": %.4f},\n",
+        "\"ppm\": %.4f, \"lo_drift_ppm_per_s\": %.6f, \"dc_i\": %.5f, \"dc_q\": %.5f, \"iq_gain_imbalance\": %.5f, "
+        "\"iq_phase_deg\": %.4f},\n",
         synth.receiver_lat, synth.receiver_lon, synth.receiver_alt_m, cfg.antenna_height_m,
         cfg.antenna == AntennaPattern::kDipole ? "vertical dipole" : "omni", cfg.cable_loss_db,
-        cfg.noise_figure_db, cfg.full_scale_dbm, cfg.rx_ppm, cfg.dc_i, cfg.dc_q, cfg.iq_gain_imbalance,
+        cfg.noise_figure_db, cfg.full_scale_dbm, cfg.rx_ppm, cfg.lo_drift_ppm_per_s, cfg.dc_i, cfg.dc_q,
+        cfg.iq_gain_imbalance,
         cfg.iq_phase_deg);
   j.add("    \"adsb:noise\": {\"enabled\": %s, \"dbm\": %.3f, \"sigma_fs\": %.8f},\n", cfg.noise ? "true" : "false",
         plan.noise_dbm, plan.noise_sigma);

@@ -85,6 +85,11 @@ struct IqConfig {
   double full_scale_dbm = -70.0;   // antenna-port power that reaches amplitude 1.0
   bool noise = true;
   double rx_ppm = 0.0;             // LO and sample-clock error (same crystal)
+  // LO drift (a receiver warming up): the LO error grows by this many ppm
+  // per second from rx_ppm at t = 0. Only the LO: the sample clock keeps
+  // rx_ppm (its drift would change frequencies by < 1 Hz but move every
+  // sample position, which the truth annotations assume fixed).
+  double lo_drift_ppm_per_s = 0.0;
   double dc_i = 0.0;               // DC offset, fraction of full scale
   double dc_q = 0.0;
   double iq_gain_imbalance = 0.0;  // Q gain is (1 + this)

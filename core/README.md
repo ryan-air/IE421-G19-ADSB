@@ -332,6 +332,49 @@ Not done: real RTL-SDR recordings (§5.3; the generator is the only input so far
 
 The block-size row is the trade-off §5.1 plans to measure on a real RTL-SDR: smaller transfers cut the latency almost in proportion, at the cost of more wake-ups. On the laptop the reader sometimes wakes milliseconds late (`max lateness` in the report), which shows in the p99.
 
+### Transponder frequency study (README_UPDATES.md §22.5)
+
+How far is each aircraft's transmitter from 1090 MHz, and how much does it drift? The standard allows ±1 MHz. The pieces:
+
+- **Per message** ([`CarrierEstimator`](include/adsb/demod/carrier.hpp)): once a message is decoded, its pulse pattern is known. Each sample gets a weight (the share of it that pulses cover) and a time (the middle of the covered part). The estimate maximizes |Σ w z e^{−j2πft}|:
+  1. coarse peak of a zero-padded FFT over the whole band;
+  2. a grid of 1/(4T) over two FFT bins;
+  3. weighted least squares of each sample's remaining phase against time.
+
+  The fit's residuals give a standard error (over the effective number of samples). `coherence` (1 = one clean carrier across the message) flags collisions and transmitters whose phase jumps between pulses. ADC-clipped samples are left out; `adsb-carrier` marks them before it removes the DC offset, which would otherwise move them below the clip level. A fit that moves more than two grid steps from the grid's peak is rejected.
+- **Per recording** ([`adsb-carrier`](tools/adsb_carrier.cpp)): demodulates, estimates every frame, runs the frames through the track engine, and computes each message's Doppler from the aircraft's decoded position (moved forward from its last accepted fix, changed or not, with its velocity) and velocity. Output is one CSV row per frame; the centre frequency comes from the SigMF metadata. About 12–23× real time at 2.4 MS/s on one core.
+- **The study** ([`carrier-study.py`](scripts/carrier-study.py)):
+  - **Receiver error:** given (`--rx-ppm`, a GPS-disciplined or calibrated receiver), or estimated as the value that makes the mean aircraft offset zero (good only to about 100 kHz / √N, and printed with its standard error).
+  - **Receiver drift** (`--rx-drift BIN_S`, a receiver warming up): alternating least squares with each aircraft's own offset and drift, and one receiver value per time bin. It is measured from t = 0, so a given or estimated ppm is the LO error at the start. The population's mean drift is taken as zero. Without receiver drift the option only adds noise.
+  - **Per aircraft:** offset, drift with its standard error, residual spread, and Allan deviation at 1–50 s, of the offsets and of the residuals after the drift fit.
+  - **Groups:** by emitter category and by type (`--types`: a CSV, or `ads/aircraft-types-by-hex.json` for the FAA class of US registrations).
+  - **Ground truth:** `--truth` scores it all against the generator.
+
+[`scripts/check-carrier.sh`](scripts/check-carrier.sh) (CI job `iq`, 11 checks), generator scenarios:
+
+| Scenario | Result |
+|---|---|
+| 60 aircraft, 60 s, 2.4 MS/s cu8, receiver +12 ppm known | per message: error p50 23 Hz, p95 117 Hz; reported sigma right (\|err/σ\| p50 0.75; 0.67 = exact); Doppler error p50 0.4 Hz, p95 2.5 Hz. Per aircraft: offset error p50 6 Hz, p90 11 Hz; drift error p50 0.08 Hz/s |
+| The same, receiver ppm estimated from the aircraft | +27.8 ± 12.4 ppm (true +12): the aircraft's own scatter (σ ≈ 100 kHz) limits it; differences between aircraft keep their 6 Hz |
+| Offsets up to ±1 MHz (σ 500 kHz) at 2.4 MS/s | measured (largest 0.9 MHz), same per-aircraft precision |
+| LO drifting 0.02 ppm/s (22 Hz/s) for 120 s | without `--rx-drift`, every drift is 22 Hz/s off; with `--rx-drift 10`: receiver drift 0.01996 ppm/s found, aircraft drifts within 0.04 Hz/s, offsets within 3 Hz of each other plus a common 10 Hz from extrapolating the receiver drift back to t = 0 |
+| Transmitters within 1 kHz, receiver +50 ppm drifting 0.005 ppm/s | the ppm at t = 0 estimated from the aircraft within 0.3 ppm (a sign or timing error in the ppm would show here) |
+| 6 MS/s cs16, a reflector 12 dB down, DC offset | multipath is the largest error: 92 Hz per message, and not in the reported sigma; aircraft offsets still within 15 Hz (their geometry changes) |
+
+Findings that matter for the real study:
+- **Multipath dominates:** the echo has its own Doppler and overlaps other bits. A site with few reflectors (or a directional antenna) matters more than SNR.
+- **Phase coherence is assumed.** A transmitter whose phase jumps between pulses (old cavity-oscillator transponders) has coherence < 0.5 in the unit test. Such aircraft are listed as "mostly incoherent", not measured.
+- **The receiver's crystal limits absolute offsets:** an RTL-SDR at 1 ppm is 1.09 kHz off. Aircraft-to-aircraft differences and drifts don't need a reference. Absolute offsets better than ~10 ppm / √(N/60) need a GPS-disciplined receiver or a known reference signal.
+- `--lo-drift` on `adsb-iqsynth` (new) drifts only the LO. The sample clock's drift would shift every sample position, and the truth assumes they are fixed.
+
+On a real recording (an RTL-SDR at 2.4 MS/s; keep the gain below clipping):
+
+```bash
+rtl_sdr -f 1090000000 -s 2400000 -g 30 -n 1440000000 capture.cu8     # 10 minutes
+core/build/release/tools/adsb-carrier capture.cu8 --format cu8 --rate 2.4e6 --receiver LAT,LON,ALT_M --out messages.csv
+python3 core/scripts/carrier-study.py messages.csv --rx-drift 10 --types ads/aircraft-types-by-hex.json --aircraft-out aircraft.csv
+```
+
 ### A/B line arbitration (Workstream B, README_UPDATES.md §6)
 
 Two receivers at one site hear the same transmissions but lose different ones. Like a feed handler with an exchange's A and B feeds, the [`Arbiter`](include/adsb/ingest/arbiter.hpp) forwards the first copy of every frame and drops the later ones, so the output is the union of the lines, and each frame is as early as the faster line delivered it. ADS-B has no sequence numbers: a frame is its payload (56 or 112 bits) inside a window. Identical payloads legitimately repeat no sooner than about 400 ms (velocity, identification, DF11), and a dropped repeat would carry nothing new anyway.

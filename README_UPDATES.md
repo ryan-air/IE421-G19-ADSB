@@ -717,6 +717,12 @@ MATLAB is still useful to us as an **independent oracle**: its receiver example 
 
 **Before the hardware:** the generator (§22.4) tests the whole method on synthetic aircraft whose true offsets and drift we know.
 
+**Status (2026-11-24):** the software is built and checked on the generator (`core/README.md`, *Transponder frequency study*):
+- `adsb-carrier` gives a per-message estimate (pulse-pattern-weighted ML fit, about 23 Hz at 2.4 MS/s and 20 dB SNR), with the Doppler from the decoded track;
+- `carrier-study.py` removes the receiver's error and drift and fits each aircraft's offset, drift and Allan deviation, grouped by category and type.
+
+Multipath turned out to be the largest error source. The real study waits for recordings from the lab receiver.
+
 ### 22.6 Hardware and data we still need
 
 | Need | For |

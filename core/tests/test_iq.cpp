@@ -814,7 +814,9 @@ TEST(IqScenario, OutputHashIsStable) {
   char buf[64];
   std::snprintf(buf, sizeof buf, "%08x %08x %zu", adsb::crc32(q.data(), q.size()),
                 adsb::crc32(meta.data(), meta.size()), plan.messages.size());
-  EXPECT_STREQ(buf, "c29a3160 38156009 115");
+  // The samples are unchanged since the generator was added; the metadata
+  // gained adsb:receiver lo_drift_ppm_per_s (was 38156009).
+  EXPECT_STREQ(buf, "c29a3160 8e9385f4 115");
 }
 
 TEST(IqScenario, SigmfMetadataHasTheRequiredFields) {

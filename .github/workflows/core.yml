@@ -90,7 +90,7 @@ jobs:
 
       - name: Fuzz
         run: |
-          for target in beast decoder packet feed demod; do
+          for target in beast decoder packet feed demod carrier; do
             mkdir -p "/tmp/corpus_$target"
             cp fuzz/corpus/$target/* "/tmp/corpus_$target/"
             ./build/fuzz/fuzz/fuzz_$target -max_total_time=60 -print_final_stats=1 \
@@ -545,7 +545,7 @@ jobs:
       - name: Build
         run: |
           CXX=g++-14 cmake -S . -B build/iq -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
-          cmake --build build/iq --target adsb-iqsynth adsb-demod adsb-live adsb-feed-cli
+          cmake --build build/iq --target adsb-iqsynth adsb-demod adsb-live adsb-feed-cli adsb-carrier
       # Determinism and formats, then readsb decodes cu8 and cs16 files
       # (clean 15-30 dB messages >= 97%, timestamps within one sample),
       # impairments, multipath echoes, and the gain trade-off.
@@ -561,3 +561,8 @@ jobs:
       # latency against block size, and blocks dropped and counted at 100x.
       - name: IQ into the live pipeline
         run: scripts/check-iq-live.sh build/iq
+      # Transponder frequency study (plan 22.5): adsb-carrier + carrier-study.py
+      # against the generator's transmitter offsets, drifts, Doppler and
+      # receiver error, incl. a drifting LO and multipath.
+      - name: Carrier frequency
+        run: scripts/check-carrier.sh build/iq

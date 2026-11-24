@@ -37,6 +37,7 @@ These were measured on a laptop. They are medians, because laptop tails are unre
 | Our demodulator on the same IQ files, against readsb | — | 1–20% more messages than readsb (+10% on weak signals), no false DF17; starts within 0.06 µs of the truth; about 70× real time on one core at 2.4 MS/s with SIMD (readsb is about 1.1× faster) |
 | IQ sample → track state, through our demodulator (`adsb-live --iq`, 6.8 ms blocks) | — | p50 5.2 ms, p99 9.2 ms (mostly waiting for the rest of the block; 1.2 ms with 1.7 ms blocks) |
 | Two receivers merged (A/B arbitration, like an exchange's A and B feeds; synthetic IQ, two receivers with independent noise) | — | 16% more frames than the better receiver alone, every copy matched; about 25 ns per frame |
+| Transponder carrier frequency per message, from IQ (frequency-stability study; synthetic IQ with known offsets, Doppler and receiver error) | — | per message p50 23 Hz; each aircraft's offset within 6 Hz (p50) and drift within 0.08 Hz/s; Doppler from the decoded track within 0.4 Hz |
 
 The comparison runs both systems on the same traffic through readsb, at 50–3,000 aircraft. Details are in [bench/results/legacy-baseline/](bench/results/legacy-baseline/README.md) and [core/README.md](core/README.md).
 

@@ -27,6 +27,7 @@ set(ADSB_TEST_SOURCES
   test_dst.cpp
   test_iq.cpp
   test_demod.cpp
+  test_carrier.cpp
   test_iq_source.cpp
 )
 

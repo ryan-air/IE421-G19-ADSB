@@ -171,7 +171,7 @@ teeth.
 
 ## GitHub Actions job (now the `tlc` job in `.github/workflows/core.yml`)
 
-Add this under `jobs:` in a workflow. This folder does not edit any workflow file.
+The job below is what CI runs (job `tlc` in `.github/workflows/core.yml`).
 
 ```yaml
   tlc-feed-recovery:

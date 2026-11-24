@@ -1084,157 +1084,22 @@ function setupControls() {
 }
 
 // ---------------------------------------------------------------------------
-// Live feed
+// Live feed (live-feed.js, shared with the 3D view)
 //
-// Served by the WebSocket gateway (gateway/), the page keeps a live copy of
-// the track table from /gateway/ws and redraws within `render_ms` (default
-// 100 ms) of each update, instead of polling /api/aircraft every 2 s. It:
-//   - acknowledges frames (flow control: window 8, an ack every 4 frames), so
-//     a page that falls behind gets conflated frames instead of a backlog;
-//   - reconnects with backoff, and the 2 s poll covers the time out of sync;
-//   - shows markers at their latest position (?animate=1 keeps the easing).
-// Served by the Fall 2025 server.js there is no gateway: the protocol module
-// fails to load and the page keeps polling, as before.
-// window.__gateway is the same object, for tests and latency measurement.
+// Served by the WebSocket gateway, the map keeps a live copy of the track
+// table and redraws within 100 ms of each update instead of polling every
+// 2 s; the poll covers the time out of sync, and without a gateway (the Fall
+// 2025 server.js) the map keeps polling. Markers jump to their latest
+// position (?animate=1 keeps the easing).
 // ---------------------------------------------------------------------------
-const liveFeed = {
-    connected: false,
-    synced: false, // first full table received
-    animate: new URLSearchParams(location.search).get('animate') === '1',
-    renderMs: Math.max(0, Number(new URLSearchParams(location.search).get('render_ms') ?? 100)),
-    frames: 0,
-    renders: 0,
-    reconnects: 0,
-    asOfSeq: 0,
-    flags: 0,
-    lastFrameAt: 0,
-    lastRenderAt: 0,
-    seen: new Map(), // icao -> wall ms of the last update
-    table: null,
-    status: null,
-    backoff: 250,
-};
-window.__gateway = liveFeed;
-let liveProto = null;
-let liveRenderTimer = null;
-let liveRenderScheduled = false;
+let liveFeed = { synced: false, animate: false }; // replaced by startLiveFeed()
 
-function liveAircraftData() {
-    const aircraft = [];
-    for (const [icao, u] of liveFeed.table.tracks) {
-        const seen = liveFeed.seen.get(icao);
-        const a = liveProto.toAircraft(u, seen ? Math.floor(seen / 1000) : null);
-        if (a.lat === null || a.lon === null) continue;
-        aircraft.push(a);
-    }
-    return { now: Date.now(), aircraft, timeWindow: 0, source: 'gateway-ws', as_of_seq: liveFeed.asOfSeq };
-}
-
-function updateLiveStatus() {
-    if (!liveFeed.connected) updateStatus(false, 'Gateway disconnected');
-    else if (!liveFeed.synced) updateStatus(false, 'Syncing...');
-    else if (liveFeed.flags & liveProto.FrameFlags.kStale) updateStatus(false, 'Recovering feed...');
-    else if (liveFeed.flags & liveProto.FrameFlags.kEnded) updateStatus(false, 'Feed ended');
-    else updateStatus(true, 'Live (WebSocket)');
-}
-
-function renderLive() {
-    liveRenderScheduled = false;
-    liveFeed.lastRenderAt = performance.now();
-    liveFeed.renders++;
-    if (liveFeed.synced) {
-        try {
-            renderAircraftData(liveAircraftData());
-        } catch (error) {
-            console.error('Error drawing the live feed:', error);
-        }
-    }
-    updateLiveStatus();
-}
-
-function scheduleLiveRender() {
-    if (liveRenderScheduled) return;
-    liveRenderScheduled = true;
-    const wait = Math.max(0, liveFeed.lastRenderAt + liveFeed.renderMs - performance.now());
-    clearTimeout(liveRenderTimer);
-    liveRenderTimer = setTimeout(() => requestAnimationFrame(renderLive), wait);
-}
-
-function connectLiveFeed() {
-    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/gateway/ws`);
-    ws.binaryType = 'arraybuffer';
-    let processed = 0;
-    let acked = 0;
-    const ack = new Uint8Array(5);
-    ack[0] = 0x41; // 'A'
-    const ackView = new DataView(ack.buffer);
-    ws.onopen = () => {
-        ws.send(JSON.stringify({ type: 'hello', window: 8 }));
-        liveFeed.connected = true;
-        liveFeed.backoff = 250;
-        updateLiveStatus();
-    };
-    ws.onmessage = (ev) => {
-        if (typeof ev.data === 'string') {
-            try {
-                liveFeed.status = JSON.parse(ev.data);
-            } catch {
-                // ignore
-            }
-            return;
-        }
-        // Count every binary frame, even one that fails to decode, or the
-        // gateway would wait for its ack forever. An ack every 4 frames keeps
-        // a window of 8 from running dry.
-        processed++;
-        if (processed - acked >= 4) {
-            acked = processed;
-            ackView.setUint32(1, acked, true);
-            ws.send(ack);
-        }
-        let frame;
-        try {
-            frame = liveProto.decodeFrame(ev.data);
-        } catch (error) {
-            console.error('gateway frame', error);
-            return;
-        }
-        const now = Date.now();
-        const touched = liveFeed.table.apply(frame);
-        if (touched === null) { // a full table
-            liveFeed.seen.clear();
-            for (const icao of liveFeed.table.tracks.keys()) liveFeed.seen.set(icao, now);
-            liveFeed.synced = true;
-        } else {
-            for (const icao of touched) {
-                if (liveFeed.table.tracks.has(icao)) liveFeed.seen.set(icao, now);
-                else liveFeed.seen.delete(icao);
-            }
-        }
-        liveFeed.frames++;
-        liveFeed.asOfSeq = frame.asOfSeq;
-        liveFeed.flags = frame.flags;
-        liveFeed.lastFrameAt = performance.now();
-        scheduleLiveRender();
-    };
-    ws.onclose = () => {
-        liveFeed.connected = false;
-        liveFeed.synced = false; // the 2 s poll takes over until the next full table
-        updateLiveStatus();
-        liveFeed.reconnects++;
-        const backoff = Math.min(5000, liveFeed.backoff);
-        liveFeed.backoff = backoff * 2;
-        setTimeout(connectLiveFeed, backoff);
-    };
-}
-
-function startLiveFeed() {
-    import('/gateway/gateway_protocol.mjs').then((m) => {
-        liveProto = m;
-        liveFeed.table = new m.TrackTable();
-        connectLiveFeed();
-    }, () => {
-        // No gateway (the Fall 2025 server): keep polling.
+function startLiveFeed2D() {
+    liveFeed = window.startLiveFeed({
+        onRender: (aircraft, feed) => renderAircraftData({
+            now: Date.now(), aircraft, timeWindow: 0, source: 'gateway-ws', as_of_seq: feed.asOfSeq,
+        }),
+        onStatus: updateStatus,
     });
 }
 
@@ -1245,7 +1110,7 @@ document.addEventListener('DOMContentLoaded', () => {
     updateStatus(false, 'Connecting...');
     setupControls();
     startPolling();
-    startLiveFeed();
+    startLiveFeed2D();
 });
 
 // Cleanup on page unload

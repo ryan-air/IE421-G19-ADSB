@@ -406,9 +406,14 @@ function updateAircraftEntity(entity, aircraft) {
         vertical_rate: aircraft.vertical_rate
     };
 
-    // Add to trail if enabled
+    // Add to trail if enabled: a point every 2 s (the poll's rate), so 50
+    // points still span ~100 s when the live feed updates 10 times a second
     if (showTrails) {
-        addToTrail(aircraft.hex, newPosition);
+        const now = performance.now();
+        if (now - (lastTrailPointAt.get(aircraft.hex) ?? -Infinity) >= TRAIL_POINT_MS) {
+            lastTrailPointAt.set(aircraft.hex, now);
+            addToTrail(aircraft.hex, newPosition);
+        }
     }
 }
 
@@ -447,6 +452,7 @@ function clearTrails() {
         viewer.entities.remove(trail);
     });
     aircraftTrails.clear();
+    lastTrailPointAt.clear();
 }
 
 // Fetch and update aircraft data
@@ -460,6 +466,11 @@ async function fetchAircraftData() {
         }
 
         const data = await response.json();
+        // The server-side extras the WebSocket frames do not carry (aircraft
+        // type, probability cones, trail). While the live feed is in sync it
+        // draws the aircraft; the poll only refreshes these.
+        liveMeta = new Map((data.aircraft || []).map((ac) => [ac.hex, ac]));
+        if (liveFeed.synced) return;
         updateStatus(true);
         document.getElementById('aircraft-count').textContent = data.aircraft?.length || 0;
 
@@ -546,11 +557,16 @@ function updateAircraftOn3DGlobe(aircraftData) {
                 viewer.entities.remove(aircraftTrails.get(hex));
                 aircraftTrails.delete(hex);
             }
+            lastTrailPointAt.delete(hex);
         }
     });
 
     // Follow mode: keep camera on followed aircraft
-    if (followMode && followedAircraft && aircraftEntities.has(followedAircraft)) {
+    // At most one camera flight per FOLLOW_FLY_MS: each lasts 1.5 s, and the
+    // live feed redraws far more often than that.
+    const followDue = performance.now() - lastFollowFlyAt >= FOLLOW_FLY_MS;
+    if (followMode && followedAircraft && aircraftEntities.has(followedAircraft) && followDue) {
+        lastFollowFlyAt = performance.now();
         const entity = aircraftEntities.get(followedAircraft);
         const position = entity.position.getValue(Cesium.JulianDate.now());
 
@@ -583,7 +599,7 @@ function updateAircraftOn3DGlobe(aircraftData) {
         });
     }
 
-    console.log(`3D Globe updated: ${seenAircraftIds.size} aircraft visible`);
+    if (!liveFeed.synced) console.log(`3D Globe updated: ${seenAircraftIds.size} aircraft visible`);
 }
 
 // Kalman filter-based collision detection and probability cone visualization
@@ -1730,6 +1746,48 @@ document.getElementById('collapse-controls').addEventListener('click', () => {
     }
 });
 
+// ---------------------------------------------------------------------------
+// Live feed (live-feed.js, shared with the 2D map)
+//
+// Served by the WebSocket gateway, the globe draws the live track table within
+// 100 ms of each update instead of every 2 s. The 2 s poll keeps running: it
+// draws while the feed is out of sync (and always without a gateway, under the
+// Fall 2025 server.js), and otherwise only refreshes the server-side extras
+// (type, probability cones, trail) merged in here.
+// ---------------------------------------------------------------------------
+const TRAIL_POINT_MS = 2000;
+const FOLLOW_FLY_MS = 1500;
+const LIST_REFRESH_MS = 1000;
+const META_FIELDS = ['type', 'probabilityCone', 'trail'];
+let liveFeed = { synced: false };
+let liveMeta = new Map(); // hex -> the last poll's aircraft
+const lastTrailPointAt = new Map(); // hex -> performance.now() of the last trail point
+let lastFollowFlyAt = -Infinity;
+let lastListRefreshAt = -Infinity;
+
+function renderLive3D(aircraft) {
+    for (const a of aircraft) {
+        const m = liveMeta.get(a.hex);
+        if (!m) continue;
+        for (const k of META_FIELDS) if (m[k] !== undefined) a[k] = m[k];
+    }
+    document.getElementById('aircraft-count').textContent = aircraft.length;
+    currentAircraftData = aircraft;
+    updateAircraftOn3DGlobe(currentAircraftData);
+    const listPanel = document.getElementById('aircraft-list-panel');
+    if (listPanel && listPanel.classList.contains('open') &&
+        performance.now() - lastListRefreshAt >= LIST_REFRESH_MS) {
+        lastListRefreshAt = performance.now();
+        updateAircraftList();
+    }
+}
+
+function startLiveFeed3D() {
+    liveFeed = window.startLiveFeed({ onRender: renderLive3D, onStatus: updateStatus });
+}
+// For tests and measurement, like window.__gateway (the feed itself).
+window.__globe = { viewer, aircraftEntities, aircraft: () => currentAircraftData };
+
 // Start polling
 function startPolling() {
     loadAirports(); // Load airports once at start
@@ -1771,6 +1829,7 @@ window.focusOnAircraft = focusOnAircraft;
 // Initialize
 updateStatus(false, 'Connecting...');
 startPolling();
+startLiveFeed3D();
 
 // Cleanup on page unload
 window.addEventListener('beforeunload', stopPolling);

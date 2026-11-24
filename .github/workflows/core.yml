@@ -5,6 +5,7 @@ on:
     paths:
       - "core/**"
       - "gateway/**"
+      - "ads/**"
       - "protocol/**"
       - "spec/**"
       - "bench/**"
@@ -13,6 +14,7 @@ on:
     paths:
       - "core/**"
       - "gateway/**"
+      - "ads/**"
       - "protocol/**"
       - "spec/**"
       - "bench/**"

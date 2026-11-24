@@ -87,6 +87,8 @@ To track real aircraft, run readsb with an RTL-SDR receiver and point `adsb-live
 - [TEAM.md](TEAM.md): roles, what is left, and how a change gets into `main`.
 - [SETUP.md](SETUP.md): build, test and tooling.
 - [protocol/feed_spec.md](protocol/feed_spec.md): the feed protocol.
+- [REPRODUCING.md](REPRODUCING.md): every reported result, with the commands that reproduce it and which numbers still need the benchmark host.
+- [REPORT.md](REPORT.md): the final report's skeleton, with the results so far and placeholders for the pending ones.
 
 ## Team
 

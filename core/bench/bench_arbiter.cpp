@@ -42,7 +42,7 @@ void BM_ArbiterOffer(benchmark::State& state) {
   for (auto _ : state) {
     record::Record r = recs[i];
     r.rx_ns += shift;
-    forwarded += arb->offer(r) ? 1 : 0;
+    forwarded += arb->offer(r) ? 1u : 0u;
     if (++i == recs.size()) {
       i = 0;
       shift += span + cfg.window_ns + 1;

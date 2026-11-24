@@ -19,13 +19,59 @@ const failedTrailFetches = new Set(); // Track aircraft with no trail data to av
 let trailRefreshInterval = null;
 let showAllTrails = false; // Global toggle for all trails
 
+// Colours for everything drawn on the map. Mirrors the tokens in styles.css
+// (:root); keep the two in step.
+const PALETTE = {
+    ink: '#ebe5d6',
+    stone: '#8e887c',
+    graphite: '#121110',
+    ochre: '#b8955a',
+    steel: '#7d93a6',
+    alert: '#c2603f',
+    caution: '#b98340',
+    sand: '#c2b598',
+    alt: {
+        ground: '#77726a',
+        low: '#c39a5a',  // < 10,000 ft
+        mid: '#c2b598',  // 10-20,000 ft
+        high: '#98a8b3', // 20-30,000 ft
+        top: '#7590a8',  // >= 30,000 ft
+    },
+};
+
+// Altitude band of an aircraft, for its colour (see the legend in index.html)
+function altitudeBand(aircraft) {
+    if (aircraft.on_ground) return 'ground';
+    const alt = aircraft.altitude;
+    if (alt === null || alt === undefined) return 'mid';
+    if (alt < 10000) return 'low';
+    if (alt < 20000) return 'mid';
+    if (alt < 30000) return 'high';
+    return 'top';
+}
+
+// One popup layout for aircraft, airports, trails and collisions
+function popupHTML(title, rows, extra = '', cls = '') {
+    const body = rows
+        .filter(([, value]) => value !== null && value !== undefined && value !== '')
+        .map(([label, value]) => `<div class="map-popup-row"><span>${label}</span><span>${value}</span></div>`)
+        .join('');
+    return `<div class="map-popup ${cls}"><div class="map-popup-title">${title}</div>${body}${extra}</div>`;
+}
+
 // Initialize map
 function initializeMap() {
     // Initialize the map centered on a default location (you can change this)
     map = L.map('map', {
-        zoomControl: true,
+        zoomControl: false, // zoom lives on the edge rail (atlas.js)
         attributionControl: true
     }).setView([41.88, -87.63], 9); // Default: Chicago, IL (receiver location)
+
+    // Overlay panes, bottom to top: recorded trails, live overlays
+    // (predictions, conflicts; hidden during playback), the selection
+    map.createPane('trailPane').style.zIndex = 405;
+    map.createPane('livePane').style.zIndex = 415;
+    map.createPane('selectionPane').style.zIndex = 425;
 
     // Dark basemap for the ATC/radar look: Esri's dark gray canvas plus its
     // labels layer (no API key needed; CARTO's dark_all now requires one).
@@ -38,7 +84,9 @@ function initializeMap() {
     }).addTo(map);
     L.tileLayer(`${esri}/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}`, {
         maxNativeZoom: 16,
-        maxZoom: 19
+        maxZoom: 19,
+        opacity: 0.55, // place names recede behind the aircraft
+        className: 'reference-tiles'
     }).addTo(map);
 
     // Load airports data
@@ -85,34 +133,28 @@ function displayAirports() {
         pointToLayer: (feature, latlng) => {
             const props = feature.properties;
 
-            // Different colors by airport type
-            let color = '#e8a628'; // Default: orange for small/medium
-            if (props.type === 'large_airport') {
-                color = '#ff5533'; // Red for large airports
-            }
-
-            return L.circleMarker(latlng, {
-                radius: props.type === 'large_airport' ? 5 : 3,
-                fillColor: color,
-                color: '#000',
-                weight: 1,
-                opacity: 0.8,
-                fillOpacity: 0.6
+            // Chart symbols: a ticked ring for large airports, a ring for
+            // the rest (their names are drawn by atlas.js)
+            const large = props.type === 'large_airport';
+            return L.marker(latlng, {
+                icon: L.divIcon({
+                    className: 'airport-symbol',
+                    html: `<i class="${large ? 'apt-large' : 'apt-small'}"></i>`,
+                    iconSize: [0, 0],
+                }),
+                keyboard: false,
             });
         },
         onEachFeature: (feature, layer) => {
             const props = feature.properties;
 
             // Create popup with airport info
-            const popupContent = `
-                <div style="font-family: 'Courier New', monospace; color: #e8a628;">
-                    <strong style="color: #ffa628;">${props.name}</strong><br>
-                    ${props.icao ? `ICAO: ${props.icao}` : ''}${props.iata ? ` (${props.iata})` : ''}<br>
-                    ${props.municipality ? `Location: ${props.municipality}` : ''}<br>
-                    ${props.elevation ? `Elevation: ${props.elevation} ft` : ''}<br>
-                    <em style="color: #888;">${props.type.replace('_', ' ')}</em>
-                </div>
-            `;
+            const popupContent = popupHTML(props.name, [
+                ['ICAO', props.icao ? `${props.icao}${props.iata ? ` (${props.iata})` : ''}` : null],
+                ['Location', props.municipality],
+                ['Elevation', props.elevation ? `${props.elevation} ft` : null],
+                ['Type', `<span class="map-popup-note">${props.type.replace('_', ' ')}</span>`],
+            ]);
             layer.bindPopup(popupContent);
         }
     });
@@ -140,6 +182,7 @@ function updateStatus(connected, text) {
         indicator.className = 'status-dot disconnected';
         statusText.textContent = text || 'Disconnected';
     }
+    atlas.onStatus(connected, statusText.textContent);
 }
 
 // Format time
@@ -176,44 +219,47 @@ function isHelicopter(aircraft) {
 
 function createAircraftIcon(aircraft) {
     const heading = aircraft.track || 0;
-    const identifier = aircraft.flight || aircraft.hex || 'N/A';
     const isHeli = isHelicopter(aircraft);
+    const band = altitudeBand(aircraft);
 
-    // Different SVG for helicopters vs fixed-wing
-    const iconSVG = isHeli ? `
-        <svg width="24" height="24" viewBox="0 0 24 24" class="aircraft-icon" style="transform: rotate(${heading}deg);">
-            <!-- Helicopter rotor -->
-            <line x1="4" y1="6" x2="20" y2="6" stroke="#7a9a7a" stroke-width="1.5"/>
-            <circle cx="12" cy="6" r="1.5" fill="#5a8a5a"/>
-            <!-- Helicopter body -->
-            <ellipse cx="12" cy="12" rx="5" ry="7" fill="#7a9a7a" stroke="#5a8a5a" stroke-width="0.5"/>
-            <circle cx="12" cy="12" r="2" fill="#6b8e6b"/>
-            <!-- Tail rotor -->
-            <line x1="12" y1="18" x2="12" y2="22" stroke="#7a9a7a" stroke-width="1.2"/>
-            <line x1="10" y1="22" x2="14" y2="22" stroke="#7a9a7a" stroke-width="1"/>
-        </svg>
-    ` : `
-        <svg width="24" height="24" viewBox="0 0 24 24" class="aircraft-icon" style="transform: rotate(${heading}deg);">
-            <!-- Fixed-wing aircraft -->
-            <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="#7a9a7a" stroke="#5a8a5a" stroke-width="0.5"/>
-            <path d="M2 17L12 22L22 17" stroke="#7a9a7a" stroke-width="1" fill="none"/>
-            <circle cx="12" cy="12" r="2" fill="#6b8e6b"/>
-        </svg>
-    `;
+    // A directional symbol at the aircraft's position (rotated to its
+    // track) and an ATC-style data block on a leader line; atlas.js places
+    // the block around the symbol so blocks do not collide.
+    const symbol = isHeli ? `
+        <svg width="18" height="18" viewBox="-9 -9 18 18" class="aircraft-icon" style="transform: rotate(${heading}deg);">
+            <circle r="4.2" fill="none" stroke="currentColor" stroke-width="1.4"/>
+            <line x1="-8" y1="0" x2="8" y2="0" stroke="currentColor" stroke-width="1.2"/>
+            <line x1="0" y1="-8" x2="0" y2="-4.2" stroke="currentColor" stroke-width="1.4"/>
+        </svg>` : `
+        <svg width="18" height="18" viewBox="-9 -9 18 18" class="aircraft-icon" style="transform: rotate(${heading}deg);">
+            <path d="M0 -8 L5.2 6.4 L0 3.4 L-5.2 6.4 Z" fill="currentColor" stroke="#121110" stroke-width="0.8" stroke-linejoin="round"/>
+        </svg>`;
 
     const markerHTML = `
-        <div class="aircraft-marker-container">
-            <div class="aircraft-label">${identifier}</div>
-            ${iconSVG}
+        <div class="ac" data-band="${band}">
+            <svg class="ac-leader" width="1" height="1"><line x1="0" y1="0" x2="0" y2="0"/></svg>
+            <div class="ac-symbol">${symbol}</div>
+            <div class="ac-label"><b class="ac-callsign">${aircraft.flight || aircraft.hex || 'N/A'}</b><span class="ac-data">${atlasDataLine(aircraft)}</span></div>
         </div>
     `;
 
     return L.divIcon({
         className: 'aircraft-marker',
         html: markerHTML,
-        iconSize: [60, 40], // Wider to accommodate label
-        iconAnchor: [30, 35] // Anchor at bottom center (below label)
+        iconSize: [0, 0], // the symbol is centred on the position by CSS
+        iconAnchor: [0, 0]
     });
+}
+
+// Second line of a data block: altitude in hundreds of feet, climb or
+// descent arrow, ground speed in knots ("350↑241"); GND on the ground
+function atlasDataLine(aircraft) {
+    if (aircraft.on_ground) return `GND ${aircraft.speed ?? ''}`.trim();
+    const alt = aircraft.altitude === null || aircraft.altitude === undefined
+        ? '---' : String(Math.round(aircraft.altitude / 100)).padStart(3, '0');
+    const vr = aircraft.vertical_rate;
+    const arrow = vr > 300 ? '↑' : vr < -300 ? '↓' : ' ';
+    return `${alt}${arrow}${aircraft.speed ?? '---'}`;
 }
 
 // Interpolate between two angles (handles 0/360 wrap)
@@ -279,7 +325,6 @@ function smoothMoveMarker(marker, targetLat, targetLon, targetHeading, duration)
     animate();
 }
 
-// Update aircraft on map with smooth movement
 function updateAircraftOnMap(aircraftData) {
     if (!map) return; // Map not initialized yet
     
@@ -320,13 +365,26 @@ function updateAircraftOnMap(aircraftData) {
                 );
             }
             
-            // Update label and icon rotation if needed
+            // Update the data block and icon rotation if needed
             if (marker._icon) {
-                const labelElement = marker._icon.querySelector('.aircraft-label');
+                const labelElement = marker._icon.querySelector('.ac-callsign');
                 const newIdentifier = aircraft.flight || aircraft.hex || 'N/A';
                 if (labelElement && marker._identifier !== newIdentifier) {
                     labelElement.textContent = newIdentifier;
                     marker._identifier = newIdentifier;
+                }
+                const dataLine = atlasDataLine(aircraft);
+                if (marker._dataLine !== dataLine) {
+                    const dataElement = marker._icon.querySelector('.ac-data');
+                    if (dataElement) dataElement.textContent = dataLine;
+                    marker._dataLine = dataLine;
+                }
+                // Recolour when the aircraft changes altitude band
+                const band = altitudeBand(aircraft);
+                if (marker._band !== band) {
+                    const container = marker._icon.querySelector('.ac');
+                    if (container) container.dataset.band = band;
+                    marker._band = band;
                 }
                 // Update icon rotation for small movements
                 const iconElement = marker._icon.querySelector('.aircraft-icon');
@@ -336,17 +394,6 @@ function updateAircraftOnMap(aircraftData) {
                 }
             }
             
-            // Update popup content
-            const popupContent = `
-                <div style="font-family: 'Courier New', monospace; color: #7a9a7a;">
-                    <strong style="color: #8a9a8a;">${aircraft.flight || 'N/A'}</strong><br>
-                    ${aircraft.hex ? `ICAO: ${aircraft.hex}` : ''}<br>
-                    ${aircraft.altitude ? `ALT: ${aircraft.altitude} ft` : ''}<br>
-                    ${aircraft.speed ? `SPD: ${aircraft.speed} kt` : ''}<br>
-                    ${aircraft.track ? `HDG: ${aircraft.track}°` : ''}<br>
-                </div>
-            `;
-            marker.setPopupContent(popupContent);
         } else {
             // Create new marker
             const marker = L.marker([aircraft.lat, aircraft.lon], {
@@ -356,24 +403,18 @@ function updateAircraftOnMap(aircraftData) {
             
             marker._heading = aircraft.track || 0;
             marker._identifier = aircraft.flight || aircraft.hex || 'N/A';
+            marker._band = altitudeBand(aircraft);
+            marker._dataLine = atlasDataLine(aircraft);
+            marker._hex = aircraft.hex;
 
-            // Add popup with aircraft info and trail button
-            const hasTrail = aircraftTrails.has(aircraft.hex);
-            const popupContent = `
-                <div style="font-family: 'Courier New', monospace; color: #7a9a7a;">
-                    <strong style="color: #8a9a8a;">${aircraft.flight || 'N/A'}</strong><br>
-                    ${aircraft.hex ? `ICAO: ${aircraft.hex}` : ''}<br>
-                    ${aircraft.altitude ? `ALT: ${aircraft.altitude} ft` : ''}<br>
-                    ${aircraft.speed ? `SPD: ${aircraft.speed} kt` : ''}<br>
-                    ${aircraft.track ? `HDG: ${aircraft.track}°` : ''}<br>
-                    <button
-                        onclick="toggleAircraftTrail('${aircraft.hex}')"
-                        style="margin-top: 8px; padding: 4px 12px; background: ${hasTrail ? '#d9534f' : '#5cb85c'}; color: white; border: none; border-radius: 3px; cursor: pointer; font-family: 'Courier New', monospace; font-size: 12px;">
-                        ${hasTrail ? 'Hide Trail' : 'Show Trail'}
-                    </button>
-                </div>
-            `;
-            marker.bindPopup(popupContent);
+            // Selecting an aircraft opens its annotation (atlas.js); the
+            // gateway/database trail stays one click away in it
+            marker.on('click', (e) => {
+                L.DomEvent.stopPropagation(e);
+                atlas.select(aircraft.hex);
+            });
+            marker.on('mouseover', () => atlas.hover(aircraft.hex));
+            marker.on('mouseout', () => atlas.hover(null));
 
             aircraftMarkers.set(aircraftId, marker);
         }
@@ -400,33 +441,12 @@ function updateAircraftOnMap(aircraftData) {
         }
     });
     
-    // Debug log (can be removed later)
-    console.log(`Map updated: ${seenAircraftIds.size} aircraft visible, ${aircraftMarkers.size} markers on map`);
+    atlas.afterMapUpdate();
 }
 
 // Update aircraft list
 function updateAircraftList(aircraftData) {
-    const listContainer = document.getElementById('aircraft-list');
-    
-    if (aircraftData.length === 0) {
-        listContainer.innerHTML = '<div class="empty-state"><p>No aircraft detected</p></div>';
-        return;
-    }
-
-    listContainer.innerHTML = aircraftData.map(aircraft => {
-        return `
-            <div class="aircraft-card">
-                <h3>${aircraft.flight || aircraft.hex || 'Unknown'}</h3>
-                <div class="aircraft-info">
-                    ${aircraft.hex ? `<span><strong>ICAO:</strong> ${aircraft.hex}</span>` : ''}
-                    ${aircraft.altitude ? `<span><strong>Altitude:</strong> ${aircraft.altitude} ft</span>` : ''}
-                    ${aircraft.speed ? `<span><strong>Speed:</strong> ${aircraft.speed} kt</span>` : ''}
-                    ${aircraft.track ? `<span><strong>Heading:</strong> ${aircraft.track}°</span>` : ''}
-                    ${aircraft.lat && aircraft.lon ? `<span><strong>Position:</strong> ${aircraft.lat.toFixed(4)}, ${aircraft.lon.toFixed(4)}</span>` : ''}
-                </div>
-            </div>
-        `;
-    }).join('');
+    atlas.renderIndex(aircraftData);
 }
 
 // Get current time window from selector
@@ -466,8 +486,12 @@ function renderAircraftData(data) {
         // Store aircraft data globally for collision detection to use
         currentAircraftData = data.aircraft || [];
 
+        // The timeline records every table it is shown; while it plays back
+        // the past, the map shows the recording instead of the live table
+        atlas.record(currentAircraftData, data.now || Date.now());
+
         // Update map and list (always update map, even if empty)
-        updateAircraftOnMap(currentAircraftData);
+        if (!atlas.isPlayback()) updateAircraftOnMap(currentAircraftData);
         updateAircraftList(currentAircraftData);
 
         // If global trails are enabled, show trails for new aircraft
@@ -489,10 +513,7 @@ window.toggleAircraftTrail = async function(hex) {
     if (showAllTrails) {
         showAllTrails = false;
         const button = document.getElementById('toggle-trails');
-        if (button) {
-            button.textContent = '⚪ Show All Trails';
-            button.style.background = '';
-        }
+        if (button) button.classList.remove('active');
     }
 
     if (aircraftTrails.has(hex)) {
@@ -566,22 +587,21 @@ async function fetchAndDisplayTrail(hex) {
         const aircraft = currentAircraftData.find(ac => ac.hex === hex);
         const isHeli = aircraft && isHelicopter(aircraft);
 
-        // Create polyline for trail - yellow for helicopters, cyan for fixed-wing
+        // Create polyline for trail - ochre for helicopters, ivory for fixed-wing
         const trail = L.polyline(coordinates, {
-            color: isHeli ? '#ffff00' : '#00ffff',
-            weight: 2,
-            opacity: 0.6,
+            pane: 'trailPane',
+            color: isHeli ? PALETTE.ochre : PALETTE.ink,
+            weight: 1.5,
+            opacity: 0.55,
             smoothFactor: 1
         }).addTo(map);
 
         // Add popup with trail info
-        trail.bindPopup(`
-            <div style="font-family: 'Courier New', monospace; color: #7a9a7a;">
-                <strong style="color: #8a9a8a;">Trail: ${hex}${isHeli ? ' 🚁' : ''}</strong><br>
-                Points: ${data.trail.length}<br>
-                Duration: ${Math.round((data.trail[0].seen - data.trail[data.trail.length - 1].seen) / 60)} minutes
-            </div>
-        `);
+        trail.bindPopup(popupHTML(`Trail ${hex}`, [
+            ['Aircraft', isHeli ? 'Helicopter' : null],
+            ['Points', data.trail.length],
+            ['Duration', `${Math.round((data.trail[0].seen - data.trail[data.trail.length - 1].seen) / 60)} min`],
+        ]));
 
         aircraftTrails.set(hex, trail);
 
@@ -617,17 +637,11 @@ async function toggleAllTrails() {
         // Hide all trails
         clearAllTrails();
         showAllTrails = false;
-        if (button) {
-            button.textContent = '⚪ Show All Trails';
-            button.style.background = '';
-        }
+        if (button) button.classList.remove('active');
     } else {
         // Show trails for all current aircraft
         showAllTrails = true;
-        if (button) {
-            button.textContent = '🔵 Hide All Trails';
-            button.style.background = 'rgba(0, 255, 255, 0.3)';
-        }
+        if (button) button.classList.add('active');
 
         // Fetch and display trails for all aircraft
         const promises = currentAircraftData.map(aircraft =>
@@ -669,68 +683,7 @@ async function fetchStatistics() {
 
 // Update statistics dashboard
 function updateStatisticsDashboard(data) {
-    const dashboardElement = document.getElementById('statistics-content');
-    if (!dashboardElement) {
-        console.error('Statistics dashboard element not found');
-        return;
-    }
-
-    console.log('Updating statistics dashboard with:', data);
-    const { summary, altitude_distribution, flight_durations } = data;
-
-    // Build altitude distribution bars
-    const altitudeHTML = altitude_distribution.map(item => {
-        const maxCount = 10; // Assume max 10 aircraft for bar width
-        const barWidth = Math.min((item.count / maxCount) * 100, 100);
-        return `
-            <div class="stat-bar-container">
-                <span class="stat-label">${item.range} ft</span>
-                <div class="stat-bar-bg">
-                    <div class="stat-bar" style="width: ${barWidth}%"></div>
-                </div>
-                <span class="stat-value">${item.count}</span>
-            </div>
-        `;
-    }).join('');
-
-    // Build flight durations list
-    const durationsHTML = flight_durations.map(item => {
-        return `
-            <div class="duration-item">
-                <span class="duration-flight">${item.flight || item.hex}</span>
-                <span class="duration-time">${formatDuration(item.duration_seconds)}</span>
-            </div>
-        `;
-    }).join('') || '<div class="empty-state"><p>No active flights</p></div>';
-
-    dashboardElement.innerHTML = `
-        <div class="stats-summary">
-            <div class="stat-card">
-                <div class="stat-card-label">Total Flights</div>
-                <div class="stat-card-value">${summary.total_flights}</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-card-label">Avg Speed</div>
-                <div class="stat-card-value">${summary.avg_speed.toFixed(0)} kt</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-card-label">Avg Altitude</div>
-                <div class="stat-card-value">${(summary.avg_altitude / 1000).toFixed(1)}k ft</div>
-            </div>
-        </div>
-
-        <div class="stats-section">
-            <h3>Altitude Distribution</h3>
-            ${altitudeHTML || '<div class="empty-state"><p>No data</p></div>'}
-        </div>
-
-        <div class="stats-section">
-            <h3>Flight Durations</h3>
-            <div class="durations-list">
-                ${durationsHTML}
-            </div>
-        </div>
-    `;
+    atlas.renderAnalysis(data);
 }
 
 // APOORV'S CODE
@@ -750,6 +703,7 @@ async function fetchCollisions() {
             return;
         }
 
+        atlas.onCollisions(data);
         displayCollisions(data.collisions);
     } catch (error) {
         console.error('Error fetching collisions:', error);
@@ -796,24 +750,26 @@ function displayCollisions(collisions) {
         const time = collision.timeToCollision;
 
         if (probability > 15 || time < 60) {
-            color = '#ff0000'; // Red: High risk
+            color = PALETTE.alert; // High risk
         } else if (probability > 10 || time < 120) {
-            color = '#ff6600'; // Orange: Medium risk
+            color = PALETTE.caution; // Medium risk
         } else {
-            color = '#ffaa00'; // Yellow: Low risk
+            color = PALETTE.ochre; // Low risk
         }
 
         // Draw trajectory line for aircraft 1: current position → collision point
         const trajectory1 = L.polyline([currentPos1, collisionPointPos], {
+            pane: 'livePane',
             color: color,
             weight: 2,
             opacity: 0.6,
-            dashArray: '5, 5'
+            dashArray: '4, 5'
         }).addTo(map);
         collisionLines.push(trajectory1);
 
         // Draw trajectory line for aircraft 2: current position → collision point
         const trajectory2 = L.polyline([currentPos2, collisionPointPos], {
+            pane: 'livePane',
             color: color,
             weight: 2,
             opacity: 0.6,
@@ -823,11 +779,12 @@ function displayCollisions(collisions) {
 
         // Draw collision point marker at the midpoint (where they would collide)
         const collisionPoint = L.circle(collisionPointPos, {
+            pane: 'livePane',
             color: color,
             fillColor: color,
-            fillOpacity: 0.3,
+            fillOpacity: 0.18,
             radius: 500, // 500 meters radius
-            weight: 2
+            weight: 1.5
         }).addTo(map);
         collisionLines.push(collisionPoint);
 
@@ -835,23 +792,17 @@ function displayCollisions(collisions) {
         const aircraft1Display = collision.flight1 || collision.aircraft1;
         const aircraft2Display = collision.flight2 || collision.aircraft2;
 
-        const popupContent = `
-            <div style="min-width: 220px;">
-                <h3 style="margin: 0 0 10px 0; color: ${color};">⚠️ Predicted Collision</h3>
-                <table style="width: 100%; font-size: 12px;">
-                    <tr><td><b>Aircraft 1:</b></td><td>${aircraft1Display}</td></tr>
-                    <tr><td><b>Aircraft 2:</b></td><td>${aircraft2Display}</td></tr>
-                    <tr><td><b>Time to Collision:</b></td><td>${collision.timeToCollision}s (${Math.round(collision.timeToCollision/60)}m)</td></tr>
-                    <tr><td><b>Probability:</b></td><td>${collision.probability}</td></tr>
-                    <tr><td><b>Separation:</b></td><td>${(collision.distance/1000).toFixed(2)} km</td></tr>
-                    <tr><td><b>Vertical Sep:</b></td><td>${collision.verticalSeparation} ft</td></tr>
-                    <tr><td colspan="2"><hr style="margin: 5px 0;"></td></tr>
-                    <tr><td colspan="2"><b>Predicted Positions:</b></td></tr>
-                    <tr><td><b>AC1 Alt:</b></td><td>${collision.position1.alt} ft</td></tr>
-                    <tr><td><b>AC2 Alt:</b></td><td>${collision.position2.alt} ft</td></tr>
-                </table>
-            </div>
-        `;
+        const popupContent = popupHTML('Predicted Collision', [
+            ['Aircraft 1', aircraft1Display],
+            ['Aircraft 2', aircraft2Display],
+            ['Time to collision', `${collision.timeToCollision}s (${Math.round(collision.timeToCollision/60)}m)`],
+            ['Probability', collision.probability],
+            ['Separation', `${(collision.distance/1000).toFixed(2)} km`],
+            ['Vertical sep', `${collision.verticalSeparation} ft`],
+        ], `<div class="map-popup-section">Predicted positions</div>` + [
+            ['AC1 alt', `${collision.position1.alt} ft`],
+            ['AC2 alt', `${collision.position2.alt} ft`],
+        ].map(([l, v]) => `<div class="map-popup-row"><span>${l}</span><span>${v}</span></div>`).join(''), 'alert');
 
         collisionPoint.bindPopup(popupContent);
     });
@@ -860,6 +811,7 @@ function displayCollisions(collisions) {
     const collisionCountEl = document.getElementById('collision-count');
     if (collisionCountEl) {
         collisionCountEl.textContent = collisions.length;
+        collisionCountEl.classList.toggle('has-alerts', collisions.length > 0);
     }
 
     console.log(`🚨 ${collisions.length} potential collision(s) detected`);
@@ -876,7 +828,6 @@ function togglePredictionWedges() {
     
     const button = document.getElementById('toggle-predictions');
     if (button) {
-        button.textContent = showPredictionWedges ? '🔵 Hide Predictions' : '⚪ Show Predictions';
         button.classList.toggle('active', showPredictionWedges);
     }
     
@@ -940,16 +891,8 @@ function displayPredictionWedges() {
         const rightLat = ac.lat + rightDeltaLat;
         const rightLon = ac.lon + rightDeltaLon;
         
-        // Color based on altitude
-        let color;
-        const altitude = ac.altitude || 10000;
-        if (altitude < 10000) {
-            color = '#00ff00'; // Green - low altitude
-        } else if (altitude < 25000) {
-            color = '#ffff00'; // Yellow - mid altitude
-        } else {
-            color = '#ff8800'; // Orange - high altitude
-        }
+        // Colour of the aircraft's altitude band, as on its marker
+        const color = PALETTE.alt[altitudeBand(ac)];
         
         // Create wedge polygon (triangle from current position to future bounds)
         const wedgeCoords = [
@@ -961,21 +904,23 @@ function displayPredictionWedges() {
         ];
         
         const wedge = L.polygon(wedgeCoords, {
+            pane: 'livePane',
             color: color,
             weight: 1,
-            opacity: 0.6,
+            opacity: 0.45,
             fillColor: color,
-            fillOpacity: 0.15
+            fillOpacity: 0.05
         }).addTo(map);
         
         predictionWedges.push(wedge);
         
         // Add center trajectory line
         const trajectoryLine = L.polyline([[ac.lat, ac.lon], [futureLat, futureLon]], {
+            pane: 'livePane',
             color: color,
-            weight: 2,
-            opacity: 0.7,
-            dashArray: '5, 5'
+            weight: 1.2,
+            opacity: 0.65,
+            dashArray: '3, 5'
         }).addTo(map);
         
         predictionWedges.push(trajectoryLine);
@@ -1027,12 +972,14 @@ function setupControls() {
     if (toggleButton) {
         toggleButton.addEventListener('click', () => {
             listPanel.classList.toggle('open');
+            toggleButton.classList.toggle('active', listPanel.classList.contains('open'));
         });
     }
 
     if (closeButton) {
         closeButton.addEventListener('click', () => {
             listPanel.classList.remove('open');
+            toggleButton?.classList.remove('active');
         });
     }
 
@@ -1055,6 +1002,7 @@ function setupControls() {
     if (toggleStatsButton) {
         toggleStatsButton.addEventListener('click', () => {
             statsPanel.classList.toggle('open');
+            toggleStatsButton.classList.toggle('active', statsPanel.classList.contains('open'));
             updateAircraftListWidth();
         });
     }
@@ -1062,6 +1010,7 @@ function setupControls() {
     if (closeStatsButton) {
         closeStatsButton.addEventListener('click', () => {
             statsPanel.classList.remove('open');
+            toggleStatsButton?.classList.remove('active');
             updateAircraftListWidth();
         });
     }
@@ -1071,6 +1020,7 @@ function setupControls() {
     if (toggleAirportsButton) {
         toggleAirportsButton.addEventListener('click', () => {
             toggleAirports();
+            toggleAirportsButton.classList.toggle('active', showAirports);
         });
     }
 
@@ -1105,6 +1055,12 @@ const liveFeed = {
     frames: 0,
     renders: 0,
     reconnects: 0,
+    bytes: 0, // binary WebSocket payload received
+    updates: 0, // aircraft updates in delta frames
+    updatesBy: new Map(), // icao -> updates since it was first seen (for the analysis)
+    renderTimes: new Float64Array(240), // ms per redraw, ring
+    renderIdx: 0,
+    connectedAt: 0,
     asOfSeq: 0,
     flags: 0,
     lastFrameAt: 0,
@@ -1144,7 +1100,9 @@ function renderLive() {
     liveFeed.renders++;
     if (liveFeed.synced) {
         try {
+            const t0 = performance.now();
             renderAircraftData(liveAircraftData());
+            liveFeed.renderTimes[liveFeed.renderIdx++ % liveFeed.renderTimes.length] = performance.now() - t0;
         } catch (error) {
             console.error('Error drawing the live feed:', error);
         }
@@ -1171,6 +1129,7 @@ function connectLiveFeed() {
     ws.onopen = () => {
         ws.send(JSON.stringify({ type: 'hello', window: 8 }));
         liveFeed.connected = true;
+        liveFeed.connectedAt = Date.now();
         liveFeed.backoff = 250;
         updateLiveStatus();
     };
@@ -1187,6 +1146,7 @@ function connectLiveFeed() {
         // gateway would wait for its ack forever. An ack every 4 frames keeps
         // a window of 8 from running dry.
         processed++;
+        liveFeed.bytes += ev.data.byteLength;
         if (processed - acked >= 4) {
             acked = processed;
             ackView.setUint32(1, acked, true);
@@ -1206,9 +1166,15 @@ function connectLiveFeed() {
             for (const icao of liveFeed.table.tracks.keys()) liveFeed.seen.set(icao, now);
             liveFeed.synced = true;
         } else {
+            liveFeed.updates += touched.length;
             for (const icao of touched) {
-                if (liveFeed.table.tracks.has(icao)) liveFeed.seen.set(icao, now);
-                else liveFeed.seen.delete(icao);
+                if (liveFeed.table.tracks.has(icao)) {
+                    liveFeed.seen.set(icao, now);
+                    liveFeed.updatesBy.set(icao, (liveFeed.updatesBy.get(icao) ?? 0) + 1);
+                } else {
+                    liveFeed.seen.delete(icao);
+                    liveFeed.updatesBy.delete(icao);
+                }
             }
         }
         liveFeed.frames++;
@@ -1242,6 +1208,7 @@ function startLiveFeed() {
 // Load aircraft types for helicopter detection
 document.addEventListener('DOMContentLoaded', () => {
     initializeMap();
+    atlas.init(map);
     updateStatus(false, 'Connecting...');
     setupControls();
     startPolling();

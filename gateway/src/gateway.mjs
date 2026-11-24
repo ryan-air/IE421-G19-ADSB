@@ -511,6 +511,14 @@ export class Gateway {
     try {
       if (path === '/gateway/stats') return json(200, this.stats());
       if (path === '/gateway/digest') return json(200, this.digest());
+      if (path === '/gateway/latency') {
+        return json(200, {
+          time_ms: Date.now(),
+          as_of_seq: this.asOfSeq(),
+          feed_to_gateway: this.lat.feed_to_gateway.logHistogram(),
+          feed_to_ws: this.lat.feed_to_ws.logHistogram(),
+        });
+      }
       if (path === '/api/aircraft' || path === '/api/aircraft/enriched') {
         const aircraft = this.aircraftList();
         if (path.endsWith('/enriched')) for (const a of aircraft) a.trail = this.trails.get(Number.parseInt(a.hex, 16)) ?? [];

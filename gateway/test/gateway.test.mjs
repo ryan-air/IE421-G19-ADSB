@@ -429,6 +429,13 @@ test('Fall 2025 REST endpoints are served from memory', async () => {
     assert.equal((await get(port, '/api/unknown')).status, 404);
     const st = JSON.parse((await get(port, '/gateway/stats')).body);
     assert.equal(st.subscriber.applied, 4);
+    const lat = JSON.parse((await get(port, '/gateway/latency')).body);
+    assert.equal(lat.as_of_seq, 4);
+    for (const h of [lat.feed_to_gateway, lat.feed_to_ws]) {
+      assert.equal(h.edges_us.length, h.counts.length + 1);
+      assert.equal(h.counts.reduce((a, b) => a + b, 0) + h.over_1s, h.count);
+    }
+    assert.equal(lat.feed_to_gateway.count, st.latency_us.feed_to_gateway.count);
     const dg = JSON.parse((await get(port, '/gateway/digest')).body);
     assert.equal(dg.digest, pub.pub.book.hexDigest());
     // A delete removes the aircraft and its trail.

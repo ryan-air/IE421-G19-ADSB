@@ -53,3 +53,7 @@ adsb_apply_compiler_options(adsb-iqsynth)
 add_executable(adsb-demod adsb_demod.cpp)
 target_link_libraries(adsb-demod PRIVATE adsb::core)
 adsb_apply_compiler_options(adsb-demod)
+
+add_executable(adsb-carrier adsb_carrier.cpp)
+target_link_libraries(adsb-carrier PRIVATE adsb::core)
+adsb_apply_compiler_options(adsb-carrier)

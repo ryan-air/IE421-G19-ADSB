@@ -51,6 +51,7 @@ namespace {
                "  --noise-figure DB     (default 5)\n"
                "  --full-scale DBM      antenna-port power at ADC full scale (default -70; lower = more gain)\n"
                "  --ppm X               LO and sample-clock error (default 0)\n"
+      "  --lo-drift PPM/S      LO error grows by this per second (warm-up; the sample clock stays at --ppm)\n"
                "  --antenna-height M    above ground (default 10)\n"
                "  --omni                isotropic antenna instead of a vertical dipole\n"
                "  --dc I,Q              DC offset, fraction of full scale\n"
@@ -159,6 +160,7 @@ int main(int argc, char** argv) {
     else if (a == "--noise-figure") cfg.noise_figure_db = num(val(), a.c_str());
     else if (a == "--full-scale") cfg.full_scale_dbm = num(val(), a.c_str());
     else if (a == "--ppm") cfg.rx_ppm = num(val(), a.c_str());
+    else if (a == "--lo-drift") cfg.lo_drift_ppm_per_s = num(val(), a.c_str());
     else if (a == "--antenna-height") cfg.antenna_height_m = num(val(), a.c_str());
     else if (a == "--omni") cfg.antenna = adsb::sim::AntennaPattern::kOmni;
     else if (a == "--dc") {

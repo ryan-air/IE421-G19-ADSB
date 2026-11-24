@@ -76,7 +76,7 @@ cd IE421-G19-ADSB/core
 cmake --preset debug && cmake --build --preset debug -j && ctest --preset debug
 ```
 
-Expected result: `100% tests passed, 0 tests failed out of 187`.
+Expected result: `100% tests passed, 0 tests failed` (about 410 tests by November 2026; the count grows with every feature).
 
 The first configure takes a minute because it downloads the test frameworks. Later builds are incremental. Add `-G Ninja` after `--preset debug` on the first configure if you installed Ninja.
 
@@ -186,7 +186,7 @@ Then open http://127.0.0.1:8080/. Tests: `cd gateway && node --test test/*.test.
 bench/legacy/run.sh
 ```
 
-It takes about 20 minutes and needs about 2 GB of free disk. On the benchmark host, `bench/lab/run.sh` runs this together with every other benchmark and collects the results in one directory ([bench/lab/README.md](bench/lab/README.md)).
+It takes about 25 minutes and needs about 2 GB of free disk. On the benchmark host, `bench/lab/run.sh` runs this together with every other benchmark and collects the results in one directory ([bench/lab/README.md](bench/lab/README.md)).
 
 ---
 

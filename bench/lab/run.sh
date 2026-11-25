@@ -9,6 +9,7 @@
 #   bench/lab/run.sh --steps xdp --tx-port enp1s0f0 --rx-port enp1s0f1
 #   bench/lab/run.sh --steps legacy             # Fall 2025 vs new pipeline (Docker, ~25 min)
 #   bench/lab/run.sh --steps all --tx-port ... --rx-port ...
+#   bench/lab/run.sh --steps carrier --receiver 40.1,-88.2,230   # RTL-SDR, 10 min
 #
 # Steps (each logs to its own file; a failing step does not stop the others):
 #   host        machine description: check-host.sh, CPU, kernel, NICs
@@ -20,7 +21,11 @@
 #   xdp         AF_XDP over a real NIC, copy and zero-copy (needs --tx-port and
 #               --rx-port: two unused ports cabled to each other; sudo)
 #   legacy      bench/legacy/run.sh: Fall 2025 system vs new pipeline (Docker)
+#   carrier     transponder frequency study (plan 22.5): records 1090 MHz with
+#               an RTL-SDR (rtl_sdr, 2.4 MS/s; or analyses --iq FILE), then
+#               adsb-carrier + carrier-study.py (needs --receiver)
 # Default: host build test core transports, plus xdp when ports are given.
+# xdp, legacy and carrier run only when asked for.
 #
 # What it changes on the machine: nothing, except
 #   - build directories under core/build/ (as any build does);
@@ -30,7 +35,9 @@
 #     on exit (also on Ctrl-C). It refuses ports that have an address or a
 #     route, so the connection you are logged in through cannot be touched;
 #   - with --tune CPUS: core/scripts/tune-host.sh --apply, reverted on exit;
-#   - with legacy: Docker images and containers of the harness (removed after).
+#   - with legacy: Docker images and containers of the harness (removed after);
+#   - with carrier: nothing; the raw recording (about 4.8 MB/s) is deleted
+#     after the analysis unless --keep-iq.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -50,9 +57,15 @@ QUICK=0
 NS=adsblab
 TX_IP=10.77.0.1
 RX_IP=10.77.0.2
+RECEIVER=""
+SDR_SECONDS=600
+SDR_GAIN=30
+SDR_DEVICE=0
+IQ_IN=""
+KEEP_IQ=0
 
 usage() {
-  sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
   cat <<EOF
 
 Options:
@@ -65,6 +78,12 @@ Options:
   --rate N         xdp/transports: datagrams per second (default $RATE)
   --size B         xdp/transports: datagram bytes (default $SIZE)
   --rounds N       xdp/transports: rounds per transport (default $ROUNDS)
+  --receiver LAT,LON,ALT_M  carrier: the antenna's position (degrees, metres above sea level)
+  --sdr-seconds N  carrier: recording length (default $SDR_SECONDS; --quick: 20)
+  --sdr-gain DB    carrier: RTL-SDR gain (default $SDR_GAIN; too high clips strong aircraft)
+  --sdr-device N   carrier: RTL-SDR device index (default $SDR_DEVICE)
+  --iq FILE        carrier: analyse this recording instead (SigMF, or raw cu8 at 2.4 MS/s)
+  --keep-iq        carrier: keep the raw recording in the results (not in the .tar.gz)
   --quick          shorter runs everywhere (a check that it all works)
   --dry-run        print the plan and the machine changes, run nothing
 EOF
@@ -82,6 +101,12 @@ while (($#)); do
     --rate) RATE="$2"; shift 2 ;;
     --size) SIZE="$2"; shift 2 ;;
     --rounds) ROUNDS="$2"; shift 2 ;;
+    --receiver) RECEIVER="$2"; shift 2 ;;
+    --sdr-seconds) SDR_SECONDS="$2"; shift 2 ;;
+    --sdr-gain) SDR_GAIN="$2"; shift 2 ;;
+    --sdr-device) SDR_DEVICE="$2"; shift 2 ;;
+    --iq) IQ_IN="$2"; shift 2 ;;
+    --keep-iq) KEEP_IQ=1; shift ;;
     --quick) QUICK=1; shift ;;
     --dry-run) DRY=1; shift ;;
     -h|--help) usage 0 ;;
@@ -89,7 +114,7 @@ while (($#)); do
   esac
 done
 
-ALL_STEPS="host build test core transports xdp legacy"
+ALL_STEPS="host build test core transports xdp legacy carrier"
 if [[ -z $STEPS ]]; then
   STEPS="host build test core transports"
   [[ -n $TX_PORT || -n $RX_PORT ]] && STEPS="$STEPS xdp"
@@ -109,6 +134,20 @@ fi
 if [[ -n $CPUS && ! $CPUS =~ ^[0-9]+,[0-9]+$ ]]; then
   echo "--cpus takes two core numbers, e.g. 2,3" >&2
   exit 1
+fi
+if want carrier; then
+  if [[ ! $RECEIVER =~ ^-?[0-9.]+,-?[0-9.]+(,-?[0-9.]+)?$ ]]; then
+    echo "the carrier step needs --receiver LAT,LON[,ALT_M] (the antenna; Doppler is computed from it)" >&2
+    exit 1
+  fi
+  if [[ -n $IQ_IN && ! -f $IQ_IN ]]; then
+    echo "--iq: no such file: $IQ_IN" >&2
+    exit 1
+  fi
+  if [[ ! $SDR_SECONDS =~ ^[0-9]+$ || $SDR_SECONDS -lt 1 || ! $SDR_DEVICE =~ ^[0-9]+$ ]]; then
+    echo "--sdr-seconds and --sdr-device take whole numbers" >&2
+    exit 1
+  fi
 fi
 if [[ $(uname -s) != Linux ]]; then
   echo "this suite is for the Linux benchmark host (this is $(uname -s))" >&2
@@ -153,6 +192,14 @@ xdp:      $TX_PORT ($TX_IP) -> $RX_PORT ($RX_IP, in network namespace $NS), for 
 EOF
 fi
 want legacy && echo "legacy:   bench/legacy/run.sh (Docker; about 25 min, a few with --quick)"
+if want carrier; then
+  if [[ -n $IQ_IN ]]; then
+    echo "carrier:  analyse $IQ_IN (receiver $RECEIVER)"
+  else
+    echo "carrier:  rtl_sdr -d $SDR_DEVICE -f 1090000000 -s 2400000 -g $SDR_GAIN for $((QUICK ? 20 : SDR_SECONDS)) s" \
+      "(about $(( (QUICK ? 20 : SDR_SECONDS) * 48 / 10 )) MB, deleted after unless --keep-iq), receiver $RECEIVER"
+  fi
+fi
 if ((DRY)); then
   echo "(dry run: nothing was run or changed)"
   exit 0
@@ -433,6 +480,70 @@ step_legacy() {
   env "${env[@]}" "$ROOT/bench/legacy/run.sh"
 }
 
+# Transponder frequency study (plan 22.5): a recording at 1090 MHz, every
+# message's carrier frequency (adsb-carrier), then per aircraft
+# (carrier-study.py). The receiver's own error is estimated from the
+# aircraft (an RTL-SDR's crystal is not a reference) and its drift removed.
+step_carrier() {
+  set -e
+  local work="$OUT/carrier" secs="$SDR_SECONDS" input fmt_args=()
+  ((QUICK)) && secs=20
+  mkdir -p "$work"
+  if [[ -n $IQ_IN ]]; then
+    input="$IQ_IN"
+    [[ $input == *.sigmf-meta || $input == *.sigmf-data ]] || fmt_args=(--format cu8 --rate 2.4e6)
+  else
+    command -v rtl_sdr >/dev/null || { echo "rtl_sdr is missing (apt install rtl-sdr), or pass --iq FILE"; return 1; }
+    local need=$((secs * 4800000 + 1000000000)) avail
+    avail=$(( $(df -Pk "$work" | awk 'NR == 2 {print $4}') * 1024 ))
+    ((avail > need)) || { echo "not enough disk for $secs s of IQ: need $need bytes, $avail free"; return 1; }
+    echo "## recording $secs s at 2.4 MS/s, gain $SDR_GAIN (device $SDR_DEVICE)"
+    local start
+    start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    rtl_sdr -d "$SDR_DEVICE" -f 1090000000 -s 2400000 -g "$SDR_GAIN" -n $((secs * 2400000)) \
+      "$work/capture.sigmf-data" 2> "$work/rtl_sdr.log" || { cat "$work/rtl_sdr.log"; return 1; }
+    cat "$work/rtl_sdr.log"
+    if grep -qi "lost" "$work/rtl_sdr.log"; then
+      echo "WARNING: rtl_sdr lost samples (USB): message times and Doppler around the gaps are off"
+    fi
+    IFS=, read -r lat lon alt <<< "$RECEIVER"
+    cat > "$work/capture.sigmf-meta" <<EOF2
+{
+  "global": {
+    "core:datatype": "cu8",
+    "core:sample_rate": 2400000,
+    "core:version": "1.0.0",
+    "core:recorder": "rtl_sdr",
+    "core:hw": "RTL-SDR device $SDR_DEVICE, gain $SDR_GAIN dB",
+    "core:description": "1090 MHz recording for the transponder frequency study (bench/lab/run.sh --steps carrier)",
+    "adsb:receiver": {"lat": $lat, "lon": $lon, "ground_alt_m": ${alt:-0}, "antenna_height_m": 0}
+  },
+  "captures": [{"core:sample_start": 0, "core:frequency": 1090000000, "core:datetime": "$start"}],
+  "annotations": []
+}
+EOF2
+    input="$work/capture.sigmf-meta"
+  fi
+  echo "## adsb-carrier"
+  "$REL/tools/adsb-carrier" "$input" ${fmt_args[@]+"${fmt_args[@]}"} --receiver "$RECEIVER" --out "$work/messages.csv"
+  echo "## ADC clipping (too much gain bends the phase of strong aircraft)"
+  python3 - "$work/messages.csv" <<'EOF2'
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+clipped = sum(1 for r in rows if int(r["clipped"]) > 0)
+share = clipped / len(rows) if rows else 0.0
+print(f"frames with clipped samples: {clipped} of {len(rows)} ({100 * share:.1f}%)")
+if share > 0.05:
+    print("WARNING: more than 5% of the frames clip: lower --sdr-gain")
+EOF2
+  echo "## carrier-study.py (receiver ppm estimated from the aircraft, drift removed in 10 s bins)"
+  local study=(python3 "$CORE/scripts/carrier-study.py" "$work/messages.csv" --rx-drift 10
+               --types "$ROOT/ads/aircraft-types-by-hex.json")
+  "${study[@]}" --aircraft-out "$work/aircraft.csv" | tee "$work/study.txt"
+  "${study[@]}" --json > "$work/study.json"
+  ((KEEP_IQ)) || rm -f "$work/capture.sigmf-data"
+}
+
 # Ask for sudo once, up front, not in the middle of a logged step.
 if [[ -n $TUNE ]] || want xdp; then
   echo "sudo is needed for: ${TUNE:+tuning }$(want xdp && echo 'the xdp step')"
@@ -473,18 +584,19 @@ cleanup
 {
   echo
   echo "## Key lines"
-  for f in core transports xdp; do
+  for f in core transports xdp carrier; do
     [[ -f $OUT/$f.log ]] || continue
     echo
     echo "### $f"
     echo '```'
-    grep -E "^##|^build |records/s|p50|p99|frames/s|msg/s|PASS|FAIL|bound|mode|lost" "$OUT/$f.log" |
+    grep -E "^##|^build |records/s|p50|p99|frames/s|msg/s|PASS|FAIL|bound|mode|lost|receiver|aircraft with|offset at|drift|clipped|WARNING" "$OUT/$f.log" |
       grep -v "^+" | head -120
     echo '```'
   done
 } >> "$SUMMARY"
 
-tar -C "$(dirname "$OUT")" -czf "$OUT.tar.gz" "$(basename "$OUT")"
+# The raw IQ (kept with --keep-iq) stays out of the archive: gigabytes.
+tar -C "$(dirname "$OUT")" --exclude='*.sigmf-data' -czf "$OUT.tar.gz" "$(basename "$OUT")"
 echo
 echo "done: $SUMMARY"
 echo "copy back: $OUT.tar.gz"

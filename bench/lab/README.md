@@ -11,8 +11,9 @@
 | `transports` | feed UDP transports over loopback: kernel `sendto()`, io_uring with and without SQPOLL | build (io_uring needs `liburing-dev`) |
 | `xdp` | AF_XDP send and receive over a real NIC, copy and zero-copy mode, against kernel UDP in the same rounds | two unused NIC ports cabled to each other; sudo |
 | `legacy` | Fall 2025 system vs new pipeline, frame → map in the browser (`bench/legacy/run.sh`, about 25 min) | Docker, about 2 GB of disk |
+| `carrier` | transponder frequency study (plan §22.5): records 1090 MHz with an RTL-SDR, then every message's carrier frequency (`adsb-carrier`) and each aircraft's offset, drift and Allan deviation (`carrier-study.py`) | an RTL-SDR (`rtl-sdr` package) and `--receiver`; about 4.8 MB/s of disk while it runs |
 
-Default steps: `host build test core transports`, plus `xdp` when ports are given. A failing step does not stop the others. If the build fails, the steps that need it are skipped.
+Default steps: `host build test core transports`, plus `xdp` when ports are given. `legacy` and `carrier` run only when asked for. A failing step does not stop the others. If the build fails, the steps that need it are skipped.
 
 ## Running it
 
@@ -30,7 +31,7 @@ Packages (Ubuntu/Debian):
 sudo apt-get install -y build-essential cmake ninja-build pkg-config liburing-dev python3 ethtool iputils-ping
 ```
 
-Docker is needed only for the `legacy` step.
+Docker is needed only for the `legacy` step, and `rtl-sdr` (`sudo apt-get install -y rtl-sdr`) only for the `carrier` step.
 
 First see what it would do. This changes nothing:
 
@@ -66,6 +67,21 @@ Copy the `.tar.gz` back for analysis, for example from your own machine:
 ```bash
 scp LAB_HOST:IE421-G19-ADSB/bench/lab/runs/RUN.tar.gz .
 ```
+
+## The carrier step
+
+```bash
+bench/lab/run.sh --steps carrier --receiver LAT,LON,ALT_M
+```
+
+- **What it does:** records 10 minutes (`--sdr-seconds`) at 2.4 MS/s, then runs `adsb-carrier` and `carrier-study.py --rx-drift 10 --types ads/aircraft-types-by-hex.json`. The receiver's ppm is estimated from the aircraft, and its drift is removed.
+- **`--receiver`:** the antenna's latitude, longitude and height above sea level in metres. Every message's Doppler is computed from it.
+- **Gain (`--sdr-gain`, default 30 dB):** the log reports the share of frames with clipped samples. Above 5% it warns: lower the gain, since clipping bends the phase of strong aircraft. Close to the antenna, too much gain matters more than too little.
+- **An existing recording:** `--iq FILE` (SigMF, or raw cu8 at 2.4 MS/s) analyses it instead of recording.
+- **What comes back:** `carrier/messages.csv` (one row per message), `aircraft.csv`, `study.txt` and `study.json`. The raw IQ (about 2.9 GB for 10 minutes) is deleted after the analysis unless `--keep-iq`, and is never put in the `.tar.gz`.
+- **Lost samples:** if `rtl_sdr` loses samples (USB), the log says so. Message times and Doppler around the gaps are then off.
+
+For a longer study, run it at different times of day. The drift over a flight and differences between days come from comparing runs (Allan deviation in `aircraft.csv`).
 
 ## The xdp step
 

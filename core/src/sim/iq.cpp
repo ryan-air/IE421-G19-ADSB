@@ -228,7 +228,7 @@ std::vector<ModeAcReply> plan_mode_ac(const SynthConfig& synth, const SynthOutpu
   }
   std::vector<double> period(static_cast<std::size_t>(radars));
   for (int r = 0; r < radars; ++r) {
-    Rng rr(mix(cfg.seed, 0xAC0000000000ULL + static_cast<std::uint64_t>(r)));
+    Rng rr(mix(cfg.seed, std::uint64_t{0xAC0000000000} + static_cast<std::uint64_t>(r)));
     period[static_cast<std::size_t>(r)] = rr.uniform(4.5, 12.0);
   }
 
@@ -236,10 +236,10 @@ std::vector<ModeAcReply> plan_mode_ac(const SynthConfig& synth, const SynthOutpu
     const auto found = by_icao.find(a.icao);
     if (found == by_icao.end()) continue;
     const std::vector<std::size_t>& txs = found->second;
-    Rng ar(mix(cfg.seed, 0xAC5D000000000000ULL + a.icao));
+    Rng ar(mix(cfg.seed, std::uint64_t{0xAC5D000000000000} + a.icao));
     const bool spi = ar.chance(cfg.modeac_spi_share);
     for (int r = 0; r < radars; ++r) {
-      Rng rr(mix(cfg.seed, mix(0xACAC000000000000ULL + static_cast<std::uint64_t>(r), a.icao)));
+      Rng rr(mix(cfg.seed, mix(std::uint64_t{0xACAC000000000000} + static_cast<std::uint64_t>(r), a.icao)));
       const double p = period[static_cast<std::size_t>(r)];
       const double dwell = p * beam / 360.0;
       const double phase = rr.uniform(0.0, p);

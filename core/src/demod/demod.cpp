@@ -152,6 +152,9 @@ bool validate(const DemodConfig& c, std::string* why) {
   if (!(c.gate_ratio >= 0.0 && c.gate_ratio <= 1000.0)) return fail("gate_ratio must be in [0, 1000]");
   if (!(c.resume_overlap_us >= 0.0 && c.resume_overlap_us <= 56.0)) return fail("resume_overlap_us must be in [0, 56]");
   if (!(c.address_ttl_s > 0.0 && c.address_ttl_s <= 1e6)) return fail("address_ttl_s must be in (0, 1e6]");
+  if (!(c.first_arrival_us >= 0.0 && c.first_arrival_us <= 200.0)) return fail("first_arrival_us must be in [0, 200]");
+  if (!(c.first_arrival_match > 0.0 && c.first_arrival_match <= 1.0)) return fail("first_arrival_match must be in (0, 1]");
+  if (!(c.duplicate_window_us >= 0.0 && c.duplicate_window_us <= 1e6)) return fail("duplicate_window_us must be in [0, 1e6]");
   if (c.block_samples < 1024 || c.block_samples > (std::size_t{1} << 26)) return fail("block_samples must be in [1024, 2^26]");
   return true;
 }
@@ -275,6 +278,33 @@ struct Demodulator::Impl {
   std::uint32_t syn56[56] = {}, syn112[112] = {};
   AddressTable addresses;
   std::vector<double> templ;    // step-5 expected-magnitude template
+  // Step 6 (first arrival): samples kept before the next position, so the
+  // first_arrival_us before a frame are still there.
+  std::ptrdiff_t hist = 0;
+  std::vector<double> fa_templ;  // step-6 direct-path pulses, one value per sample
+  std::vector<double> fa_echo;   // ... and the decoded copy's
+  std::vector<std::uint8_t> fa_code;  // ... and the prefilter's per-sample codes
+  // Duplicates: the most recent frames emitted.
+  struct Recent {
+    double pos = 0.0;
+    std::uint8_t len = 0;
+    std::uint8_t bytes[14] = {};
+  };
+  static constexpr std::size_t kRecent = 16;
+  std::array<Recent, kRecent> recent{};
+  std::size_t recent_n = 0;
+  // Positions the step-1 gate opened (a direct path's pulses open it), as
+  // runs of consecutive positions, most recent last: step 6 tries only
+  // starts next to them.
+  struct GateRun {
+    std::uint64_t lo = 0, hi = 0;  // absolute positions, inclusive
+  };
+  static constexpr std::size_t kGateRuns = 256;
+  std::array<GateRun, kGateRuns> gate_runs{};
+  std::size_t gate_runs_n = 0;
+  // The last emitted frame's start: step 6 never moves a frame before it,
+  // so frame times stay in order.
+  double last_pos = -1.0;
   std::size_t templ_limit = 0;  // ... of which a trial may use this many (the rest: room for zero adds past the end)
 
   // Sequence detector (see detect_sequence). For every phase, the samples
@@ -517,6 +547,13 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
   const auto climb = static_cast<std::ptrdiff_t>(std::ceil((kClimbSteps + 1) * kClimbStepUs * spu_)) + 2;
   im.back = climb + 2;
   im.need = static_cast<std::ptrdiff_t>(std::ceil((kMaxChips * spu_) / 2 + 1.0)) + 6 + climb;
+  // Step 6 looks back up to first_arrival_us before a frame (and its climb).
+  if (cfg_.first_arrival_us > 0) {
+    im.hist = static_cast<std::ptrdiff_t>(std::ceil(cfg_.first_arrival_us * spu_)) + climb + 8;
+    im.fa_templ.assign(static_cast<std::size_t>(im.hist + im.need) + 32, 0.0);
+    im.fa_echo.assign(im.fa_templ.size(), 0.0);
+    im.fa_code.assign(im.fa_templ.size(), 0);
+  }
   // Single-bit error syndromes (CRC is linear: the syndrome of a frame with
   // one bit flipped is the syndrome of that bit alone).
   for (int bits : {56, 112}) {
@@ -618,7 +655,7 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
   // Everything is allocated here: room for a block, the held-back samples,
   // the up to 1023 samples that wait for the first noise block, and the
   // zero padding flush() puts after the data.
-  const std::size_t data_cap = cfg_.block_samples + static_cast<std::size_t>(im.need + im.back) + kNoiseBlock + 64;
+  const std::size_t data_cap = cfg_.block_samples + static_cast<std::size_t>(im.need + std::max(im.back, im.hist)) + kNoiseBlock + 64;
   buf_.assign(data_cap + static_cast<std::size_t>(im.need) + 64, 0.0f);
   im.wsum.assign(buf_.size(), 0.0f);
   im.gate.assign(buf_.size(), 0);
@@ -897,6 +934,15 @@ void Demodulator::scan(bool final) {
       t = t0 + (static_cast<const std::uint8_t*>(hit) - im.gate.data());
     }
     ++stats_.gated;
+    if (im.hist > 0) {
+      const std::uint64_t pos = base_ + static_cast<std::uint64_t>(t);
+      Impl::GateRun* last = im.gate_runs_n > 0 ? &im.gate_runs[(im.gate_runs_n - 1) % Impl::kGateRuns] : nullptr;
+      if (last != nullptr && last->hi + 1 == pos) {
+        last->hi = pos;
+      } else {
+        im.gate_runs[im.gate_runs_n++ % Impl::kGateRuns] = {pos, pos};
+      }
+    }
     if (const std::uint64_t blk = (base_ + static_cast<std::uint64_t>(t)) / kNoiseBlock; blk != noise_blk) {
       noise_blk = blk;
       noise = noise_for(blk, final);
@@ -1187,24 +1233,215 @@ void Demodulator::scan(bool final) {
       // yc is not below its neighbours, so the vertex lies within half a step.
       if (den < 0 && yc >= ym && yc >= yp) rel_best += kStep * std::clamp(0.5 * (ym - yp) / den, -0.5, 0.5);
     }
-    const double amplitude = amp_c;
+    double amplitude = amp_c;
     const double s_best = static_cast<double>(t) + rel_best;
 
-    if (n_out_ == out_.size()) break;  // cannot happen: out_ is sized for the block
-    DemodFrame& f = out_[n_out_++];
-    std::memcpy(f.bytes, best.bytes, 14);
-    f.len = static_cast<std::uint8_t>(best.bits / 8);
-    f.df = static_cast<std::uint8_t>(best.bytes[0] >> 3);
-    f.icao = best.icao;
-    f.sample_pos = static_cast<double>(base_ + static_cast<std::uint64_t>(t)) + rel_best;
-    f.signal = static_cast<float>(amplitude);
-    f.noise = noise;
-    f.snr_db = noise > 0 && amplitude > 0 ? 20.0f * std::log10(static_cast<float>(amplitude) / noise) : 99.0f;
-    f.margin = best.margin;
-    f.corrected_bit = static_cast<std::int8_t>(best.corrected);
-    ++stats_.frames;
-    ++stats_.by_df[f.df];
-    if (best.corrected >= 0) ++stats_.corrected;
+    // Step 6: first arrival. A preamble that failed shortly before this
+    // frame may be its direct path, garbled by this copy (the echo). Where
+    // this copy has no pulse, the samples hold the direct path alone (and
+    // noise): compare them with the pulses this frame's bits give the
+    // direct path (preamble and data half-bits that carry a pulse = 1, the
+    // rest 0) by their correlation coefficient. Before the echo begins that
+    // is every sample, after it about half, so the test sees the direct
+    // path's data bits for any delay; another reply's preamble that failed
+    // there has other bits and does not match. The earliest match is the
+    // first arrival.
+    double rel_out = rel_best;
+    double echo_delay = 0.0;
+    if (im.hist > 0) {
+      const double min_delay = 2 * h;  // 1 us; this copy's pulses are left out, so it never matches itself
+      const double max_delay = cfg_.first_arrival_us * spu_;
+      std::vector<double>& fe = im.fa_templ;
+      std::vector<double>& echo = im.fa_echo;
+      // Samples relative to t from k_base on; this copy's pulse overlaps.
+      const auto k_base = static_cast<std::ptrdiff_t>(std::floor(rel_best - max_delay - (kMaxSteps + 1) * kStep)) - 2;
+      const auto k_end = static_cast<std::ptrdiff_t>(std::floor(rel_best + nchips * h + 0.5)) + 1;  // exclusive
+      auto pulses_into = [&](std::vector<double>& v, double rel, std::ptrdiff_t lo, std::ptrdiff_t hi, int upto) {
+        std::fill(v.begin() + (lo - k_base), v.begin() + (hi - k_base), 0.0);
+        for (int c = 0; c < upto; ++c) {
+          if (sign[c] <= 0) continue;
+          const double a = rel + c * h, bnd = a + h;
+          for (auto k = static_cast<std::ptrdiff_t>(std::floor(a + 0.5)); k < hi && static_cast<double>(k) - 0.5 < bnd; ++k) {
+            const double ov = std::min(bnd, static_cast<double>(k) + 0.5) - std::max(a, static_cast<double>(k) - 0.5);
+            if (ov > 0 && k >= lo) v[static_cast<std::size_t>(k - k_base)] += ov;
+          }
+        }
+      };
+      const bool room = t + k_base >= 0 && static_cast<std::size_t>(k_end - k_base) <= echo.size();
+      if (room) pulses_into(echo, rel_best, k_base, k_end, nchips);
+      // Correlation coefficient for a direct-path start rel, and the
+      // direct path's amplitude (least-squares slope).
+      auto direct = [&](double rel, double& amp, int upto) {
+        amp = 0.0;
+        const auto lo = std::max(k_base, static_cast<std::ptrdiff_t>(std::floor(rel + 0.5)) - 1);
+        const auto hi = std::min(k_end, static_cast<std::ptrdiff_t>(std::floor(rel + upto * h + 0.5)) + 1);
+        if (hi <= lo) return -1.0;
+        pulses_into(fe, rel, lo, hi, upto);
+        double n = 0, sx = 0, se = 0, sxx = 0, see = 0, sxe = 0;
+        for (std::ptrdiff_t k = lo; k < hi; ++k) {
+          const auto u = static_cast<std::size_t>(k - k_base);
+          if (echo[u] > 0) continue;
+          const auto x = static_cast<double>(mt[k]);
+          const double v = fe[u];
+          n += 1;
+          sx += x;
+          se += v;
+          sxx += x * x;
+          see += v * v;
+          sxe += x * v;
+        }
+        const double vx = n * sxx - sx * sx, ve = n * see - se * se;
+        if (!(vx > 0 && ve > 0)) return -1.0;
+        const double cov = n * sxe - sx * se;
+        amp = cov / ve;
+        return cov / std::sqrt(vx * ve);
+      };
+      // A cheap test first: the samples at the centres of the preamble's
+      // pulses (those this copy leaves free, at least two) must carry at
+      // least half the weakest acceptable pulse. Per sample: 2 = under this
+      // copy's pulses, 1 = that strong, 0 = not.
+      const double pulse_floor = 0.5 * static_cast<double>(min_signal);
+      std::uint8_t* code = im.fa_code.data();
+      if (room) {
+        for (std::ptrdiff_t k = k_base; k < k_end; ++k) {
+          const auto u = static_cast<std::size_t>(k - k_base);
+          code[u] = echo[u] > 0 ? 2 : (static_cast<double>(mt[k]) >= pulse_floor ? 1 : 0);
+        }
+      }
+      double best_rel = 0.0, best_amp = 0.0;
+      bool found = false;
+      // Starts from the earliest on, every half sample: the first that
+      // matches over the preamble (cheap) and then over the whole frame.
+      // Start i is r0 + i / 2: its pulse centres fall on samples i / 2 +
+      // kof[i % 2][pulse] (integers only in the loop).
+      const double r0 = std::ceil((rel_best - max_delay) * 2.0) / 2.0;
+      std::ptrdiff_t kof[2][4];
+      for (int par = 0; par < 2; ++par) {
+        for (int q = 0; q < 4; ++q) {
+          kof[par][q] = static_cast<std::ptrdiff_t>(std::floor(r0 + 0.5 * par + (kPulseChips[q] + 0.5) * h + 0.5));
+        }
+      }
+      auto pulses_there = [&](std::ptrdiff_t i) {
+        int free = 0;
+        const std::ptrdiff_t j = i >> 1;
+        const std::ptrdiff_t* ko = kof[i & 1];
+        for (int q = 0; q < 4; ++q) {
+          const std::ptrdiff_t k = j + ko[q];
+          if (k < k_base || k >= k_end) continue;
+          const std::uint8_t cd = code[static_cast<std::size_t>(k - k_base)];
+          if (cd == 2) continue;
+          if (cd == 0) return false;
+          ++free;
+        }
+        return free >= 2;
+      };
+      // Not before the previous frame (frame times stay in order).
+      const double floor_rel = im.last_pos - static_cast<double>(base_ + static_cast<std::uint64_t>(t));
+      const double last_rel = rel_best - min_delay;
+      // Gate runs that reach into the window, earliest first. A start in
+      // [p, p + 1) opens the gate at p (or a neighbour).
+      const double abs_t = static_cast<double>(base_ + static_cast<std::uint64_t>(t));
+      std::size_t first_run = im.gate_runs_n;
+      while (first_run > 0 && im.gate_runs_n - first_run < Impl::kGateRuns &&
+             static_cast<double>(im.gate_runs[(first_run - 1) % Impl::kGateRuns].hi) + 1.5 - abs_t >= r0) {
+        --first_run;
+      }
+      std::ptrdiff_t i_next = 0;  // starts below it were tried already
+      for (std::size_t ri = first_run; room && !found && ri < im.gate_runs_n; ++ri) {
+        const Impl::GateRun& run = im.gate_runs[ri % Impl::kGateRuns];
+        const double lo_rel = static_cast<double>(run.lo) - abs_t - 1.0;
+        const double hi_rel = static_cast<double>(run.hi) - abs_t + 1.5;
+        if (lo_rel > last_rel) break;
+        const auto i_lo = std::max(i_next, static_cast<std::ptrdiff_t>(std::ceil((lo_rel - r0) * 2.0)));
+        const auto i_hi = static_cast<std::ptrdiff_t>(std::floor((hi_rel - r0) * 2.0));
+        for (std::ptrdiff_t i = i_lo; i <= i_hi; ++i) {
+        i_next = i + 1;
+        const double rel_c = r0 + 0.5 * static_cast<double>(i);
+        if (rel_c > last_rel) break;
+        if (rel_c <= floor_rel + 1.0) continue;
+        double a0 = 0.0;
+        if (!pulses_there(i) || !(direct(rel_c, a0, kPreambleChips) >= cfg_.first_arrival_match)) continue;
+        const double y0 = direct(rel_c, a0, nchips);
+        if (!(y0 >= cfg_.first_arrival_match) || !(a0 >= static_cast<double>(min_signal))) continue;
+        // Climb as in step 5 for the time.
+        int jb = 0;
+        double yb = y0, ab = a0;
+        for (int sweep : {1, -1}) {
+          for (int j = sweep; std::abs(j) <= kMaxSteps; j += sweep) {
+            double aj = 0.0;
+            const double yj = direct(rel_c + j * kStep, aj, nchips);
+            if (!(yj > yb)) break;
+            yb = yj;
+            ab = aj;
+            jb = j;
+          }
+          if (jb != 0) break;
+        }
+        double rel_d = rel_c + jb * kStep;
+        {
+          double am_ = 0.0, ap_ = 0.0;
+          const double ym2 = direct(rel_d - kStep, am_, nchips), yp2 = direct(rel_d + kStep, ap_, nchips);
+          const double den = ym2 - 2 * yb + yp2;
+          if (den < 0 && yb >= ym2 && yb >= yp2) rel_d += kStep * std::clamp(0.5 * (ym2 - yp2) / den, -0.5, 0.5);
+        }
+        if (rel_best - rel_d < min_delay || rel_best - rel_d > max_delay || rel_d <= floor_rel) continue;
+        found = true;
+        best_rel = rel_d;
+        best_amp = ab;
+        break;
+        }
+      }
+      if (found) {
+        echo_delay = (rel_best - best_rel) / spu_;
+        rel_out = best_rel;
+        amplitude = best_amp;
+      }
+    }
+    const double pos_out = static_cast<double>(base_ + static_cast<std::uint64_t>(t)) + rel_out;
+
+    // A copy of a recent frame (an echo longer than the frame) is dropped.
+    bool duplicate = false;
+    if (cfg_.duplicate_window_us > 0) {
+      const double window = cfg_.duplicate_window_us * spu_;
+      const auto len = static_cast<std::uint8_t>(best.bits / 8);
+      for (std::size_t i = 0; i < std::min(im.recent_n, Impl::kRecent); ++i) {
+        const Impl::Recent& r = im.recent[(im.recent_n - 1 - i) % Impl::kRecent];
+        if (pos_out - r.pos > window) break;
+        if (r.len == len && std::memcmp(r.bytes, best.bytes, len) == 0) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (!duplicate) {
+        Impl::Recent& r = im.recent[im.recent_n++ % Impl::kRecent];
+        r.pos = pos_out;
+        r.len = len;
+        std::memcpy(r.bytes, best.bytes, 14);
+      }
+    }
+
+    if (duplicate) {
+      ++stats_.duplicates;
+    } else {
+      if (n_out_ == out_.size()) break;  // cannot happen: out_ is sized for the block
+      DemodFrame& f = out_[n_out_++];
+      std::memcpy(f.bytes, best.bytes, 14);
+      f.len = static_cast<std::uint8_t>(best.bits / 8);
+      f.df = static_cast<std::uint8_t>(best.bytes[0] >> 3);
+      f.icao = best.icao;
+      f.sample_pos = pos_out;
+      f.echo_delay_us = static_cast<float>(echo_delay);
+      f.signal = static_cast<float>(amplitude);
+      f.noise = noise;
+      f.snr_db = noise > 0 && amplitude > 0 ? 20.0f * std::log10(static_cast<float>(amplitude) / noise) : 99.0f;
+      f.margin = best.margin;
+      f.corrected_bit = static_cast<std::int8_t>(best.corrected);
+      ++stats_.frames;
+      ++stats_.by_df[f.df];
+      if (best.corrected >= 0) ++stats_.corrected;
+      if (echo_delay > 0) ++stats_.retimed;
+      im.last_pos = pos_out;
+    }
     // A verified DF11/17/18 address makes Address/Parity replies from it acceptable.
     if (best.score >= 2) im.addresses.add(best.icao, base_ + static_cast<std::uint64_t>(t));
     // Resume shortly before the message's end: the next reply's preamble
@@ -1216,7 +1453,7 @@ void Demodulator::scan(bool final) {
   if (t < im.back) t = im.back;
 
   // Keep the samples the next scan needs.
-  const std::ptrdiff_t keep_from = final ? valid : std::min(t - im.back, valid);
+  const std::ptrdiff_t keep_from = final ? valid : std::min(t - std::max(im.back, im.hist), valid);
   next_ = base_ + static_cast<std::uint64_t>(std::max<std::ptrdiff_t>(t, 0));
   if (keep_from > 0) {
     const std::size_t keep = valid_ - static_cast<std::size_t>(keep_from);

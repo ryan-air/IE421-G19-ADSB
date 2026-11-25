@@ -101,6 +101,9 @@ void on_signal(int) { g_stop.store(true); }
                "                        (a live receiver on stdin, e.g. rtl_sdr -f 1090e6 -s 2.4e6 - | adsb-live\n"
                "                        --iq - --iq-format cu8 --iq-speed 0 --iq-drop)\n"
                "  --iq-fix              correct one wrong bit in DF11/17/18 frames\n"
+               "  --iq-first-arrival US echoes: a frame whose direct path failed up to US earlier takes its\n"
+               "                        time (default 40; 0 = off)\n"
+               "  --iq-duplicate-window US  drop copies of a frame within US (long echoes; default 200, 0 = off)\n"
                "overload (README_UPDATES.md §10.1):\n"
                "  --overload drop|block when decode/state falls behind: drop the frame at the input and\n"
                "                        count it (default), or stop reading the socket until it catches up\n"
@@ -255,6 +258,8 @@ int main(int argc, char** argv) {
     else if (a == "--iq-buffers") iq_cfg.buffers = std::strtoull(val().c_str(), nullptr, 10);
     else if (a == "--iq-speed") iq_cfg.speed = std::strtod(val().c_str(), nullptr);
     else if (a == "--iq-fix") iq_cfg.demod.fix_single_bit = true;
+    else if (a == "--iq-first-arrival") iq_cfg.demod.first_arrival_us = std::strtod(val().c_str(), nullptr);
+    else if (a == "--iq-duplicate-window") iq_cfg.demod.duplicate_window_us = std::strtod(val().c_str(), nullptr);
     else if (a == "--iq-drop") iq_cfg.drop_when_full = true;
     else if (a == "--fix") eng_cfg.fix_single_bit = true;
     else if (a == "--line") {
@@ -757,9 +762,10 @@ int main(int argc, char** argv) {
                   q.samples ? 100.0 * static_cast<double>(q.samples_dropped) / static_cast<double>(q.samples) : 0.0,
                   u(q.ring_high_water), ic.buffers, static_cast<double>(q.max_lateness_ns) * 1e-6);
       std::printf("%s%llu frames (%llu by the sequence detector, %llu fixed), %llu preambles, %llu failed; "
+                  "echoes: %llu frames moved to their direct path, %llu duplicates dropped; "
                   "%llu frame times raised to stay monotonic\n",
                   lab("demod").c_str(), u(q.demod.frames), u(q.demod.sequence_decoded), u(q.demod.corrected), u(q.demod.preambles),
-                  u(q.demod.bad_crc), u(q.time_clamped));
+                  u(q.demod.bad_crc), u(q.demod.retimed), u(q.demod.duplicates), u(q.time_clamped));
     } else {
       const auto st = line == 0 ? source.stats() : source_b->stats();
       const adsb::ingest::BeastTcpConfig& bc = line == 0 ? src_cfg : b_cfg;

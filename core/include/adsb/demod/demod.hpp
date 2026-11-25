@@ -99,6 +99,23 @@ struct DemodConfig {
   bool sequence_detector = true;
   bool fix_single_bit = false;      // correct one wrong bit in DF11/17/18
   double address_ttl_s = 60.0;      // Address/Parity frames need an address seen this recently
+  // Echoes (multipath). A reply can be garbled by its own echo, which
+  // arrives a few microseconds later, overlaps it and decodes on its own:
+  // the frame then carries the echo's time. When a frame decodes, the
+  // preambles that failed up to first_arrival_us before it are tested
+  // against it: one whose samples before the echo begins match the frame's
+  // pulses (normalized correlation >= first_arrival_match) is the direct
+  // path, and the frame takes its time and amplitude (step 6). It must lie
+  // at least 5 us earlier (all four preamble pulses before the echo).
+  // 0 = off.
+  double first_arrival_us = 40.0;
+  double first_arrival_match = 0.85;
+  // An echo delayed more than a frame decodes as a second copy: a frame
+  // identical to one emitted at most duplicate_window_us earlier is
+  // dropped. Real repeats of the same bytes are far apart (squitters every
+  // 0.2-5 s; replies to different interrogators milliseconds apart).
+  // 0 = off.
+  double duplicate_window_us = 200.0;
   std::size_t block_samples = 1 << 16;  // most samples per feed() call
 };
 
@@ -115,6 +132,9 @@ struct DemodFrame {
   float snr_db = 0.0f;              // 20 log10(signal / noise)
   float margin = 0.0f;              // mean |first - second half| / signal over the bits
   std::int8_t corrected_bit = -1;   // bit index fixed by fix_single_bit, or -1
+  // > 0: the decoded copy was an echo this long after the direct path;
+  // sample_pos and signal are the direct path's (step 6).
+  float echo_delay_us = 0.0f;
 };
 
 struct DemodStats {
@@ -127,6 +147,8 @@ struct DemodStats {
   std::uint64_t sequence_decoded = 0;  // ... read by the sequence detector (step 3b)
   std::uint64_t bad_crc = 0;        // preambles whose every phase failed the check
   std::uint64_t unknown_address = 0;  // ... of which an Address/Parity frame had an unseen address
+  std::uint64_t retimed = 0;        // frames moved to an earlier copy (first arrival, step 6)
+  std::uint64_t duplicates = 0;     // copies of a recent frame, dropped (long echoes)
   std::uint64_t by_df[32] = {};     // frames emitted per downlink format
 };
 

@@ -23,6 +23,7 @@ import { FrameFlags, FrameKind, encodeFrameHeader, toAircraft } from '../public/
 import { ClockSync, LatencyHistogram, hrNs } from './clock.mjs';
 import { ApplyResult, Mode } from './feed.mjs';
 import { FeedClient } from './feed_client.mjs';
+import { ProbabilityCone, detectCollisionsFromCones, formatCollision } from './prediction.mjs';
 import { acceptUpgrade } from './websocket.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -54,7 +55,15 @@ export const defaultGatewayOptions = Object.freeze({
   statusMs: 1000,
   trailPoints: 200,
   clockHelper: null,
+  coneCacheMs: 2000, // reuse an aircraft's probability cone this long (the Fall 2025 server: 3 s)
+  collisionCacheMs: 2000, // reuse the /api/collisions/kalman result this long
+  predictionSliceMs: 4, // compute cones in slices of about this long, yielding to the feed in between
 });
+
+// The Fall 2025 server's history windows (ads/server.js), in event time.
+const kConeHistoryMs = 120 * 60_000; // enriched: trails of the last 120 minutes
+const kCollisionHistoryMs = 10 * 60_000; // collisions: positions of the last 10 minutes
+const kCollisionActiveMs = 2 * 60_000; // collisions: aircraft seen in the last 2 minutes
 
 const u16le = (n) => {
   const b = Buffer.alloc(2);
@@ -77,7 +86,12 @@ export class Gateway {
     this.opts = { ...defaultGatewayOptions, ...opts };
     this.clients = new Set();
     this.seen = new Map(); // icao -> { first, last } wall ms (for the Fall 2025 API)
-    this.trails = new Map(); // icao -> [{lat, lon, altitude, speed, track, seen}]
+    this.trails = new Map(); // icao -> [{lat, lon, altitude, speed, track, seen, event_ms}]
+    // Probability cones, computed per REST request (never per feed message):
+    // key -> {at (wall ms), cone}; and the last collision results.
+    this.coneCache = new Map();
+    this.collisionCache = new Map();
+    this.predictionStats = { cones_computed: 0, cone_cache_hits: 0, collision_runs: 0, last_cones_ms: 0, last_collisions_ms: 0 };
     this.clock = new ClockSync(this.opts.clockHelper);
     this.lat = {
       feed_to_gateway: new LatencyHistogram(), // publish_ts -> applied to the book
@@ -194,13 +208,18 @@ export class Gateway {
     if (a.lat === null || a.lon === null) return;
     let t = this.trails.get(icao);
     if (!t) this.trails.set(icao, (t = []));
-    t.push({ lat: a.lat, lon: a.lon, altitude: a.altitude, speed: a.speed, track: a.track, seen: Math.floor(nowMs / 1000) });
+    // event_ms: the feed's event time of the frame that moved it (TrackUpdate
+    // event_ts_ns), whole ms: the time base of the probability cones.
+    const eventMs = Number(msg.readBigUInt64LE(8) / 1_000_000n);
+    t.push({ lat: a.lat, lon: a.lon, altitude: a.altitude, speed: a.speed, track: a.track, seen: Math.floor(nowMs / 1000), event_ms: eventMs });
     if (t.length > this.opts.trailPoints) t.splice(0, t.length - this.opts.trailPoints);
   }
 
   // A new session cleared the book, or a snapshot replaced it.
   onBookReplaced(cleared) {
     const nowMs = Date.now();
+    this.coneCache.clear();
+    this.collisionCache.clear();
     if (cleared) {
       this.seen.clear();
       this.trails.clear();
@@ -418,6 +437,7 @@ export class Gateway {
       status: this.status(),
       subscriber: { ...st, expected: this.core.expected, known_next: this.core.knownNext, feed_dropped: this.feed.loss.dropped },
       fanout: { ...this.counters },
+      prediction: { ...this.predictionStats, cached_cones: this.coneCache.size },
       latency_us: {
         feed_to_gateway: this.lat.feed_to_gateway.summary(),
         feed_to_ws: this.lat.feed_to_ws.summary(),
@@ -495,6 +515,180 @@ export class Gateway {
     };
   }
 
+  // ---- Probability cones and collisions (ads/server.js, from memory) -------
+  //
+  // The Fall 2025 server ran the Kalman filter over Postgres history against
+  // Date.now(). Here the history is the in-memory trail and "now" is the
+  // feed's event time: the newest event_ts_ns in the book. Everything is
+  // computed when a REST request asks for it, and cones are reused for
+  // coneCacheMs, so the feed -> book -> WebSocket path never runs it. A
+  // request computes its cones in slices of predictionSliceMs and yields to
+  // the event loop in between, so datagrams and WebSocket frames are not held
+  // up for the whole computation (1,000 aircraft: about 40 ms).
+
+  async forEachSliced(items, fn) {
+    let t = performance.now();
+    for (let i = 0; i < items.length; i++) {
+      fn(items[i]);
+      if ((i & 15) === 15 && performance.now() - t > this.opts.predictionSliceMs) {
+        await new Promise((r) => setImmediate(r));
+        t = performance.now();
+      }
+    }
+  }
+
+  eventNowMs() {
+    let max = 0n;
+    for (const u of this.book.tracks.values()) {
+      const t = u.readBigUInt64LE(8);
+      if (t > max) max = t;
+    }
+    return Number(max / 1_000_000n);
+  }
+
+  // History in the original's shape ({lat, lon, altitude, timestamp}), points
+  // with event time >= sinceMs.
+  history(icao, sinceMs) {
+    const out = [];
+    for (const p of this.trails.get(icao) ?? []) {
+      if (p.event_ms >= sinceMs) out.push({ lat: p.lat, lon: p.lon, altitude: p.altitude, timestamp: p.event_ms });
+    }
+    return out;
+  }
+
+  sweepCaches(wallMs) {
+    for (const [k, e] of this.coneCache) if (wallMs - e.at >= this.opts.coneCacheMs) this.coneCache.delete(k);
+    for (const [k, e] of this.collisionCache) if (wallMs - e.at >= this.opts.collisionCacheMs) this.collisionCache.delete(k);
+  }
+
+  // A ProbabilityCone for `a` (an aircraftList() object) from its trail
+  // points of the last `historyMs`, or null when the original would not
+  // compute one (fewer than 2 positions and, unless `requireHistory`, no speed
+  // and track) or it fails. Cached by the history it is computed from, so the
+  // enriched and collision endpoints share a cone whenever their windows hold
+  // the same points (with 200-point trails, nearly always).
+  coneFor(a, horizon, confidence, nowMs, historyMs, requireHistory) {
+    const icao = Number.parseInt(a.hex, 16);
+    const since = nowMs - historyMs;
+    let n = 0;
+    let first = 0;
+    let last = 0;
+    for (const p of this.trails.get(icao) ?? []) {
+      if (p.event_ms < since) continue;
+      if (n === 0) first = p.event_ms;
+      last = p.event_ms;
+      n++;
+    }
+    if (n < 2 && requireHistory) return null;
+    const key = `${icao}:${horizon}:${confidence}:${n}:${first}:${last}`;
+    const wallMs = Date.now();
+    const hit = this.coneCache.get(key);
+    if (hit && wallMs - hit.at < this.opts.coneCacheMs) {
+      this.predictionStats.cone_cache_hits++;
+      return hit.cone;
+    }
+    const history = this.history(icao, since);
+    let cone = null;
+    if (history.length >= 2 || (a.speed && a.track)) {
+      try {
+        cone = new ProbabilityCone(a, history, horizon, confidence, nowMs);
+      } catch {
+        cone = null;
+      }
+      this.predictionStats.cones_computed++;
+    }
+    if (this.opts.coneCacheMs > 0) this.coneCache.set(key, { at: wallMs, cone });
+    return cone;
+  }
+
+  // /api/aircraft/enriched?trails=&cones=&prediction_time=&confidence=
+  // (window is accepted and ignored: the book holds the current aircraft).
+  async enriched(params) {
+    const includeTrails = params.get('trails') !== 'false';
+    const includeCones = params.get('cones') !== 'false';
+    const predictionTime = Number.parseInt(params.get('prediction_time')) || 300;
+    const confidenceLevel = Number.parseFloat(params.get('confidence')) || 0.95;
+    const aircraft = this.aircraftList();
+    const t0 = performance.now();
+    if (includeCones) {
+      this.sweepCaches(Date.now());
+      const nowMs = this.eventNowMs();
+      await this.forEachSliced(aircraft, (a) => {
+        const cone = this.coneFor(a, predictionTime, confidenceLevel, nowMs, kConeHistoryMs, false);
+        a.probabilityCone = cone ? cone.getPredictionPoints() : null;
+      });
+      this.predictionStats.last_cones_ms = performance.now() - t0;
+    }
+    if (includeTrails) for (const a of aircraft) a.trail = this.trails.get(Number.parseInt(a.hex, 16)) ?? [];
+    return {
+      now: Date.now(),
+      aircraft,
+      timeWindow: 0,
+      source: 'gateway',
+      stats: {
+        total: aircraft.length,
+        withTrails: aircraft.filter((a) => a.trail && a.trail.length > 0).length,
+        withCones: aircraft.filter((a) => a.probabilityCone).length,
+      },
+    };
+  }
+
+  // /api/collisions/kalman?time_horizon=&confidence=: aircraft with a
+  // position and altitude, updated in the last 2 minutes, with at least 2
+  // positions in the last 10 minutes (all in event time).
+  async collisions(params) {
+    const timeHorizon = Number.parseInt(params.get('time_horizon')) || 300;
+    const confidence = Number.parseFloat(params.get('confidence')) || 0.95;
+    const wallMs = Date.now();
+    this.sweepCaches(wallMs);
+    const key = `${timeHorizon}:${confidence}`;
+    const hit = this.collisionCache.get(key);
+    if (hit && wallMs - hit.at < this.opts.collisionCacheMs) return { ...hit.body, timestamp: wallMs, cached: true };
+    const t0 = performance.now();
+    const nowMs = this.eventNowMs();
+    const active = this.aircraftList().filter((a) => {
+      if (a.altitude === null) return false;
+      const u = this.book.tracks.get(Number.parseInt(a.hex, 16));
+      return Number(u.readBigUInt64LE(8) / 1_000_000n) >= nowMs - kCollisionActiveMs;
+    });
+    const valid = [];
+    const cones = [];
+    await this.forEachSliced(active, (a) => {
+      const cone = this.coneFor(a, timeHorizon, confidence, nowMs, kCollisionHistoryMs, true);
+      if (!cone) return; // fewer than 2 positions in the window
+      valid.push(a);
+      cones.push(cone);
+    });
+    let body;
+    if (valid.length < 2) {
+      body = {
+        collisions: [],
+        message: 'Not enough aircraft with sufficient position history',
+        aircraft_count: valid.length,
+        time_horizon: timeHorizon,
+        confidence_level: confidence,
+      };
+    } else {
+      const byHex = new Map(valid.map((a) => [a.hex, a]));
+      const current = (a) => (a ? { lat: a.lat.toFixed(4), lon: a.lon.toFixed(4), alt: Math.round(a.altitude) } : null);
+      const collisions = detectCollisionsFromCones(cones).map((c) => {
+        const f = formatCollision(c);
+        const ac1 = byHex.get(c.aircraft1);
+        const ac2 = byHex.get(c.aircraft2);
+        f.currentPosition1 = current(ac1);
+        f.currentPosition2 = current(ac2);
+        f.flight1 = ac1?.flight || null;
+        f.flight2 = ac2?.flight || null;
+        return f;
+      });
+      body = { collisions, aircraft_count: valid.length, time_horizon: timeHorizon, confidence_level: confidence };
+    }
+    this.predictionStats.collision_runs++;
+    this.predictionStats.last_collisions_ms = performance.now() - t0;
+    if (this.opts.collisionCacheMs > 0) this.collisionCache.set(key, { at: wallMs, body });
+    return { ...body, timestamp: wallMs };
+  }
+
   onHttp(req, res) {
     const url = new URL(req.url || '/', 'http://gateway');
     const path = url.pathname;
@@ -511,11 +705,10 @@ export class Gateway {
     try {
       if (path === '/gateway/stats') return json(200, this.stats());
       if (path === '/gateway/digest') return json(200, this.digest());
-      if (path === '/api/aircraft' || path === '/api/aircraft/enriched') {
-        const aircraft = this.aircraftList();
-        if (path.endsWith('/enriched')) for (const a of aircraft) a.trail = this.trails.get(Number.parseInt(a.hex, 16)) ?? [];
-        return json(200, { now: Date.now(), aircraft, timeWindow: 0, source: 'gateway' });
+      if (path === '/api/aircraft') {
+        return json(200, { now: Date.now(), aircraft: this.aircraftList(), timeWindow: 0, source: 'gateway' });
       }
+      if (path === '/api/aircraft/enriched') return this.enriched(url.searchParams).then((b) => json(200, b), (e) => json(500, { error: e.message }));
       const trail = /^\/api\/aircraft\/([0-9a-fA-F]{1,6})\/trail$/.exec(path);
       if (trail) {
         const hex = trail[1].toUpperCase().padStart(6, '0');
@@ -527,10 +720,7 @@ export class Gateway {
       if (path === '/api/health') {
         return json(200, { status: 'ok', database: 'not used (gateway)', aircraft_count: this.book.size, timestamp: Date.now() });
       }
-      if (path === '/api/collisions/kalman') {
-        // The gateway does not run the Fall 2025 collision model.
-        return json(200, { collisions: [], aircraft_count: this.book.size, note: 'collision detection is not part of the gateway', timestamp: Date.now() });
-      }
+      if (path === '/api/collisions/kalman') return this.collisions(url.searchParams).then((b) => json(200, b), (e) => json(500, { error: e.message }));
       if (path.startsWith('/api/')) return json(404, { error: 'not provided by the gateway' });
       if (path.startsWith('/gateway/')) return this.serveFile(res, publicDir, path.slice('/gateway/'.length), req.method);
       return this.serveFile(res, this.opts.mapDir, path === '/' ? 'index.html' : path.slice(1), req.method);

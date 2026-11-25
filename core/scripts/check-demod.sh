@@ -17,6 +17,10 @@
 #   * weak signals (noise figure 22 dB): at least as many messages as readsb
 #   * receiver impairments (40 ppm, DC offset, IQ imbalance) and strong
 #     multipath still decode; under multipath the false decodes are echoes
+#   * echoes (step 6): frames decoded from an echo take their direct path's
+#     time (fewer late copies, more matched, no frame lost); in busy
+#     airspace without echoes nothing is moved; copies from a reflector far
+#     enough to delay them past the frame are dropped
 #   * 2.0 and 12 MS/s recordings decode (readsb's file input is 2.4 MS/s only;
 #     2.0 MS/s loses some frames to its blind sampling phase)
 #   * with readsb: at least 98% of readsb's matched messages on every
@@ -199,6 +203,40 @@ sys.exit(0 if other <= 30 else 1)
 EOF
 then ok "multipath: the false decodes are echoes"; else bad "multipath: false decodes that are not echoes"; fi
 ECHO_OK=1 compare mp
+
+echo "== echoes"
+# echo_numbers OURS_JSON PLAIN_JSON: late copies and matched, with and
+# without echo handling.
+"$DEMOD" "$WORK/mp.sigmf-meta" --first-arrival 0 --duplicate-window 0 --beast "$WORK/mp.plain" --quiet
+python3 "$SCORE" "$WORK/mp.sigmf-meta" "$WORK/mp.plain" --json >"$WORK/mp.plain.json"
+moved="$(grep -o 'echoes: [0-9]* frames moved' "$WORK/mp.demod.log" | grep -o '[0-9]*')"
+if python3 - "$WORK/mp.ours.json" "$WORK/mp.plain.json" "$moved" <<'EOF'
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+la, lb = a["timing"]["late_copies"], b["timing"]["late_copies"]
+ma, mb = a["timing"]["matched"], b["timing"]["matched"]
+print(f"    {sys.argv[3]} frames moved to their direct path: late copies {lb} -> {la}, matched {mb} -> {ma}")
+sys.exit(0 if la <= 0.6 * lb and ma >= mb + 0.8 * (lb - la) and a["decoded"] == b["decoded"] else 1)
+EOF
+then ok "multipath: frames decoded from an echo take the direct path's time"; else bad "multipath: first arrival"; fi
+grep -q 'echoes: 0 frames moved to their direct path, 0 duplicates dropped' "$WORK/busy.demod.log" &&
+  ok "busy airspace without echoes: nothing moved or dropped" || { bad "busy: echoes found where there are none"; grep echoes "$WORK/busy.demod.log"; }
+# A reflector ~20 km out, 1 dB down: echoes arrive 20-200 us late, most of
+# them after the frame has ended, and decode as second copies.
+"$SYNTH" -o "$WORK/far" --aircraft 100 --duration 6 --tail 1 --seed 12 --reflector 40.25,-88.24,400,1 >/dev/null
+"$DEMOD" "$WORK/far.sigmf-meta" --beast "$WORK/far.ours" 2>"$WORK/far.demod.log"
+"$DEMOD" "$WORK/far.sigmf-meta" --duplicate-window 0 --beast "$WORK/far.plain" --quiet
+python3 "$SCORE" "$WORK/far.sigmf-meta" "$WORK/far.ours" --json >"$WORK/far.ours.json"
+python3 "$SCORE" "$WORK/far.sigmf-meta" "$WORK/far.plain" --json >"$WORK/far.plain.json"
+dups="$(grep -o '[0-9]* duplicates dropped' "$WORK/far.demod.log" | grep -o '^[0-9]*')"
+if python3 - "$WORK/far.ours.json" "$WORK/far.plain.json" "$dups" <<'EOF'
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+d = int(sys.argv[3])
+print(f"    {d} copies dropped: false {b['false']} -> {a['false']}, matched {b['timing']['matched']} -> {a['timing']['matched']}")
+sys.exit(0 if d > 500 and b["false"] - a["false"] == d and a["timing"]["matched"] == b["timing"]["matched"] else 1)
+EOF
+then ok "far reflector: every dropped copy was a false decode, none was a real message"; else bad "far reflector: duplicates"; fi
 
 echo "== other sample rates"
 for rate in 2.0e6 12e6; do

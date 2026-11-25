@@ -44,6 +44,11 @@ void usage() {
                "  --gate R              first-stage gate, share of the weakest accepted pulse (default 0.9)\n"
                "  --resume-overlap US   after a frame, resume scanning US before its end (default 16)\n"
                "  --address-ttl S       Address/Parity frames need the address seen within S s (default 60)\n"
+               "  --first-arrival US    a frame whose direct path failed up to US earlier (garbled by this\n"
+               "                        copy, its echo) takes the direct path's time; 0 = off (default 40)\n"
+               "  --first-arrival-match C  normalized correlation the direct path needs (default 0.85)\n"
+               "  --duplicate-window US drop a copy of a frame emitted up to US earlier (an echo longer\n"
+               "                        than the frame); 0 = off (default 200)\n"
                "  --quiet               no statistics on stderr\n");
 }
 
@@ -137,6 +142,9 @@ int main(int argc, char** argv) {
     else if (a == "--gate") cfg.gate_ratio = num();
     else if (a == "--resume-overlap") cfg.resume_overlap_us = num();
     else if (a == "--address-ttl") cfg.address_ttl_s = num();
+    else if (a == "--first-arrival") cfg.first_arrival_us = num();
+    else if (a == "--first-arrival-match") cfg.first_arrival_match = num();
+    else if (a == "--duplicate-window") cfg.duplicate_window_us = num();
     else if (a == "--quiet") quiet = true;
     else { std::fprintf(stderr, "adsb-demod: unknown option %s\n", a.c_str()); usage(); return 2; }
   }
@@ -267,6 +275,8 @@ int main(int argc, char** argv) {
                  cfg.sample_rate_hz / 1e6, adsb::demod::format_name(fmt), static_cast<unsigned long long>(s.frames));
     std::fprintf(stderr, ", %llu of them by the sequence detector", static_cast<unsigned long long>(s.sequence_decoded));
     if (cfg.fix_single_bit) std::fprintf(stderr, " (%llu with one bit fixed)", static_cast<unsigned long long>(s.corrected));
+    std::fprintf(stderr, "\n  echoes: %llu frames moved to their direct path, %llu duplicates dropped",
+                 static_cast<unsigned long long>(s.retimed), static_cast<unsigned long long>(s.duplicates));
     std::fprintf(stderr, "\n  by format:");
     for (int df = 0; df < 32; ++df) {
       if (s.by_df[df]) std::fprintf(stderr, " DF%d %llu", df, static_cast<unsigned long long>(s.by_df[df]));

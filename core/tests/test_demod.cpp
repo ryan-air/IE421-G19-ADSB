@@ -217,6 +217,11 @@ TEST(Demod, RejectsBadConfigurations) {
   EXPECT_TRUE(bad([](DemodConfig& c) { c.resume_overlap_us = 60; }));
   EXPECT_TRUE(bad([](DemodConfig& c) { c.address_ttl_s = 0; }));
   EXPECT_TRUE(bad([](DemodConfig& c) { c.block_samples = 100; }));
+  EXPECT_TRUE(bad([](DemodConfig& c) { c.first_arrival_us = -1; }));
+  EXPECT_TRUE(bad([](DemodConfig& c) { c.first_arrival_us = 300; }));
+  EXPECT_TRUE(bad([](DemodConfig& c) { c.first_arrival_match = 0; }));
+  EXPECT_TRUE(bad([](DemodConfig& c) { c.first_arrival_match = 1.5; }));
+  EXPECT_TRUE(bad([](DemodConfig& c) { c.duplicate_window_us = -1; }));
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +811,178 @@ TEST(DemodScenario, WeakSignalOutputIsPinned) {
   const auto frames = demod_all(sc.cu8, SampleFormat::kCu8, DemodConfig{}, 0, &st);
   EXPECT_GT(st.sequence_decoded, 5u);
   EXPECT_EQ(pin_of(frames, st), "a65c4e5264a2da9c 48");
+}
+
+// ---------------------------------------------------------------------------
+// Echoes (step 6)
+// ---------------------------------------------------------------------------
+
+struct EchoCase {
+  Frame frame;
+  double start_us = 0.0;   // direct path
+  double delay_us = 0.0;   // echo after it
+  double amp = 0.0;        // direct path's amplitude
+};
+
+// Frames with an echo 1.5-30 us later at a random carrier phase, 0.3-0.6 or
+// (a direct path partly blocked) 1.6-3 times as strong: the copies garble
+// each other, and the stronger one may decode.
+std::vector<EchoCase> echo_cases(std::vector<Burst>& bursts, int n, std::uint64_t seed) {
+  adsb::Rng rng(seed);
+  std::vector<EchoCase> cases;
+  double t = 40;
+  for (int k = 0; k < n; ++k) {
+    const Frame f = position_frame(0x710000 + static_cast<std::uint32_t>(k), k);
+    const double delay = rng.uniform(1.5, 30.0);
+    const double amp0 = rng.uniform(0.15, 0.3);
+    const double ratio = k % 2 ? rng.uniform(0.3, 0.6) : rng.uniform(1.6, 3.0);
+    const double amp = k % 2 ? amp0 : amp0 / ratio;
+    const double ph = rng.uniform(0, 6.283);
+    bursts.push_back({f, t, amp, ph, 0});
+    bursts.push_back({f, t + delay, amp * ratio, ph + rng.uniform(1.0, 5.0), 0});
+    cases.push_back({f, t, delay, amp});
+    t += 400;
+  }
+  return cases;
+}
+
+const EchoCase* case_of(const std::vector<EchoCase>& cases, const DemodFrame& f) {
+  for (const EchoCase& c : cases) {
+    if (hex(c.frame) == hex(f)) return &c;
+  }
+  return nullptr;
+}
+
+// When the echo is what decodes, the frame takes the direct path's time:
+// with step 6 every decoded frame is within 0.1 us of its direct path,
+// except a few with echoes under 5 us (most of the direct path's samples
+// are under the echo's pulses); with it off, many carry their echo's time.
+void check_echo_timing(double fs) {
+  SCOPED_TRACE(fs);
+  std::vector<Burst> bursts;
+  const auto cases = echo_cases(bursts, 120, 21);
+  const double us = fs / 1e6;
+  const auto iq = render(bursts, fs, static_cast<std::size_t>((cases.back().start_us + 400) * us), 0.01, 5);
+  DemodConfig off = config_at(fs);
+  off.first_arrival_us = 0;
+  DemodStats st_on, st_off;
+  const auto on = demod_floats(iq, config_at(fs), &st_on);
+  const auto plain = demod_floats(iq, off, &st_off);
+  EXPECT_EQ(on.size(), plain.size());
+  // (2.0 MS/s has a blind phase: fewer frames decode at all.)
+  EXPECT_GE(on.size(), fs == 2.0e6 ? 45u : 85u);
+  int at_echo = 0, retimed = 0;
+  for (const DemodFrame& f : on) {
+    const EchoCase* c = case_of(cases, f);
+    ASSERT_NE(c, nullptr) << hex(f);
+    if ((c->delay_us >= 5.0 && fs != 2.0e6) || f.echo_delay_us > 0) {
+      EXPECT_NEAR(f.sample_pos, c->start_us * us, 0.1 * us) << "delay " << c->delay_us;
+    }
+    if (f.echo_delay_us > 0) {
+      ++retimed;
+      EXPECT_NEAR(f.echo_delay_us, c->delay_us, 0.1) << hex(f);
+      // The direct path's amplitude, not the echo's (which differs by a
+      // factor 1.6-3 or 0.3-0.6).
+      EXPECT_NEAR(f.signal, c->amp, 0.25 * c->amp) << hex(f);
+    }
+  }
+  for (const DemodFrame& f : plain) {
+    const EchoCase* c = case_of(cases, f);
+    ASSERT_NE(c, nullptr);
+    if (std::abs(f.sample_pos - (c->start_us + c->delay_us) * us) < 0.1 * us) ++at_echo;
+    EXPECT_EQ(f.echo_delay_us, 0.0f);
+  }
+  // At 2.0 MS/s (a half-bit is one sample) the correlation of a direct
+  // path is lower and fewer pass first_arrival_match: about 30%.
+  EXPECT_GT(at_echo, 30);
+  EXPECT_GE(retimed, fs == 2.0e6 ? at_echo / 4 : at_echo * 9 / 10);
+  EXPECT_EQ(st_on.retimed, static_cast<std::uint64_t>(retimed));
+  EXPECT_EQ(st_off.retimed, 0u);
+}
+
+TEST(Demod, AFrameDecodedFromItsEchoTakesTheDirectPathsTime) {
+  for (double fs : {2.4e6, 2.0e6, 6.0e6, 12.0e6}) check_echo_timing(fs);
+}
+
+// Without echoes nothing is moved, also when replies from other aircraft
+// overlap (a reply's preamble that failed under another one has other bits).
+TEST(Demod, OverlappingRepliesFromOtherAircraftAreNotTakenForEchoes) {
+  std::vector<Burst> bursts;
+  adsb::Rng rng(31);
+  double t = 30;
+  for (int k = 0; k < 400; ++k) {
+    const bool shrt = rng.uniform() < 0.3;
+    const auto icao = 0x600000 + static_cast<std::uint32_t>(k);
+    bursts.push_back({shrt ? adsb::modes::encode_df11(icao) : position_frame(icao, k), t, rng.uniform(0.05, 0.5),
+                      rng.uniform(0, 6), 0});
+    t += rng.uniform(3.0, 150.0);  // many overlaps
+  }
+  const double us = 2.4;
+  const auto iq = render(bursts, 2.4e6, static_cast<std::size_t>((t + 200) * us), 0.01, 6);
+  DemodStats st;
+  const auto frames = demod_floats(iq, DemodConfig{}, &st);
+  EXPECT_GT(frames.size(), 80u);
+  EXPECT_EQ(st.retimed, 0u);
+  int real = 0;
+  for (const DemodFrame& f : frames) {
+    // (DF11 near-misses with an interrogator code are not among the bursts.)
+    const Burst* b = nullptr;
+    for (const Burst& x : bursts) {
+      if (hex(x.frame) == hex(f)) b = &x;
+    }
+    if (b == nullptr) continue;
+    ++real;
+    EXPECT_NEAR(f.sample_pos, b->start_us * us, 0.1 * us) << hex(f);
+  }
+  EXPECT_GT(real, 80);
+}
+
+// An echo later than the frame is long decodes as a second copy: dropped
+// within the window; a real repeat after it is kept.
+TEST(Demod, ACopyOfARecentFrameIsDroppedAsAnEcho) {
+  const Frame f = position_frame(0x4840D6, 3);
+  const double fs = 2.4e6, us = fs / 1e6;
+  const std::vector<Burst> bursts = {{f, 50, 0.3, 0, 0}, {f, 50 + 150, 0.2, 1.0, 0}, {f, 50 + 600, 0.3, 2.0, 0}};
+  const auto iq = render(bursts, fs, static_cast<std::size_t>(800 * us), 0.01, 7);
+  DemodStats st;
+  const auto frames = demod_floats(iq, DemodConfig{}, &st);
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_NEAR(frames[0].sample_pos, 50 * us, 0.1 * us);
+  EXPECT_NEAR(frames[1].sample_pos, 650 * us, 0.1 * us);
+  EXPECT_EQ(st.duplicates, 1u);
+  DemodConfig keep;
+  keep.duplicate_window_us = 0;
+  DemodStats st0;
+  const auto all = demod_floats(iq, keep, &st0);
+  ASSERT_EQ(all.size(), 3u);
+  EXPECT_NEAR(all[1].sample_pos, 200 * us, 0.1 * us);
+  EXPECT_EQ(st0.duplicates, 0u);
+  // A different frame at the echo's place is not a copy.
+  const std::vector<Burst> other = {{f, 50, 0.3, 0, 0}, {position_frame(0x4840D6, 4), 200, 0.2, 1.0, 0}};
+  EXPECT_EQ(demod_floats(render(other, fs, static_cast<std::size_t>(400 * us), 0.01, 8), DemodConfig{}).size(), 2u);
+}
+
+// Step 6 looks back into samples an earlier feed() delivered: the output
+// still does not depend on how the input is split.
+TEST(Demod, EchoHandlingDoesNotDependOnHowTheInputIsSplit) {
+  std::vector<Burst> bursts;
+  const auto cases = echo_cases(bursts, 60, 41);
+  const auto bytes = as_bytes(render(bursts, 2.4e6, static_cast<std::size_t>((cases.back().start_us + 400) * 2.4), 0.01, 9),
+                              SampleFormat::kCu8);
+  DemodConfig small;
+  small.block_samples = 1024;
+  DemodStats st;
+  const auto ref = demod_all(bytes, SampleFormat::kCu8, DemodConfig{}, 0, &st);
+  EXPECT_GT(st.retimed, 5u);
+  for (std::size_t chunk : {std::size_t{1024}, std::size_t{777}, std::size_t{5000}}) {
+    const auto got = demod_all(bytes, SampleFormat::kCu8, chunk <= 1024 ? small : DemodConfig{}, chunk);
+    ASSERT_EQ(got.size(), ref.size()) << chunk;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      EXPECT_EQ(hex(got[i]), hex(ref[i]));
+      EXPECT_EQ(got[i].sample_pos, ref[i].sample_pos);
+      EXPECT_EQ(got[i].echo_delay_us, ref[i].echo_delay_us);
+    }
+  }
 }
 
 }  // namespace

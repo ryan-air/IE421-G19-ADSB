@@ -1210,18 +1210,20 @@ void Demodulator::scan(bool final) {
   if (end > t0) {
     const std::ptrdiff_t w_end = end + im.gate_k[3] + 2;  // window sums needed: [t0, w_end)
     float* ws = im.wsum.data();
-    if (im.win == 2) {  // 2.0-2.9 MS/s: a fixed width the compiler vectorizes
-      for (std::ptrdiff_t k = t0; k < w_end; ++k) ws[k] = m[k] + m[k + 1];
+    // Then the larger of the two windows a pulse can sit in, once per
+    // position (ws[k] = max(sum at k, sum at k + 1); the last keeps its sum).
+    if (im.win == 2) {  // 2.0-2.9 MS/s: a fixed width, both steps in one pass the compiler vectorizes
+      for (std::ptrdiff_t k = t0; k + 1 < w_end; ++k) ws[k] = std::max(m[k] + m[k + 1], m[k + 1] + m[k + 2]);
+      if (w_end > t0) ws[w_end - 1] = m[w_end - 1] + m[w_end];
     } else {
       for (std::ptrdiff_t k = t0; k < w_end; ++k) {
         float acc = 0.0f;
         for (std::ptrdiff_t j = 0; j < im.win; ++j) acc += m[k + j];
         ws[k] = acc;
       }
+      // (In place: ws[k] only needs ws[k + 1], which is read before it changes.)
+      for (std::ptrdiff_t k = t0; k + 1 < w_end; ++k) ws[k] = std::max(ws[k], ws[k + 1]);
     }
-    // The larger of the two windows a pulse can sit in, once per position
-    // (in place: ws[k] only needs ws[k + 1], which is read before it changes).
-    for (std::ptrdiff_t k = t0; k + 1 < w_end; ++k) ws[k] = std::max(ws[k], ws[k + 1]);
     std::uint8_t* g = im.gate.data();
     const std::ptrdiff_t k0 = im.gate_k[0], k1 = im.gate_k[1], k2 = im.gate_k[2], k3 = im.gate_k[3];
     // One threshold per noise block.

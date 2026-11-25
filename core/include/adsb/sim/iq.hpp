@@ -24,6 +24,11 @@
 //                |Gamma| with phase pi) and optional fixed specular
 //                reflectors (buildings, hills) that add delayed echoes
 //   collisions   overlapping replies simply add
+//   Mode A/C     optional (IqConfig::modeac_rate_hz): replies to simulated
+//                SSR radars (rotating beams, bursts of interrogations),
+//                identity or Gillham altitude, 0.45 us pulses 1.45 us apart
+//                (modes/mode_ac.hpp); same transmitter, channel and receiver
+//                as the Mode S messages
 //   receiver     LO and sample-clock error from one crystal (ppm, as on an
 //                RTL-SDR), thermal noise from the noise figure, DC offset,
 //                IQ gain/phase imbalance, then the ADC: clipping and
@@ -118,6 +123,27 @@ struct IqConfig {
   // Messages weaker than this (direct-path SNR) are neither rendered nor
   // annotated: they would be indistinguishable from noise.
   double min_snr_db = -15.0;
+
+  // Mode A/C replies (off when modeac_rate_hz is 0; then nothing below has
+  // any effect and the output is that of a Mode S-only scenario). Every
+  // airborne aircraft answers `modeac_radars` rotating SSR radars: each
+  // radar (rotation period 4.5-12 s, beam modeac_beam_deg wide; 360 = an
+  // interrogator that is always on it) interrogates an aircraft in a burst
+  // while its beam passes, at a PRF chosen so that
+  // the mean reply rate per aircraft is modeac_rate_hz. Each interrogation
+  // asks for Mode C with probability modeac_mode_c_share (else Mode A) and
+  // is answered with probability modeac_reply_efficiency. A share of the
+  // aircraft (modeac_spi_share) has ident pressed: their Mode A replies
+  // carry SPI. Aircraft on the ground do not reply (squat switch). Mode A/C
+  // draws use their own random streams: the Mode S messages, their noise
+  // and their samples are unchanged by them (only collision flags can
+  // change, where a Mode A/C reply overlaps).
+  double modeac_rate_hz = 0.0;
+  int modeac_radars = 3;
+  double modeac_beam_deg = 3.0;
+  double modeac_mode_c_share = 0.5;
+  double modeac_reply_efficiency = 0.9;
+  double modeac_spi_share = 0.0;
 };
 
 // Checks every field is finite and in a physical range (the renderer assumes
@@ -178,12 +204,16 @@ struct IqTransmitter {
   double drift_hz_per_s = 0.0;
 };
 
-// One rendered message and its truth.
+// One rendered message and its truth. A Mode A/C reply has len 2, bytes =
+// its code word big-endian (modes/mode_ac.hpp), icao = the aircraft that
+// sent it and mode_ac 'A' or 'C' (0 for Mode S). sample_pos is F1's leading
+// edge.
 struct IqMessage {
   std::uint64_t tx_ns = 0;
   std::uint32_t icao = 0;
   std::uint8_t len = 0;
   std::uint8_t bytes[14] = {};
+  char mode_ac = 0;
   double lat = 0.0, lon = 0.0, alt_ft = 0.0;
   double arrival_s = 0.0;          // direct path, true time since the start
   double sample_pos = 0.0;         // direct-path preamble start, in recording samples
@@ -204,6 +234,8 @@ struct IqPlanStats {
   std::uint64_t too_weak = 0;      // below min_snr_db
   std::uint64_t beyond_horizon = 0;  // rendered or not
   std::uint64_t collided = 0;
+  std::uint64_t modeac_replies = 0;  // Mode A/C replies rendered (included in rendered)
+  std::uint64_t modeac_too_weak = 0;  // ... below min_snr_db (included in too_weak)
 };
 
 struct IqPlan {

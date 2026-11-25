@@ -10,6 +10,8 @@
 
 #include "adsb/common/portable_math.hpp"
 #include "adsb/common/rng.hpp"
+#include "adsb/modes/altitude.hpp"
+#include "adsb/modes/mode_ac.hpp"
 
 namespace adsb::sim {
 
@@ -120,7 +122,23 @@ int pulse_intervals(const std::uint8_t* bytes, int len, Interval* out) {
   return n;
 }
 
-double message_duration_s(int len) { return (8.0 + len * 8.0) * 1e-6; }
+double message_duration_s(const IqMessage& m) {
+  if (m.mode_ac) return modes::mode_ac_duration_us(static_cast<std::uint16_t>(m.bytes[0] << 8 | m.bytes[1])) * 1e-6;
+  return (8.0 + m.len * 8.0) * 1e-6;
+}
+
+// Pulses of a Mode A/C reply (code word in bytes[0..1]).
+int mode_ac_intervals(const std::uint8_t* bytes, Interval* out) {
+  const std::uint32_t mask = modes::mode_ac_pulses(static_cast<std::uint16_t>(bytes[0] << 8 | bytes[1]));
+  int n = 0;
+  for (int k = 0; k < modes::kModeAcSlots; ++k) {
+    if (mask >> k & 1u) {
+      const double a = k * modes::kModeAcSlotUs * 1e-6;
+      out[n++] = {a, a + modes::kModeAcPulseUs * 1e-6};
+    }
+  }
+  return n;
+}
 
 struct Fmt {
   std::string s;
@@ -178,6 +196,106 @@ bool spherical_bounce(double h_r, double h_t, double d, double re, Bounce& out) 
   out.divergence = 1.0 / std::sqrt(1.0 + 2.0 * d1 * d2 / (re * (hr + ht)));
   out.grazing_rad = pm::atan2(hr + ht, d);
   return true;
+}
+
+struct ModeAcReply {
+  Transmission tr;   // len 2, bytes = code word; state of the aircraft at tx_ns
+  char mode = 'A';
+};
+
+// Mode A/C replies to simulated SSR radars (IqConfig::modeac_*). Radar r
+// rotates with period P_r (4.5-12 s) and a beam b degrees wide, so it
+// illuminates an aircraft for P_r b / 360 s once per turn, at a phase that
+// depends on the aircraft's bearing (drawn per aircraft and radar). While
+// the beam is on it, interrogations come at the radar's PRF (with a 2%
+// stagger), chosen so that the mean reply rate is modeac_rate_hz per
+// aircraft over all radars. The aircraft's state at a reply is that of its
+// nearest Mode S transmission, dead-reckoned by its velocity.
+std::vector<ModeAcReply> plan_mode_ac(const SynthConfig& synth, const SynthOutput& traffic, const IqConfig& cfg) {
+  std::vector<ModeAcReply> out;
+  const int radars = std::max(1, cfg.modeac_radars);
+  const double eff = cfg.modeac_reply_efficiency;
+  const double beam = cfg.modeac_beam_deg;
+  const double prf = cfg.modeac_rate_hz * 360.0 / (radars * beam * eff);
+  const double duration = std::max(0.0, synth.duration_s);
+
+  std::unordered_map<std::uint32_t, std::vector<std::size_t>> by_icao;
+  for (std::size_t i = 0; i < traffic.transmissions.size(); ++i) by_icao[traffic.transmissions[i].icao].push_back(i);
+  for (auto& [icao, v] : by_icao) {
+    std::stable_sort(v.begin(), v.end(), [&](std::size_t a, std::size_t b) {
+      return traffic.transmissions[a].tx_ns < traffic.transmissions[b].tx_ns;
+    });
+  }
+  std::vector<double> period(static_cast<std::size_t>(radars));
+  for (int r = 0; r < radars; ++r) {
+    Rng rr(mix(cfg.seed, 0xAC0000000000ULL + static_cast<std::uint64_t>(r)));
+    period[static_cast<std::size_t>(r)] = rr.uniform(4.5, 12.0);
+  }
+
+  for (const AircraftInfo& a : traffic.aircraft) {
+    const auto found = by_icao.find(a.icao);
+    if (found == by_icao.end()) continue;
+    const std::vector<std::size_t>& txs = found->second;
+    Rng ar(mix(cfg.seed, 0xAC5D000000000000ULL + a.icao));
+    const bool spi = ar.chance(cfg.modeac_spi_share);
+    for (int r = 0; r < radars; ++r) {
+      Rng rr(mix(cfg.seed, mix(0xACAC000000000000ULL + static_cast<std::uint64_t>(r), a.icao)));
+      const double p = period[static_cast<std::size_t>(r)];
+      const double dwell = p * beam / 360.0;
+      const double phase = rr.uniform(0.0, p);
+      for (double scan = phase - p; scan < duration; scan += p) {
+        for (int k = 0;; ++k) {
+          if (k / prf >= dwell) break;
+          const double t = scan + (k + rr.uniform(-0.02, 0.02)) / prf;
+          const bool answered = rr.chance(eff);
+          const bool mode_c = rr.chance(cfg.modeac_mode_c_share);
+          if (!answered || t < 0.0 || t >= duration) continue;
+          const auto tx_ns = synth.start_rx_ns + static_cast<std::uint64_t>(std::llround(t * 1e9));
+          // Nearest Mode S transmission of the aircraft.
+          const auto pos = std::lower_bound(txs.begin(), txs.end(), tx_ns, [&](std::size_t i, std::uint64_t v) {
+            return traffic.transmissions[i].tx_ns < v;
+          });
+          std::size_t near = pos == txs.end() ? txs.back() : *pos;
+          if (pos != txs.begin() && pos != txs.end()) {
+            const std::size_t prev = *(pos - 1);
+            if (tx_ns - traffic.transmissions[prev].tx_ns < traffic.transmissions[near].tx_ns - tx_ns) near = prev;
+          }
+          const Transmission& ref = traffic.transmissions[near];
+          if (ref.on_ground) continue;  // squat switch: no Mode A/C on the ground
+          const double dt = (static_cast<double>(tx_ns) - static_cast<double>(ref.tx_ns)) * 1e-9;
+          if (dt > 10.0 || dt < -10.0) continue;
+          ModeAcReply rep;
+          rep.mode = mode_c ? 'C' : 'A';
+          Transmission& tr = rep.tr;
+          tr = ref;
+          tr.tx_ns = tx_ns;
+          double st, ct;
+          pm::sincos(ref.track_deg * kDeg, st, ct);
+          const double v = ref.ground_speed_kt * kKtToMps * dt;
+          tr.lat = ref.lat + v * ct / kMeanEarthRadius / kDeg;
+          tr.lon = ref.lon + v * st / (kMeanEarthRadius * std::max(1e-6, pm::cos(ref.lat * kDeg))) / kDeg;
+          tr.alt_ft = ref.alt_ft + ref.vertical_rate_fpm * dt / 60.0;
+          std::uint16_t code = 0;
+          if (mode_c) {
+            // Pressure altitude to the nearest 100 ft; none (only the
+            // framing pulses) out of the code's range.
+            const double hundreds = std::floor((tr.alt_ft + 50.0) / 100.0);
+            code = hundreds >= -12.0 && hundreds <= 1267.0
+                       ? modes::feet_to_gillham(static_cast<std::int32_t>(hundreds) * 100).value_or(0)
+                       : 0;
+          } else {
+            code = static_cast<std::uint16_t>((a.squawk & 0x7777u) | (spi ? modes::kModeAcSpiBit : 0u));
+          }
+          tr.len = 2;
+          std::memset(tr.bytes, 0, sizeof tr.bytes);
+          tr.bytes[0] = static_cast<std::uint8_t>(code >> 8);
+          tr.bytes[1] = static_cast<std::uint8_t>(code & 0xFF);
+          out.push_back(rep);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 }  // namespace
@@ -245,7 +363,13 @@ bool validate_iq_config(const IqConfig& c, std::string* why) {
       !in(c.fall_us, 1e-3, 1, "fall time") || !in(c.k_factor, 0.1, 100, "k-factor") ||
       !in(c.diffraction_db_per_km, 0, 100, "diffraction") || !in(c.ground_reflection, 0, 1, "ground reflection") ||
       !in(c.min_snr_db, -100, 100, "min SNR") || !in(c.tail_s, 0, 3600, "tail") ||
-      !check(c.reflectors.size() <= static_cast<std::size_t>(kMaxIqPaths - 2), "at most 6 reflectors")) {
+      !check(c.reflectors.size() <= static_cast<std::size_t>(kMaxIqPaths - 2), "at most 6 reflectors") ||
+      !in(c.modeac_rate_hz, 0, 1000, "Mode A/C rate") ||
+      !check(c.modeac_radars >= 1 && c.modeac_radars <= 64, "Mode A/C radars must be in [1, 64]") ||
+      !in(c.modeac_beam_deg, 0.1, 360, "Mode A/C beam width") ||
+      !in(c.modeac_mode_c_share, 0, 1, "Mode C share") ||
+      !in(c.modeac_reply_efficiency, 0.01, 1, "Mode A/C reply efficiency") ||
+      !in(c.modeac_spi_share, 0, 1, "SPI share")) {
     return false;
   }
   for (const Reflector& r : c.reflectors) {
@@ -359,15 +483,15 @@ IqPlan plan_iq(const SynthConfig& synth, const SynthOutput& traffic, const IqCon
   }
 
   const double edge = std::max(cfg.rise_us, cfg.fall_us) * 1e-6;
-  for (std::size_t i = 0; i < traffic.transmissions.size(); ++i) {
-    const Transmission& tr = traffic.transmissions[i];
-    ++plan.stats.transmissions;
+  // Plans one message (Mode S, or Mode A/C when mode_ac is 'A' or 'C').
+  auto place = [&](const Transmission& tr, char mode_ac) {
     const auto it = by_icao.find(tr.icao);
-    if (it == by_icao.end()) continue;
+    if (it == by_icao.end()) return;
     const IqTransmitter& xmit = plan.transmitters[it->second];
     // Per-message draws depend on the message itself, not its index, so a
-    // message renders the same whatever other traffic there is.
-    Rng mr(mix(cfg.seed, mix(0x5100000000000000ULL + tr.icao, tr.tx_ns)));
+    // message renders the same whatever other traffic there is. Mode A/C
+    // replies draw from their own stream.
+    Rng mr(mix(cfg.seed, mix((mode_ac ? 0xAC51000000000000ULL : 0x5100000000000000ULL) + tr.icao, tr.tx_ns)));
 
     const double t = static_cast<double>(tr.tx_ns - synth.start_rx_ns) * 1e-9;
     Emitter e;
@@ -400,11 +524,13 @@ IqPlan plan_iq(const SynthConfig& synth, const SynthOutput& traffic, const IqCon
         strongest > 0 ? pm::power_to_db(strongest * strongest) + cfg.full_scale_dbm - plan.noise_dbm : -999.0;
     if (strongest_snr_db < cfg.min_snr_db) {
       ++plan.stats.too_weak;
-      continue;
+      if (mode_ac) ++plan.stats.modeac_too_weak;
+      return;
     }
     m.tx_ns = tr.tx_ns;
     m.icao = tr.icao;
     m.len = tr.len;
+    m.mode_ac = mode_ac;
     std::memcpy(m.bytes, tr.bytes, tr.len);
     m.lat = tr.lat;
     m.lon = tr.lon;
@@ -418,10 +544,18 @@ IqPlan plan_iq(const SynthConfig& synth, const SynthOutput& traffic, const IqCon
     for (int p = 0; p < m.link.n_paths; ++p) max_delay = std::max(max_delay, m.link.paths[p].delay_s);
     m.first_sample = static_cast<std::int64_t>(std::floor((m.arrival_s - edge) * fs_act)) - 1;
     m.last_sample = static_cast<std::int64_t>(
-                        std::ceil((m.arrival_s + max_delay + message_duration_s(m.len) + edge) * fs_act)) + 1;
+                        std::ceil((m.arrival_s + max_delay + message_duration_s(m) + edge) * fs_act)) + 1;
     m.first_sample = std::max<std::int64_t>(m.first_sample, 0);
     plan.total_samples = std::max(plan.total_samples, static_cast<std::uint64_t>(m.last_sample) + 1);
+    if (mode_ac) ++plan.stats.modeac_replies;
     plan.messages.push_back(m);
+  };
+  for (std::size_t i = 0; i < traffic.transmissions.size(); ++i) {
+    ++plan.stats.transmissions;
+    place(traffic.transmissions[i], 0);
+  }
+  if (cfg.modeac_rate_hz > 0.0) {
+    for (const ModeAcReply& r : plan_mode_ac(synth, traffic, cfg)) place(r.tr, r.mode);
   }
 
   std::stable_sort(plan.messages.begin(), plan.messages.end(),
@@ -470,7 +604,7 @@ std::size_t render_iq_chunk(const IqPlan& plan, const IqConfig& cfg, std::uint64
   for (; it != plan.messages.end() && it->first_sample <= end_sample; ++it) {
     const IqMessage& m = *it;
     if (m.last_sample < static_cast<std::int64_t>(n0)) continue;
-    const int np = pulse_intervals(m.bytes, m.len, pulses);
+    const int np = m.mode_ac ? mode_ac_intervals(m.bytes, pulses) : pulse_intervals(m.bytes, m.len, pulses);
     const std::int64_t s_begin = std::max<std::int64_t>(m.first_sample, static_cast<std::int64_t>(n0));
     const std::int64_t s_end = std::min<std::int64_t>(m.last_sample, end_sample);
     for (int p = 0; p < m.link.n_paths; ++p) {
@@ -620,6 +754,13 @@ std::string sigmf_meta(const SynthConfig& synth, const IqConfig& cfg, const IqPl
         static_cast<unsigned long long>(plan.stats.beyond_horizon),
         static_cast<unsigned long long>(plan.stats.collided),
         static_cast<unsigned long long>(plan.total_samples));
+  if (cfg.modeac_rate_hz > 0.0) {
+    j.add("    \"adsb:mode_ac\": {\"rate_hz\": %.4f, \"radars\": %d, \"beam_deg\": %.3f, \"mode_c_share\": %.4f, "
+          "\"reply_efficiency\": %.4f, \"spi_share\": %.4f, \"replies\": %llu, \"too_weak\": %llu},\n",
+          cfg.modeac_rate_hz, cfg.modeac_radars, cfg.modeac_beam_deg, cfg.modeac_mode_c_share,
+          cfg.modeac_reply_efficiency, cfg.modeac_spi_share, static_cast<unsigned long long>(plan.stats.modeac_replies),
+          static_cast<unsigned long long>(plan.stats.modeac_too_weak));
+  }
   j.add("    \"adsb:transmitters\": [");
   for (std::size_t i = 0; i < plan.transmitters.size(); ++i) {
     const IqTransmitter& t = plan.transmitters[i];
@@ -636,10 +777,26 @@ std::string sigmf_meta(const SynthConfig& synth, const IqConfig& cfg, const IqPl
     for (int b = 0; b < m.len; ++b) std::snprintf(hex + 2 * b, 3, "%02X", m.bytes[b]);
     const int df = m.bytes[0] >> 3;
     const double f = cfg.center_hz + m.observed_hz;
+    char label[8];
+    if (m.mode_ac) std::snprintf(label, sizeof label, "MODE%c", m.mode_ac);
+    else std::snprintf(label, sizeof label, "DF%d", df);
     j.add("%s\n    {\"core:sample_start\": %lld, \"core:sample_count\": %lld, \"core:freq_lower_edge\": %.1f, "
-          "\"core:freq_upper_edge\": %.1f, \"core:label\": \"DF%d\", \"core:generator\": \"adsb-iqsynth\", ",
+          "\"core:freq_upper_edge\": %.1f, \"core:label\": \"%s\", \"core:generator\": \"adsb-iqsynth\", ",
           i ? "," : "", static_cast<long long>(m.first_sample),
-          static_cast<long long>(m.last_sample - m.first_sample + 1), f - 0.5e6, f + 0.5e6, df);
+          static_cast<long long>(m.last_sample - m.first_sample + 1), f - 0.5e6, f + 0.5e6, label);
+    if (m.mode_ac) {
+      // Code word as readsb's Beast type '1' payload (adsb:hex), and what it says.
+      const auto code = static_cast<std::uint16_t>(m.bytes[0] << 8 | m.bytes[1]);
+      j.add("\"adsb:mode_ac\": \"%c\", \"adsb:spi\": %s, ", m.mode_ac,
+            (code & modes::kModeAcSpiBit) ? "true" : "false");
+      if (m.mode_ac == 'A') {
+        j.add("\"adsb:squawk\": \"%04X\", ", code & 0x7777u);
+      } else if (const auto ft = modes::gillham_to_feet(code)) {
+        j.add("\"adsb:modec_alt_ft\": %d, ", static_cast<int>(*ft));
+      } else {
+        j.add("\"adsb:modec_alt_ft\": null, ");
+      }
+    }
     j.add("\"adsb:hex\": \"%s\", \"adsb:icao\": \"%06X\", \"adsb:tx_ns\": %llu, \"adsb:sample_pos\": %.4f, ", hex,
           m.icao, static_cast<unsigned long long>(m.tx_ns), m.sample_pos);
     j.add("\"adsb:snr_db\": %.2f, \"adsb:power_dbm\": %.2f, \"adsb:range_m\": %.1f, \"adsb:elevation_deg\": %.3f, "

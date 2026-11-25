@@ -45,4 +45,9 @@ namespace adsb::modes {
 [[nodiscard]] std::optional<std::uint16_t> encode_ac12(std::int32_t alt_ft) noexcept;
 [[nodiscard]] std::optional<std::uint16_t> encode_ac13(std::int32_t alt_ft) noexcept;
 
+// Inverse of gillham_to_feet: the Mode C code (Mode A layout 0xABCD, D1 = 0)
+// of an altitude, rounded to the nearest 100 ft (half-way rounds up, as an
+// encoder's 50 ft transition points do). nullopt outside [-1200, 126700] ft.
+[[nodiscard]] std::optional<std::uint16_t> feet_to_gillham(std::int32_t alt_ft) noexcept;
+
 }  // namespace adsb::modes

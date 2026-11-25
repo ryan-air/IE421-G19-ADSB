@@ -75,6 +75,7 @@ struct FrameMeta {
 struct EngineStats {
   std::uint64_t frames = 0;
   std::uint64_t bad_frames = 0;          // bad CRC / length / unknown format
+  std::uint64_t mode_ac = 0;             // Mode A/C replies (2 bytes): no address, so not tracked
   std::uint64_t corrected = 0;           // DF17/18 frames with one bit repaired (fix_single_bit)
   std::uint64_t corrected_rejected = 0;  // ... of which no confirmed track had the address: dropped
   std::uint64_t ap_accepted = 0;
@@ -108,6 +109,14 @@ class BasicTrackEngine {
   // Decodes and applies one raw frame.
   template <typename Sink>
   void on_frame(const std::uint8_t* frame, std::size_t len, const FrameMeta& meta, Sink& sink) {
+    if (len == 2) {
+      // A Mode A/C reply (Beast type '1'): its time still counts, its code
+      // cannot be tied to a track.
+      ++stats_.frames;
+      ++stats_.mode_ac;
+      advance(meta.rx_ns, sink);
+      return;
+    }
     modes::DecodedMsg m;
     const modes::DecodeStatus st = modes::decode(frame, len, m, modes::DecodeOptions{cfg_.fix_single_bit});
     FrameMeta mm = meta;

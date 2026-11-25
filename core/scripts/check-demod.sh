@@ -25,6 +25,13 @@
 #     2.0 MS/s loses some frames to its blind sampling phase)
 #   * with readsb: at least 98% of readsb's matched messages on every
 #     scenario, and no more false DF17 than readsb
+#   * Mode A/C (adsb-iqsynth --modeac-rate, adsb-demod --modeac): >= 95% of
+#     the clean 15-30 dB replies decoded with the right code (90% at
+#     2.0 MS/s), wrong codes <= 1% of those found, few false detections per
+#     minute (busy airspace and pure noise); the Mode S frames are exactly
+#     those without --modeac; with readsb, its --modeac output is scored
+#     beside ours (reported, not checked: readsb's Mode A/C is not tuned for
+#     this comparison)
 #   * faster than real time
 set -euo pipefail
 
@@ -247,6 +254,76 @@ for rate in 2.0e6 12e6; do
   python3 "$SCORE" "$WORK/r$rate.sigmf-meta" "$WORK/r$rate.ours" --require "clean>=15<30:$min" --require "false17<=0" >"$WORK/r$rate.score" &&
     ok "$rate S/s: $(head -1 "$WORK/r$rate.score")" || { bad "$rate S/s"; cat "$WORK/r$rate.score"; }
 done
+
+echo "== Mode A/C"
+AC=(--require "acclean>=15<30:0.95" --require "acwrong<=0.01" --require "acfalsepm<=60")
+"$SYNTH" -o "$WORK/ac" --aircraft 100 --duration 20 --tail 1 --seed 31 --modeac-rate 10 --modeac-spi 0.1 >/dev/null
+"$DEMOD" "$WORK/ac.sigmf-meta" --modeac --beast "$WORK/ac.ours" 2>"$WORK/ac.demod.log"
+NS+=("$(grep -o '[0-9.]* ns/sample' "$WORK/ac.demod.log" | cut -d' ' -f1)")
+"$DEMOD" "$WORK/ac.sigmf-meta" --beast "$WORK/ac.off" --quiet
+if python3 "$SCORE" "$WORK/ac.sigmf-meta" "$WORK/ac.ours" "${AC[@]}" "${REQ[@]}" >"$WORK/ac.score"; then
+  ok "Mode A/C, busy (100 aircraft, 10 replies/s each): $(grep '^Mode A/C' "$WORK/ac.score")"
+else
+  bad "Mode A/C, busy"; cat "$WORK/ac.score"
+fi
+sed -n '/^Mode A\/C/,$p' "$WORK/ac.score" | sed 's/^/    /'
+if python3 - "$SCORE" "$WORK/ac.ours" "$WORK/ac.off" <<'EOF'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("score", sys.argv[1])
+score = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(score)
+on = score.parse_beast(open(sys.argv[2], "rb").read())
+off = score.parse_beast(open(sys.argv[3], "rb").read())
+mode_s = [f for f in on if len(f[1]) != 4]
+print(f"    {len(mode_s)} Mode S frames with --modeac, {len(off)} without, {len(on) - len(mode_s)} Mode A/C")
+sys.exit(0 if mode_s == off and len(on) > len(off) else 1)
+EOF
+then ok "Mode A/C on: the Mode S frames are exactly those without it"; else bad "Mode A/C changed the Mode S frames"; fi
+for rate in 2.0e6 8e6; do
+  "$SYNTH" -o "$WORK/ac$rate" --aircraft 60 --duration 4 --tail 1 --seed 32 --rate "$rate" --modeac-rate 10 >/dev/null
+  "$DEMOD" "$WORK/ac$rate.sigmf-meta" --modeac --beast "$WORK/ac$rate.ours" --quiet
+  min=0.95; [[ "$rate" == 2.0e6 ]] && min=0.90
+  python3 "$SCORE" "$WORK/ac$rate.sigmf-meta" "$WORK/ac$rate.ours" --require "acclean>=15<30:$min" --require "acwrong<=0.01" \
+    >"$WORK/ac$rate.score" && ok "Mode A/C at $rate S/s: $(grep '^Mode A/C' "$WORK/ac$rate.score")" ||
+    { bad "Mode A/C at $rate S/s"; cat "$WORK/ac$rate.score"; }
+done
+"$SYNTH" -o "$WORK/acnoise" --format cs16 --aircraft 1 --duration 60 --min-snr 99 >/dev/null
+"$DEMOD" "$WORK/acnoise.sigmf-meta" --modeac --beast "$WORK/acnoise.ours" --quiet
+n_false="$(python3 -c "
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('score', '$SCORE'); s = importlib.util.module_from_spec(spec); spec.loader.exec_module(s)
+print(sum(1 for f in s.parse_beast(open('$WORK/acnoise.ours', 'rb').read()) if len(f[1]) == 4))")"
+(( n_false <= 20 )) && ok "Mode A/C in 60 s of pure noise: $n_false false detections (<= 20)" ||
+  bad "Mode A/C in pure noise: $n_false false detections in 60 s"
+if [[ -n "$READSB" ]]; then
+  # readsb --modeac on the same file (report only).
+  portfile="$WORK/port"
+  rm -f "$portfile"
+  python3 - "$WORK/ac.readsb" "$portfile" <<'EOF' &
+import os, socket, sys
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+s.settimeout(60)
+open(sys.argv[2] + ".tmp", "w").write(str(s.getsockname()[1]))
+os.rename(sys.argv[2] + ".tmp", sys.argv[2])
+c, _ = s.accept()
+c.settimeout(60)
+with open(sys.argv[1], "wb") as f:
+    while True:
+        b = c.recv(65536)
+        if not b:
+            break
+        f.write(b)
+EOF
+  listener=$!
+  for _ in $(seq 100); do [[ -f "$portfile" ]] && break; sleep 0.05; done
+  "$READSB" --device-type ifile --ifile "$WORK/ac.sigmf-data" --iformat UC8 --no-fix --modeac --net \
+    --net-connector "127.0.0.1,$(cat "$portfile"),beast_out" --quiet >"$WORK/ac.readsb.log" 2>&1 || true
+  wait "$listener" || true
+  echo "    readsb --modeac on the same file:"
+  python3 "$SCORE" "$WORK/ac.sigmf-meta" "$WORK/ac.readsb" 2>&1 | sed -n '/^Mode A\/C/,$p' | sed 's/^/      /' || true
+fi
 
 echo "== speed"
 python3 - "${NS[@]}" <<'EOF'

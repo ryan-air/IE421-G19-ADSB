@@ -19,6 +19,10 @@
 #     line): the arbiter matches exactly the frames both demodulators decoded
 #     (counted apart from it, by payload and sample time), and recovers line
 #     B's +20 ppm sample clock
+#
+# AB_IQ_SPEED (default 1): pacing of the IQ lines, times real time. A build
+# whose demodulator is slower than real time (ThreadSanitizer) drops blocks
+# at the paced input, differently on each line; run it with e.g. 0.25.
 set -euo pipefail
 
 BUILD="${1:?usage: check-ab.sh BUILD_DIR}"
@@ -119,7 +123,7 @@ check "live: no frame dropped at the input boundary" "grep -q 'line A 0 dropped'
 # lines lose different frames), line B's sample clock 20 ppm fast.
 "$T/adsb-iqsynth" -o "$WORK/a" --aircraft 150 --duration 4 --seed 5 --iq-seed 100 --noise-figure 20 >/dev/null 2>&1
 "$T/adsb-iqsynth" -o "$WORK/b" --aircraft 150 --duration 4 --seed 5 --iq-seed 200 --noise-figure 20 --ppm 20 >/dev/null 2>&1
-limit 60 "$T/adsb-live" --iq "$WORK/a.sigmf-meta" --iq-b "$WORK/b.sigmf-meta" --stats-every 0 --quiet > "$WORK/q.txt" 2>&1 || true
+limit 60 "$T/adsb-live" --iq "$WORK/a.sigmf-meta" --iq-b "$WORK/b.sigmf-meta" --iq-speed "${AB_IQ_SPEED:-1}" --stats-every 0 --quiet > "$WORK/q.txt" 2>&1 || true
 "$T/adsb-demod" "$WORK/a.sigmf-meta" --beast "$WORK/a.beast" --quiet
 "$T/adsb-demod" "$WORK/b.sigmf-meta" --beast "$WORK/b.beast" --quiet
 # Frames both demodulators decoded: same payload, sample times within 1 ms
@@ -155,6 +159,8 @@ print(both, len(a) + len(b) - both)
 PYEOF
 read -r both union <<< "$(python3 "$WORK/both.py" "$WORK/a.beast" "$WORK/b.beast")"
 echo "iq: both demodulators $both, union $union"; arb "$WORK/q.txt"
+check "iq: no block dropped on either line (else the demodulator is slower than AB_IQ_SPEED x real time)" \
+  "[[ \$(grep -cE ', 0 blocks dropped' '$WORK/q.txt') -eq 2 ]] || { grep -E 'blocks dropped' '$WORK/q.txt'; false; }"
 check "iq: matched copies = frames both demodulators decoded" "[[ $both -gt 100 && $(field "$WORK/q.txt" arbiter multi) -eq $both ]]"
 check "iq: forwarded = the union" "[[ $(field "$WORK/q.txt" arbiter forwarded) -eq $union ]]"
 check "iq: line B's sample clock +20.000 ppm" "grep -q 'rate +20.000 ppm' '$WORK/q.txt'"

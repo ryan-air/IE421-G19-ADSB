@@ -5,6 +5,8 @@
 #include <fstream>
 #include <sstream>
 
+#include "adsb/modes/mode_ac.hpp"
+
 namespace adsb::ingest {
 
 namespace {
@@ -245,12 +247,15 @@ void IqSource::note_arrival(const IqBlock& b) noexcept {
 record::Record IqSource::to_record(const demod::DemodFrame& f) const noexcept {
   record::Record r;
   const double spu = cfg_.sample_rate_hz / 1e6;
-  const double end_sample = f.sample_pos + (8.0 + 8.0 * f.len) * spu;
+  // Mode A/C (len 2): ends with F2; its radio time is F2's, as in readsb.
+  const double end_sample = f.len == 2 ? f.sample_pos + (modes::kModeAcF2Us + modes::kModeAcPulseUs) * spu
+                                       : f.sample_pos + (8.0 + 8.0 * f.len) * spu;
+  const double radio_sample = f.len == 2 ? f.sample_pos + modes::kModeAcF2Us * spu : f.sample_pos;
   r.rx_ns = host_ns_of(end_sample);
-  r.radio_ts = static_cast<std::uint64_t>(std::llround(std::max(0.0, f.sample_pos) * 12e6 / cfg_.sample_rate_hz)) &
+  r.radio_ts = static_cast<std::uint64_t>(std::llround(std::max(0.0, radio_sample) * 12e6 / cfg_.sample_rate_hz)) &
                0xFFFFFFFFFFFFull;
   r.line = cfg_.line;
-  r.type = f.len == 7 ? '2' : '3';
+  r.type = f.len == 2 ? '1' : f.len == 7 ? '2' : '3';
   r.signal = static_cast<std::uint8_t>(std::clamp(std::lround(f.signal * 255.0f), 0L, 255L));
   r.len = f.len;
   std::memcpy(r.payload, f.bytes, f.len);

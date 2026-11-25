@@ -331,7 +331,8 @@ jobs:
       - name: Run (ThreadSanitizer)
         run: |
           mkdir -p "$RUNNER_TEMP/tsan"
-          TSAN_OPTIONS="halt_on_error=0 log_path=$RUNNER_TEMP/tsan/report" scripts/check-ab.sh build/ab-tsan
+          # The instrumented demodulator is slower than real time: pace the IQ lines at 1/4.
+          AB_IQ_SPEED=0.25 TSAN_OPTIONS="halt_on_error=0 log_path=$RUNNER_TEMP/tsan/report" scripts/check-ab.sh build/ab-tsan
           if compgen -G "$RUNNER_TEMP/tsan/report*" > /dev/null; then
             cat "$RUNNER_TEMP"/tsan/report*
             echo "ThreadSanitizer reported a race" >&2

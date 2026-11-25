@@ -70,6 +70,13 @@ namespace {
                "  --reflector LAT,LON,ALT_M,LOSS_DB   fixed reflector (repeatable, up to 6)\n"
                "  --min-snr DB          skip messages below this SNR (default -15)\n"
                "  --tail S              noise-only seconds after the traffic (default 0)\n"
+               "Mode A/C (off by default; replies to simulated rotating SSR radars):\n"
+               "  --modeac-rate HZ      mean Mode A/C replies per airborne aircraft per second (0 = none)\n"
+               "  --modeac-radars N     radars (default 3; rotation 4.5-12 s, bursts while the beam passes)\n"
+               "  --modeac-beam DEG     beam width (default 3)\n"
+               "  --modeac-mode-c F     share of Mode C (altitude) interrogations (default 0.5; the rest Mode A)\n"
+               "  --modeac-efficiency F share of interrogations answered (default 0.9)\n"
+               "  --modeac-spi F        share of aircraft with ident (SPI) in their Mode A replies (default 0)\n"
                "output:\n"
                "  -o BASE | --data FILE|- | --meta FILE | --no-meta\n");
   std::exit(code);
@@ -192,6 +199,12 @@ int main(int argc, char** argv) {
       cfg.reflectors.push_back({v[0], v[1], v[2], v[3]});
     } else if (a == "--min-snr") cfg.min_snr_db = num(val(), a.c_str());
     else if (a == "--tail") cfg.tail_s = num(val(), a.c_str());
+    else if (a == "--modeac-rate") cfg.modeac_rate_hz = num(val(), a.c_str());
+    else if (a == "--modeac-radars") cfg.modeac_radars = static_cast<int>(integer(val(), a.c_str(), 1, 64));
+    else if (a == "--modeac-beam") cfg.modeac_beam_deg = num(val(), a.c_str());
+    else if (a == "--modeac-mode-c") cfg.modeac_mode_c_share = num(val(), a.c_str());
+    else if (a == "--modeac-efficiency") cfg.modeac_reply_efficiency = num(val(), a.c_str());
+    else if (a == "--modeac-spi") cfg.modeac_spi_share = num(val(), a.c_str());
     else {
       std::fprintf(stderr, "adsb-iqsynth: unknown option %s\n", a.c_str());
       usage(1);
@@ -302,6 +315,11 @@ int main(int argc, char** argv) {
                plan.stats.rendered ? 100.0 * static_cast<double>(plan.stats.collided) /
                                          static_cast<double>(plan.stats.rendered)
                                    : 0.0);
+  if (cfg.modeac_rate_hz > 0) {
+    std::fprintf(log, "  Mode A/C: %llu replies rendered (%llu below %.0f dB SNR), included above\n",
+                 static_cast<unsigned long long>(plan.stats.modeac_replies),
+                 static_cast<unsigned long long>(plan.stats.modeac_too_weak), cfg.min_snr_db);
+  }
   std::fprintf(log, "  SNR: <0 dB %llu, 0-10 %llu, 10-20 %llu, 20-30 %llu, >=30 %llu\n",
                static_cast<unsigned long long>(bins[0]), static_cast<unsigned long long>(bins[1]),
                static_cast<unsigned long long>(bins[2]), static_cast<unsigned long long>(bins[3]),

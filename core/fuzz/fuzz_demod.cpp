@@ -14,6 +14,11 @@
 //    an address that an earlier DF11/17/18 frame in the same stream showed;
 //  * frames come out in time order, inside the stream, with finite levels;
 //  * the output does not depend on the chunk size.
+// The same input is then demodulated with Mode A/C on:
+//  * its Mode S frames are exactly those above;
+//  * every Mode A/C frame has len 2, df 32 and a valid code word, lies
+//    inside the stream, in time order with the Mode S frames, with finite
+//    levels; and that output does not depend on the chunk size either.
 
 #include <cmath>
 #include <cstddef>
@@ -24,6 +29,7 @@
 
 #include "adsb/demod/demod.hpp"
 #include "adsb/modes/crc24.hpp"
+#include "adsb/modes/mode_ac.hpp"
 #include "fuzz_check.hpp"
 
 using namespace adsb::demod;
@@ -105,6 +111,40 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
       FUZZ_CHECK(std::memcmp(again[i].bytes, frames[i].bytes, 14) == 0);
       FUZZ_CHECK(again[i].sample_pos == frames[i].sample_pos);
       FUZZ_CHECK(again[i].noise == frames[i].noise || (std::isnan(again[i].noise) && std::isnan(frames[i].noise)));
+    }
+  }
+
+  DemodConfig ac = cfg;
+  ac.mode_ac = true;
+  const auto with_ac = run(data, n, f, ac, chunk);
+  std::size_t ms = 0;
+  last = -1e300;
+  for (const DemodFrame& fr : with_ac) {
+    FUZZ_CHECK(std::isfinite(fr.sample_pos) && fr.sample_pos >= 0.0 && fr.sample_pos < static_cast<double>(n));
+    FUZZ_CHECK(fr.sample_pos >= last);
+    last = fr.sample_pos;
+    if (fr.len == 2) {
+      FUZZ_CHECK(fr.df == 32);
+      const auto code = static_cast<std::uint16_t>(fr.bytes[0] << 8 | fr.bytes[1]);
+      FUZZ_CHECK((code & ~adsb::modes::kModeAcCodeMask) == 0);
+      FUZZ_CHECK(std::isfinite(fr.signal) && fr.signal > 0.0f && std::isfinite(fr.noise));
+      continue;
+    }
+    FUZZ_CHECK(ms < frames.size());
+    FUZZ_CHECK(std::memcmp(fr.bytes, frames[ms].bytes, 14) == 0);
+    FUZZ_CHECK(fr.sample_pos == frames[ms].sample_pos);
+    ++ms;
+  }
+  FUZZ_CHECK(ms == frames.size());
+  if (n <= 400000) {
+    DemodConfig big = ac;
+    big.block_samples = 1 << 16;
+    const auto again = run(data, n, f, big, big.block_samples);
+    FUZZ_CHECK(again.size() == with_ac.size());
+    for (std::size_t i = 0; i < with_ac.size(); ++i) {
+      FUZZ_CHECK(again[i].len == with_ac[i].len);
+      FUZZ_CHECK(std::memcmp(again[i].bytes, with_ac[i].bytes, 14) == 0);
+      FUZZ_CHECK(again[i].sample_pos == with_ac[i].sample_pos);
     }
   }
   return 0;

@@ -13,6 +13,7 @@
 #endif
 
 #include "adsb/modes/crc24.hpp"
+#include "adsb/modes/mode_ac.hpp"
 
 namespace adsb::demod {
 
@@ -156,6 +157,12 @@ bool validate(const DemodConfig& c, std::string* why) {
   if (!(c.first_arrival_match > 0.0 && c.first_arrival_match <= 1.0)) return fail("first_arrival_match must be in (0, 1]");
   if (!(c.duplicate_window_us >= 0.0 && c.duplicate_window_us <= 1e6)) return fail("duplicate_window_us must be in [0, 1e6]");
   if (c.block_samples < 1024 || c.block_samples > (std::size_t{1} << 26)) return fail("block_samples must be in [1024, 2^26]");
+  if (!(c.ac_min_signal_ratio >= 1.0 && c.ac_min_signal_ratio <= 1000.0)) return fail("ac_min_signal_ratio must be in [1, 1000]");
+  if (!(c.ac_framing_ratio >= 1.0 && c.ac_framing_ratio <= 100.0)) return fail("ac_framing_ratio must be in [1, 100]");
+  if (!(c.ac_decision_band >= 0.0 && c.ac_decision_band < 0.5)) return fail("ac_decision_band must be in [0, 0.5)");
+  if (!(c.ac_max_pulse > 1.0 && c.ac_max_pulse <= 100.0)) return fail("ac_max_pulse must be in (1, 100]");
+  if (!(c.ac_max_gap > 0.0 && c.ac_max_gap <= 1.0)) return fail("ac_max_gap must be in (0, 1]");
+  if (!(c.ac_max_residual >= 0.0 && c.ac_max_residual <= 1000.0)) return fail("ac_max_residual must be in [0, 1000]");
   return true;
 }
 
@@ -667,6 +674,7 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
   // history before the oldest of them.
   block_est_.assign(data_cap / kNoiseBlock + kNoiseHistory + 4, 0.0f);
   block_id_.assign(block_est_.size(), ~std::uint64_t{0});
+  if (cfg_.mode_ac) init_mode_ac();  // grows buf_ and out_ for what it keeps and finds
 }
 
 Demodulator::~Demodulator() = default;
@@ -1451,9 +1459,11 @@ void Demodulator::scan(bool final) {
     t = std::max(t, static_cast<std::ptrdiff_t>(std::floor(resume)) - 1);
   }
   if (t < im.back) t = im.back;
+  // Mode A/C over the same samples (merges its replies into out_).
+  const std::ptrdiff_t ac_keep = ac_ ? scan_mode_ac(final, end) : valid;
 
   // Keep the samples the next scan needs.
-  const std::ptrdiff_t keep_from = final ? valid : std::min(t - std::max(im.back, im.hist), valid);
+  const std::ptrdiff_t keep_from = final ? valid : std::min({t - std::max(im.back, im.hist), valid, ac_keep});
   next_ = base_ + static_cast<std::uint64_t>(std::max<std::ptrdiff_t>(t, 0));
   if (keep_from > 0) {
     const std::size_t keep = valid_ - static_cast<std::size_t>(keep_from);
@@ -1466,9 +1476,11 @@ void Demodulator::scan(bool final) {
 std::size_t to_beast(const DemodFrame& f, double sample_rate_hz, std::vector<std::uint8_t>& out) {
   const std::size_t before = out.size();
   out.push_back(0x1A);
-  out.push_back(f.len == 7 ? '2' : '3');
+  out.push_back(f.len == 2 ? '1' : f.len == 7 ? '2' : '3');
   std::uint8_t body[7 + 14];
-  const double ts_d = std::max(0.0, f.sample_pos) * 12e6 / sample_rate_hz;
+  // Mode A/C: the time of F2 (readsb, Beast).
+  const double at = f.len == 2 ? f.sample_pos + modes::kModeAcF2Us * sample_rate_hz / 1e6 : f.sample_pos;
+  const double ts_d = std::max(0.0, at) * 12e6 / sample_rate_hz;
   const auto ts = static_cast<std::uint64_t>(std::llround(ts_d)) & 0xFFFFFFFFFFFFull;
   for (int i = 0; i < 6; ++i) body[i] = static_cast<std::uint8_t>(ts >> (40 - 8 * i));
   body[6] = static_cast<std::uint8_t>(std::clamp(std::lround(f.signal * 255.0f), 0L, 255L));

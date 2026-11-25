@@ -7,7 +7,9 @@
 // files and stdin need --format and --rate). Frames go out as Beast binary
 // (12 MHz timestamps counted from the first sample, like readsb's ifile
 // input) and/or readsb-style raw text; statistics and throughput go to
-// stderr.
+// stderr. With --modeac, Mode A/C replies are demodulated too and written as
+// Beast type '1' frames (2-byte code word in readsb's layout, timestamp at
+// F2, as readsb --modeac writes them) and as "*XXXX;" raw lines.
 
 #include <chrono>
 #include <cmath>
@@ -49,6 +51,11 @@ void usage() {
                "  --first-arrival-match C  normalized correlation the direct path needs (default 0.85)\n"
                "  --duplicate-window US drop a copy of a frame emitted up to US earlier (an echo longer\n"
                "                        than the frame); 0 = off (default 200)\n"
+               "  --modeac              also demodulate Mode A/C replies (Beast type '1')\n"
+               "  --ac-min-signal R     Mode A/C framing pulse level / noise floor (default 3.0)\n"
+               "  --ac-band X           Mode A/C uncertain band around the slot decision point (default 0.13)\n"
+               "  --ac-max-gap X        Mode A/C gaps between slots must stay below X of the pulse level (default 0.2)\n"
+               "  --ac-max-residual E   Mode A/C template residual allowed beyond noise, pulse energies (default 0.3)\n"
                "  --quiet               no statistics on stderr\n");
 }
 
@@ -145,6 +152,11 @@ int main(int argc, char** argv) {
     else if (a == "--first-arrival") cfg.first_arrival_us = num();
     else if (a == "--first-arrival-match") cfg.first_arrival_match = num();
     else if (a == "--duplicate-window") cfg.duplicate_window_us = num();
+    else if (a == "--modeac") cfg.mode_ac = true;
+    else if (a == "--ac-min-signal") cfg.ac_min_signal_ratio = num();
+    else if (a == "--ac-band") cfg.ac_decision_band = num();
+    else if (a == "--ac-max-gap") cfg.ac_max_gap = num();
+    else if (a == "--ac-max-residual") cfg.ac_max_residual = num();
     else if (a == "--quiet") quiet = true;
     else { std::fprintf(stderr, "adsb-demod: unknown option %s\n", a.c_str()); usage(); return 2; }
   }
@@ -280,6 +292,13 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "\n  by format:");
     for (int df = 0; df < 32; ++df) {
       if (s.by_df[df]) std::fprintf(stderr, " DF%d %llu", df, static_cast<unsigned long long>(s.by_df[df]));
+    }
+    if (cfg.mode_ac) {
+      std::fprintf(stderr, "\n  Mode A/C: %llu replies (gated %llu positions, %llu under Mode S frames, %llu with a framing pair, "
+                   "%llu rejected as garbled)",
+                   static_cast<unsigned long long>(s.ac_frames), static_cast<unsigned long long>(s.ac_gated),
+                   static_cast<unsigned long long>(s.ac_in_mode_s), static_cast<unsigned long long>(s.ac_framing),
+                   static_cast<unsigned long long>(s.ac_garbled));
     }
     std::fprintf(stderr, "\n  noise floor %.5f of full scale (%.1f dBFS)", static_cast<double>(demod.noise_floor()),
                  demod.noise_floor() > 0 ? 20.0 * std::log10(static_cast<double>(demod.noise_floor())) : -999.0);

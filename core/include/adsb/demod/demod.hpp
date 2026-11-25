@@ -40,6 +40,12 @@
 //     resumes 16 us before the message's end, since the next reply may
 //     start under it.
 //
+// Mode A/C (optional, DemodConfig::mode_ac; mode_ac.cpp): framing pulse
+// pairs 20.3 us apart, then the 12 code pulses and SPI read against the
+// framing level; see detect_mode_ac in mode_ac.cpp for the checks.
+// Frames have len 2 (the code word of modes/mode_ac.hpp, readsb's
+// layout), df 32 and sample_pos at F1's leading edge.
+//
 // No allocation after construction; feed() takes at most `block_samples`
 // per call and returns the frames found so far (a frame near the end of the
 // samples is held back until the next call or flush()).
@@ -117,20 +123,44 @@ struct DemodConfig {
   // 0 = off.
   double duplicate_window_us = 200.0;
   std::size_t block_samples = 1 << 16;  // most samples per feed() call
+
+  // Mode A/C replies (off by default: then nothing below matters and the
+  // Mode S output is exactly that of a Mode S-only demodulator). With it on,
+  // Mode S frames are the same, but a frame can be returned one feed() call
+  // later (frames are returned in time order, and Mode A/C replies are
+  // decided once the Mode S frames around them are known).
+  bool mode_ac = false;
+  double ac_min_signal_ratio = 3.0;  // each framing pulse's level / noise floor (~9.5 dB)
+  double ac_framing_ratio = 2.0;     // the two framing pulses within this level ratio
+  // Pulse decisions, as a share x of the way from the noise floor to the
+  // level a pulse would have in that slot: a slot is a pulse above
+  // 0.5 + band, empty below 0.5 - band; in between (uncertain) or above
+  // ac_max_pulse (a stronger overlapping reply) rejects the reply as
+  // garbled, and so does a gap between slots above ac_max_gap of the
+  // framing level (another reply's pulse there).
+  double ac_decision_band = 0.13;
+  double ac_max_pulse = 1.6;
+  double ac_max_gap = 0.2;
+  // The whole reply's template must explain the samples to within the
+  // noise plus this many pulse energies (catches overlapping pulses that
+  // straddle a slot's edge, which split between the slot and the gap
+  // windows at 2.4 MS/s).
+  double ac_max_residual = 0.3;
 };
 
 [[nodiscard]] bool validate(const DemodConfig& cfg, std::string* why = nullptr);
 
 struct DemodFrame {
   std::uint8_t bytes[14] = {};
-  std::uint8_t len = 0;             // 7 or 14
-  std::uint8_t df = 0;
+  std::uint8_t len = 0;             // 7 or 14; 2 for a Mode A/C reply (bytes[0..1] = code word)
+  std::uint8_t df = 0;              // downlink format; 32 for Mode A/C
   std::uint32_t icao = 0;           // for Address/Parity formats: the matched address
   double sample_pos = 0.0;          // preamble start, samples since the stream start
   float signal = 0.0f;              // pulse amplitude (matched-filter estimate), relative to full scale
   float noise = 0.0f;               // noise floor (mean magnitude) at the time
   float snr_db = 0.0f;              // 20 log10(signal / noise)
   float margin = 0.0f;              // mean |first - second half| / signal over the bits
+                                    // (Mode A/C: the smallest distance of a slot from the decision point)
   std::int8_t corrected_bit = -1;   // bit index fixed by fix_single_bit, or -1
   // > 0: the decoded copy was an echo this long after the direct path;
   // sample_pos and signal are the direct path's (step 6).
@@ -150,6 +180,13 @@ struct DemodStats {
   std::uint64_t retimed = 0;        // frames moved to an earlier copy (first arrival, step 6)
   std::uint64_t duplicates = 0;     // copies of a recent frame, dropped (long echoes)
   std::uint64_t by_df[32] = {};     // frames emitted per downlink format
+  // Mode A/C (frames above counts Mode S only).
+  std::uint64_t ac_gated = 0;       // positions passing the Mode A/C gate
+  std::uint64_t ac_in_mode_s = 0;   // ... skipped: a decoded Mode S frame overlaps
+  std::uint64_t ac_framing = 0;     // ... with a framing pair (some phase)
+  std::uint64_t ac_garbled = 0;     // ... rejected: gaps, uncertain or too strong slots, X/empty slots, residual
+  std::uint64_t ac_residual = 0;    // ... of which by the template residual alone
+  std::uint64_t ac_frames = 0;      // Mode A/C replies emitted
 };
 
 class Demodulator {
@@ -187,6 +224,16 @@ class Demodulator {
   struct Impl;
   void append(std::size_t n);
   void scan(bool final);
+  // Mode A/C (mode_ac.cpp): set up in the constructor when enabled; the
+  // scan runs after the Mode S scan over the same samples and merges both
+  // into out_. Returns the first buffer index it still needs.
+  struct ModeAc;
+  struct ModeAcDelete {
+    void operator()(ModeAc* p) const noexcept;
+  };
+  void init_mode_ac();
+  std::ptrdiff_t scan_mode_ac(bool final, std::ptrdiff_t end);
+  std::unique_ptr<ModeAc, ModeAcDelete> ac_;
 
   DemodConfig cfg_;
   double spu_ = 2.4;
@@ -218,7 +265,9 @@ class Demodulator {
 
 // Beast binary frame (type '2' or '3') for a demodulated frame: 12 MHz
 // timestamp from the sample position, signal byte from the level. Appends to
-// `out`; returns the number of bytes added.
+// `out`; returns the number of bytes added. A Mode A/C reply is type '1'
+// with its 2-byte code word, timestamped at F2 (20.3 us after F1) as readsb
+// and the Beast/Radarcape do.
 std::size_t to_beast(const DemodFrame& f, double sample_rate_hz, std::vector<std::uint8_t>& out);
 
 }  // namespace adsb::demod

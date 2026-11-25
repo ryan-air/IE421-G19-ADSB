@@ -108,4 +108,36 @@ std::optional<std::uint16_t> encode_ac13(std::int32_t alt_ft) noexcept {
   return static_cast<std::uint16_t>(((*ac12 & 0x0FC0u) << 1) | (*ac12 & 0x003Fu));
 }
 
+std::optional<std::uint16_t> feet_to_gillham(std::int32_t alt_ft) noexcept {
+  // n = hundreds of feet above -1200 ft: n = 5 * five_hundreds + (h - 1),
+  // h the 100 ft sub-code 1..5 (reversed on odd 500 ft steps).
+  if (alt_ft < -1250 || alt_ft >= 126750) return std::nullopt;
+  const auto n = static_cast<unsigned>((alt_ft + 1250) / 100);  // floor((alt + 50) / 100) + 12
+  if (n > 1279) return std::nullopt;
+  const unsigned fh = n / 5;
+  const unsigned r = n % 5;
+  const unsigned h = (fh & 1u) ? 5u - r : r + 1u;  // what the decoder XORs out of C1 C2 C4
+  // C1 C2 C4 hold the 3-bit Gray code of h, with 5 sent as the code of 7.
+  const unsigned hv = h == 5 ? 7u : h;
+  const unsigned hg = hv ^ (hv >> 1);
+  // D2 D4 A1 A2 A4 B1 B2 B4 hold the 8-bit Gray code of fh, D2 first.
+  const unsigned g = fh ^ (fh >> 1);
+  std::uint16_t a = 0;
+  auto set = [&](bool on, std::uint16_t bit) {
+    if (on) a = static_cast<std::uint16_t>(a | bit);
+  };
+  set(hg & 4u, 0x0010);  // C1
+  set(hg & 2u, 0x0020);  // C2
+  set(hg & 1u, 0x0040);  // C4
+  set(g & 0x80u, 0x0002);  // D2
+  set(g & 0x40u, 0x0004);  // D4
+  set(g & 0x20u, 0x1000);  // A1
+  set(g & 0x10u, 0x2000);  // A2
+  set(g & 0x08u, 0x4000);  // A4
+  set(g & 0x04u, 0x0100);  // B1
+  set(g & 0x02u, 0x0200);  // B2
+  set(g & 0x01u, 0x0400);  // B4
+  return a;
+}
+
 }  // namespace adsb::modes

@@ -63,6 +63,7 @@ add_library(adsb_core STATIC
   src/sim/synth.cpp
   src/sim/iq.cpp
   src/demod/demod.cpp
+  src/demod/mode_ac.cpp
   src/demod/carrier.cpp
   src/ingest/iq_source.cpp
   src/ingest/rtl_device.cpp

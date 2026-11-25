@@ -669,7 +669,7 @@ MATLAB is still useful to us as an **independent oracle**: its receiver example 
 
 ### 22.4 IQ scenario generator (Workstream A)
 
-**Owner:** Role 1 (it extends the existing Must item "Synthetic IQ generator with ground truth"). Built by Ryan (`adsb-iqsynth`, `core/include/adsb/sim/iq.hpp`; status and results in `core/README.md`, *Synthetic IQ*). Everything in the tables below is modelled (ducting only as a larger k-factor); not yet checked against MATLAB's receiver; Mode A/C replies are not generated.
+**Owner:** Role 1 (it extends the existing Must item "Synthetic IQ generator with ground truth"). Built by Ryan (`adsb-iqsynth`, `core/include/adsb/sim/iq.hpp`; status and results in `core/README.md`, *Synthetic IQ*). Everything in the tables below is modelled (ducting only as a larger k-factor); not yet checked against MATLAB's receiver. Mode A/C replies are generated too (optional, from simulated rotating SSR radars) and demodulated by our demodulator (`core/README.md`, *Mode A/C replies*).
 
 **Scenario.** Reuse `adsb-synth`'s traffic and ground truth. Each aircraft has a position, altitude, velocity, transmit power class, and its own transmitter frequency model. The receiver has a location, an antenna pattern, and a model of its own impairments.
 
@@ -677,7 +677,7 @@ MATLAB is still useful to us as an **independent oracle**: its receiver example 
 
 | Effect | Model |
 |---|---|
-| Waveform | Mode S pulse-position modulation: 8 µs preamble, 56 or 112 bits of 1 µs, from the frames `adsb-synth` already encodes |
+| Waveform | Mode S pulse-position modulation: 8 µs preamble, 56 or 112 bits of 1 µs, from the frames `adsb-synth` already encodes; optionally Mode A/C replies (framing pulses 20.3 µs apart, 12 code pulses 1.45 µs apart, SPI) |
 | Geometry | Free-space path loss, propagation delay, elevation-dependent antenna gain |
 | **Doppler** | Shift from the radial velocity: up to about ±0.9 kHz at 250 m/s and ±1.1 kHz at 300 m/s, changing as an aircraft passes the receiver |
 | Transmitter frequency | Per-aircraft offset within the ±1 MHz tolerance, plus drift and jitter models (this feeds §22.5) |

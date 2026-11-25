@@ -302,7 +302,7 @@ jobs:
   ab:
     name: A/B line arbitration (replay, two Beast lines, two IQ receivers; README_UPDATES.md §6)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
@@ -319,6 +319,24 @@ jobs:
       # arbiter matches exactly the frames both demodulators decoded.
       - name: Run
         run: scripts/check-ab.sh build/ab
+      # The same checks with every tool under GCC's ThreadSanitizer: adsb-live
+      # runs one ingest thread per line plus the merging state thread, the
+      # recorder and the publisher. Unit tests do not start those threads, and
+      # GCC's TSan has caught races Clang's missed. Any report fails the step,
+      # even when the tool's exit status is not checked by the script.
+      - name: Build (ThreadSanitizer)
+        run: |
+          CXX=g++-14 cmake -S . -B build/ab-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DADSB_SANITIZE=thread -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          cmake --build build/ab-tsan
+      - name: Run (ThreadSanitizer)
+        run: |
+          mkdir -p "$RUNNER_TEMP/tsan"
+          TSAN_OPTIONS="halt_on_error=0 log_path=$RUNNER_TEMP/tsan/report" scripts/check-ab.sh build/ab-tsan
+          if compgen -G "$RUNNER_TEMP/tsan/report*" > /dev/null; then
+            cat "$RUNNER_TEMP"/tsan/report*
+            echo "ThreadSanitizer reported a race" >&2
+            exit 1
+          fi
 
   conflate:
     name: conflated feed (both tools -> conflated + main feeds -> subscribers)

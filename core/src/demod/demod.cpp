@@ -307,6 +307,21 @@ struct Demodulator::Impl {
   // so frame times stay in order.
   double last_pos = -1.0;
   std::size_t templ_limit = 0;  // ... of which a trial may use this many (the rest: room for zero adds past the end)
+  // Step-5 geometry, when it fits in kTrialTableBytes. The trials are
+  // rel0 + j * step for a phase's rel0 and |j| <= kClimbSteps + 1, so the
+  // overlaps evaluate() adds up are computed here, by the same expressions,
+  // and stored per sample: for (phase, trial), sample trial_klo + i gets
+  // the chips trial_chip[i * trial_m + n] (in increasing order, padded with
+  // kMaxChips, whose sign is 0) with overlaps trial_ov[i * trial_m + n].
+  static constexpr int kTrials = 2 * (kClimbSteps + 1) + 1;
+  static constexpr std::size_t kTrialTableBytes = std::size_t{8} << 20;
+  static constexpr std::size_t kTrialM = 4;  // entries per sample
+  int chip_span = 0;
+  bool trial_table = false;
+  std::size_t trial_n = 0;        // samples per trial
+  std::vector<std::int32_t> trial_klo;     // [phase * kTrials + trial]
+  std::vector<std::uint16_t> trial_chip;   // [((phase * kTrials + trial) * trial_n + i) * kTrialM + n]
+  std::vector<double> trial_ov;            // same layout
 
   // Sequence detector (see detect_sequence). For every phase, the samples
   // of a message in order: each overlaps chip c_lo by ov_lo and chip
@@ -687,6 +702,58 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
   im.ttl = static_cast<std::uint64_t>(cfg_.address_ttl_s * cfg_.sample_rate_hz);
   im.templ_limit = static_cast<std::size_t>(im.need + im.back) + 16;
   im.templ.assign(im.templ_limit + static_cast<std::size_t>(spu_ / 2) + 4, 0.0);
+  {
+    const double h = spu_ / 2;
+    const double step = kClimbStepUs * spu_;
+    im.chip_span = static_cast<int>(std::floor(h)) + 2;
+    // Samples per trial: k_lo .. k_hi of the longest frame, whatever rel.
+    im.trial_n = static_cast<std::size_t>(std::ceil(kMaxChips * h)) + 4;
+    // Chips with a positive overlap per sample: a sample is one long and a
+    // chip at least 0.95, so at most 3 (kTrialM leaves one for rounding; a
+    // sample with more would turn the table off).
+    constexpr std::size_t tm = Impl::kTrialM;
+    const std::size_t trials = static_cast<std::size_t>(im.phases) * Impl::kTrials;
+    im.trial_table = trials * im.trial_n * tm * (sizeof(double) + sizeof(std::uint16_t)) <= Impl::kTrialTableBytes;
+    if (im.trial_table) {
+      im.trial_klo.assign(trials, 0);
+      im.trial_chip.assign(trials * im.trial_n * tm, static_cast<std::uint16_t>(kMaxChips));
+      im.trial_ov.assign(trials * im.trial_n * tm, 0.0);
+      std::vector<std::size_t> used(im.trial_n, 0);
+      for (int p = 0; p < im.phases && im.trial_table; ++p) {
+        const double rel0 = static_cast<double>(p) / im.phases;
+        for (int tj = 0; tj < Impl::kTrials && im.trial_table; ++tj) {
+          const std::size_t tr = static_cast<std::size_t>(p * Impl::kTrials + tj);
+          // The expressions of evaluate(): rel, k_lo, and per chip k0, a, bnd, ov.
+          const double rel = rel0 + (tj - (kClimbSteps + 1)) * step;
+          const auto k_lo = static_cast<std::ptrdiff_t>(std::floor(rel + 0.5)) - 1;
+          im.trial_klo[tr] = static_cast<std::int32_t>(k_lo);
+          std::fill(used.begin(), used.end(), 0);
+          for (int c = 0; c < kMaxChips && im.trial_table; ++c) {
+            const double a = rel + c * h, bnd = a + h;
+            const auto k0 = static_cast<std::ptrdiff_t>(std::floor(a + 0.5));
+            for (int j = 0; j < im.chip_span; ++j) {
+              const std::ptrdiff_t k = k0 + j;
+              const double ov = std::min(bnd, static_cast<double>(k) + 0.5) - std::max(a, static_cast<double>(k) - 0.5);
+              if (!(ov > 0)) continue;
+              const std::ptrdiff_t i = k - k_lo;
+              if (i < 0 || static_cast<std::size_t>(i) >= im.trial_n || used[static_cast<std::size_t>(i)] == tm) {
+                im.trial_table = false;  // not expected; evaluate() computes the geometry itself then
+                break;
+              }
+              const std::size_t at = (tr * im.trial_n + static_cast<std::size_t>(i)) * tm + used[static_cast<std::size_t>(i)]++;
+              im.trial_chip[at] = static_cast<std::uint16_t>(c);
+              im.trial_ov[at] = ov;
+            }
+          }
+        }
+      }
+      if (!im.trial_table) {
+        im.trial_klo.clear();
+        im.trial_chip.clear();
+        im.trial_ov.clear();
+      }
+    }
+  }
 
   // Everything is allocated here: room for a block, the held-back samples,
   // the up to 1023 samples that wait for the first noise block, and the
@@ -1187,6 +1254,9 @@ void Demodulator::scan(bool final) {
       sign[kPreambleChips + 2 * i] = one ? 1 : -1;
       sign[kPreambleChips + 2 * i + 1] = one ? -1 : 1;
     }
+    double sgd[kMaxChips + 1];  // the signs as doubles; [kMaxChips] (padding) 0
+    for (int c = 0; c < kMaxChips; ++c) sgd[c] = sign[c];
+    sgd[kMaxChips] = 0.0;
     // 0.04 us steps (0.096 samples at 2.4 MS/s) up to +-0.5 us: at high
     // rates the first passing phase can be more than a sample early.
     const double kStep = kClimbStepUs * spu_;
@@ -1194,9 +1264,11 @@ void Demodulator::scan(bool final) {
     const std::ptrdiff_t off = im.back;  // e[k + off] holds sample k (k >= -back)
     const double h = spu_ / 2;
     std::vector<double>& e = im.templ;
-    const int chip_span = static_cast<int>(std::floor(h)) + 2;
+    const int chip_span = im.chip_span;
     // Score <m, e> / |e| and amplitude 2 <m, e> / |e|^2 (m ~ A/2 e + const).
-    auto evaluate = [&](double rel, double& amp) {
+    // Trial j (|j| <= kMaxSteps + 1) starts at rel0 + j * kStep.
+    auto evaluate = [&](int j_trial, double& amp) {
+      const double rel = rel0 + j_trial * kStep;
       // Samples k (relative to t) cover [k - 0.5, k + 0.5); stored at e[k + off].
       const auto k_lo = static_cast<std::ptrdiff_t>(std::floor(rel + 0.5)) - 1;
       const auto k_hi = static_cast<std::ptrdiff_t>(std::floor(rel + nchips * h + 0.5)) + 1;
@@ -1206,6 +1278,28 @@ void Demodulator::scan(bool final) {
           static_cast<std::size_t>(k_hi + off + 1) > im.templ_limit || t + k_hi >= static_cast<std::ptrdiff_t>(valid_) + static_cast<std::ptrdiff_t>(final ? im.need + 8 : 0)) {
         amp = 0.0;
         return -std::numeric_limits<double>::infinity();
+      }
+      const std::size_t tr = static_cast<std::size_t>(best.phase * Impl::kTrials + j_trial + kMaxSteps + 1);
+      // (The table's k_lo is this one, by the same expression.)
+      if (im.trial_table && k_lo == im.trial_klo[tr] && static_cast<std::size_t>(k_hi - k_lo) < im.trial_n) {
+        // From the precomputed overlaps: a sample's chips in increasing
+        // order, as the chip-by-chip loop below adds them (sg * ov where ov >
+        // 0; chips it skips, of sign 0, and the padding add sg * ov = +0.0,
+        // which does nothing: a sample is never -0.0), then the same dot and
+        // norm sums in sample order.
+        constexpr std::size_t tm = Impl::kTrialM;
+        const std::size_t at = tr * im.trial_n * tm;
+        const std::uint16_t* tc = im.trial_chip.data() + at;
+        const double* tov = im.trial_ov.data() + at;
+        double dot = 0.0, norm = 0.0;
+        for (std::ptrdiff_t k = k_lo; k <= k_hi; ++k, tc += tm, tov += tm) {
+          double v = 0.0;
+          for (std::size_t n = 0; n < tm; ++n) v += sgd[tc[n]] * tov[n];
+          dot += static_cast<double>(mt[k]) * v;
+          norm += v * v;
+        }
+        amp = norm > 0 ? 2.0 * dot / norm : 0.0;
+        return norm > 0 ? dot / std::sqrt(norm) : 0.0;
       }
       std::fill(e.begin() + (k_lo + off), e.begin() + (k_hi + off + 1), 0.0);
       // Every chip covers at most floor(h) + 2 samples: a fixed number of
@@ -1241,9 +1335,9 @@ void Demodulator::scan(bool final) {
     // (score and amplitude) and evaluates only the new one beyond it.
     double amp_c = 0.0, amp_m = 0.0, amp_p = 0.0;
     int jc = 0;
-    double yc = evaluate(rel0, amp_c);
-    double ym = evaluate(rel0 - kStep, amp_m);
-    double yp = evaluate(rel0 + kStep, amp_p);
+    double yc = evaluate(0, amp_c);
+    double ym = evaluate(-1, amp_m);
+    double yp = evaluate(1, amp_p);
     const int dir = yp > yc ? 1 : (ym > yc ? -1 : 0);
     while (dir != 0 && std::abs(jc) < kMaxSteps) {
       const double ahead = dir > 0 ? yp : ym;
@@ -1254,13 +1348,13 @@ void Demodulator::scan(bool final) {
         amp_m = amp_c;
         yc = yp;
         amp_c = amp_p;
-        yp = evaluate(rel0 + (jc + 1) * kStep, amp_p);
+        yp = evaluate(jc + 1, amp_p);
       } else {
         yp = yc;
         amp_p = amp_c;
         yc = ym;
         amp_c = amp_m;
-        ym = evaluate(rel0 + (jc - 1) * kStep, amp_m);
+        ym = evaluate(jc - 1, amp_m);
       }
     }
     double rel_best = rel0 + jc * kStep;

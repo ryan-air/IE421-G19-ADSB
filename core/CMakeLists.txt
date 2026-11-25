@@ -65,6 +65,7 @@ add_library(adsb_core STATIC
   src/demod/demod.cpp
   src/demod/carrier.cpp
   src/ingest/iq_source.cpp
+  src/ingest/rtl_device.cpp
 )
 add_library(adsb::core ALIAS adsb_core)
 target_include_directories(adsb_core PUBLIC
@@ -124,6 +125,30 @@ if(ADSB_AF_XDP STREQUAL "ON" AND NOT ADSB_HAVE_AF_XDP)
 endif()
 target_compile_definitions(adsb_core PUBLIC ADSB_HAVE_AF_XDP=${ADSB_HAVE_AF_XDP})
 message(STATUS "adsb: AF_XDP transport ${ADSB_HAVE_AF_XDP} (ADSB_AF_XDP=${ADSB_AF_XDP})")
+
+# Live RTL-SDR input (§5.1): librtlsdr via pkg-config. AUTO builds it when
+# librtlsdr is found; ON makes a missing librtlsdr an error; OFF (or not
+# found) leaves make_librtlsdr_device() returning nullptr, and
+# `adsb-live --iq rtlsdr` then says it was built without librtlsdr.
+set(ADSB_RTLSDR AUTO CACHE STRING "librtlsdr IQ source: AUTO, ON, OFF")
+set(ADSB_HAVE_RTLSDR 0)
+if(NOT ADSB_RTLSDR STREQUAL "OFF")
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LIBRTLSDR QUIET IMPORTED_TARGET librtlsdr)
+  endif()
+  if(LIBRTLSDR_FOUND)
+    set(ADSB_HAVE_RTLSDR 1)
+    target_sources(adsb_core PRIVATE src/ingest/rtl_librtlsdr.cpp)
+    target_link_libraries(adsb_core PRIVATE PkgConfig::LIBRTLSDR)
+  endif()
+endif()
+if(ADSB_RTLSDR STREQUAL "ON" AND NOT ADSB_HAVE_RTLSDR)
+  message(FATAL_ERROR "ADSB_RTLSDR=ON but librtlsdr was not found (apt install librtlsdr-dev pkg-config)")
+endif()
+target_compile_definitions(adsb_core PUBLIC ADSB_HAVE_RTLSDR=${ADSB_HAVE_RTLSDR})
+message(STATUS "adsb: librtlsdr IQ source ${ADSB_HAVE_RTLSDR} (ADSB_RTLSDR=${ADSB_RTLSDR})")
+
 if(ADSB_NAIVE)
   target_compile_definitions(adsb_core PUBLIC ADSB_NAIVE=1)
   message(STATUS "adsb: NAIVE baseline build (mutex queues, std::unordered_map)")

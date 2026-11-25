@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <utility>
 #include <unordered_map>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -814,7 +815,106 @@ std::span<const DemodFrame> Demodulator::flush() {
 namespace {
 constexpr float kNoiseQuarterScale = 1.0f / 0.8338f;
 
+// Lane-wise minimum and maximum. Exact for the values they see here (no NaN
+// and no -0.0: a window mean is a sum that starts at +0.0, divided by 16),
+// so they give the same values a comparison and a select would.
+inline f4 min4(f4 a, f4 b) noexcept {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  return std::bit_cast<f4>(vminq_f32(std::bit_cast<float32x4_t>(a), std::bit_cast<float32x4_t>(b)));
+#elif defined(__SSE2__)
+  return std::bit_cast<f4>(_mm_min_ps(std::bit_cast<__m128>(a), std::bit_cast<__m128>(b)));
+#else
+  return f4{std::min(a[0], b[0]), std::min(a[1], b[1]), std::min(a[2], b[2]), std::min(a[3], b[3])};
+#endif
+}
+inline f4 max4(f4 a, f4 b) noexcept {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  return std::bit_cast<f4>(vmaxq_f32(std::bit_cast<float32x4_t>(a), std::bit_cast<float32x4_t>(b)));
+#elif defined(__SSE2__)
+  return std::bit_cast<f4>(_mm_max_ps(std::bit_cast<__m128>(a), std::bit_cast<__m128>(b)));
+#else
+  return f4{std::max(a[0], b[0]), std::max(a[1], b[1]), std::max(a[2], b[2]), std::max(a[3], b[3])};
+#endif
+}
+
+// Batcher's odd-even merge sort of 16 inputs (63 comparators).
+struct Cmp {
+  std::uint8_t lo, hi;
+};
+constexpr Cmp kSort16[63] = {
+    {0, 1}, {2, 3}, {0, 2}, {1, 3}, {1, 2}, {4, 5}, {6, 7}, {4, 6}, {5, 7}, {5, 6}, {0, 4}, {2, 6}, {2, 4},
+    {1, 5}, {3, 7}, {3, 5}, {1, 2}, {3, 4}, {5, 6}, {8, 9}, {10, 11}, {8, 10}, {9, 11}, {9, 10}, {12, 13}, {14, 15},
+    {12, 14}, {13, 15}, {13, 14}, {8, 12}, {10, 14}, {10, 12}, {9, 13}, {11, 15}, {11, 13}, {9, 10}, {11, 12}, {13, 14},
+    {0, 8}, {4, 12}, {4, 8}, {2, 10}, {6, 14}, {6, 10}, {2, 4}, {6, 8}, {10, 12}, {1, 9}, {5, 13}, {5, 9}, {3, 11},
+    {7, 15}, {7, 11}, {3, 5}, {7, 9}, {11, 13}, {1, 2}, {3, 4}, {5, 6}, {7, 8}, {9, 10}, {11, 12}, {13, 14}};
+
+// 16 ascending values in four vectors, the 16 smallest of a and b (both
+// ascending): the minimum of a and b reversed is a bitonic sequence holding
+// them, which a bitonic merger sorts.
+inline void lowest16(const f4* a, const f4* b, f4* out) noexcept {
+  for (int k = 0; k < 4; ++k) out[k] = min4(a[k], __builtin_shufflevector(b[3 - k], b[3 - k], 3, 2, 1, 0));
+  for (int k = 0; k < 2; ++k) {  // distance 8
+    const f4 lo = min4(out[k], out[k + 2]), hi = max4(out[k], out[k + 2]);
+    out[k] = lo;
+    out[k + 2] = hi;
+  }
+  for (int k = 0; k < 4; k += 2) {  // distance 4
+    const f4 lo = min4(out[k], out[k + 1]), hi = max4(out[k], out[k + 1]);
+    out[k] = lo;
+    out[k + 1] = hi;
+  }
+  for (int k = 0; k < 4; ++k) {  // distance 2, then 1, inside each vector
+    f4 v = out[k];
+    f4 w = __builtin_shufflevector(v, v, 2, 3, 0, 1);
+    v = __builtin_shufflevector(min4(v, w), max4(v, w), 0, 1, 6, 7);
+    w = __builtin_shufflevector(v, v, 1, 0, 3, 2);
+    out[k] = __builtin_shufflevector(min4(v, w), max4(v, w), 0, 5, 2, 7);
+  }
+}
+
+// The 16 smallest of 64 values, ascending: each lane of the 16 vectors
+// sorted by the network (four columns of 16), the columns transposed into
+// rows, then merged two by two keeping the lowest 16.
+inline void lowest16_of_64(const float* x, float* out) noexcept {
+  f4 v[16];
+  for (int i = 0; i < 16; ++i) v[i] = load4(x + 4 * i);
+  [&]<std::size_t... I>(std::index_sequence<I...>) {
+    ((void)([&] {
+       constexpr Cmp c = kSort16[I];
+       const f4 lo = min4(v[c.lo], v[c.hi]), hi = max4(v[c.lo], v[c.hi]);
+       v[c.lo] = lo;
+       v[c.hi] = hi;
+     }()),
+     ...);
+  }(std::make_index_sequence<63>{});
+  f4 col[4][4];  // col[lane][k]: that column's sorted values 4k .. 4k + 3
+  for (int k = 0; k < 4; ++k) {
+    const f4 t0 = __builtin_shufflevector(v[4 * k], v[4 * k + 1], 0, 4, 1, 5);
+    const f4 t1 = __builtin_shufflevector(v[4 * k], v[4 * k + 1], 2, 6, 3, 7);
+    const f4 t2 = __builtin_shufflevector(v[4 * k + 2], v[4 * k + 3], 0, 4, 1, 5);
+    const f4 t3 = __builtin_shufflevector(v[4 * k + 2], v[4 * k + 3], 2, 6, 3, 7);
+    col[0][k] = __builtin_shufflevector(t0, t2, 0, 1, 4, 5);
+    col[1][k] = __builtin_shufflevector(t0, t2, 2, 3, 6, 7);
+    col[2][k] = __builtin_shufflevector(t1, t3, 0, 1, 4, 5);
+    col[3][k] = __builtin_shufflevector(t1, t3, 2, 3, 6, 7);
+  }
+  f4 m01[4], m23[4], m[4];
+  lowest16(col[0], col[1], m01);
+  lowest16(col[2], col[3], m23);
+  lowest16(m01, m23, m);
+  for (int k = 0; k < 4; ++k) store4(out + 4 * k, m[k]);
+}
+
 float lowest_quarter_mean(const float* win, std::size_t n) {
+  if (n == 64) {
+    // The common case (a whole block) without branches: the same 16 values
+    // in the same order, so the same sum.
+    alignas(16) float low[16];
+    lowest16_of_64(win, low);
+    float sum = 0.0f;
+    for (float x : low) sum += x;
+    return sum / 16.0f * kNoiseQuarterScale;
+  }
   // The q smallest, ascending, by insertion into a sorted run of q (a value
   // not below the run's largest is skipped). Equal values are the same
   // float, so the sum below adds the same values in the same order as any

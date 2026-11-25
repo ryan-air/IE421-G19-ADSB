@@ -10,7 +10,8 @@ export const S3 = 'SESSION003';
 
 // A TrackUpdate (72 bytes) with the given fields; the rest are zero or null.
 export function trackUpdate({ icao, alt = 0, eventTs = 0, publishTs = 0, lat = null, lon = null, mask = 0, callsign = '',
-  flags = 0, nic = 0, version = 0xff, heading = 0xffff, airspeed = 0xffff, nacp = 0, sil = 0, nucp = 0 }) {
+  flags = 0, nic = 0, version = 0xff, heading = 0xffff, airspeed = 0xffff, nacp = 0, sil = 0, nucp = 0,
+  gsDkt = 0xffff, trackCdeg = 0xffff, vrateFpm = -32768 }) {
   const b = Buffer.alloc(72);
   b[0] = 0x55;
   b.writeUInt16LE(mask, 2);
@@ -19,9 +20,9 @@ export function trackUpdate({ icao, alt = 0, eventTs = 0, publishTs = 0, lat = n
   b.writeInt32LE(lat === null ? -2147483648 : Math.round(lat * 1e7), 24);
   b.writeInt32LE(lon === null ? -2147483648 : Math.round(lon * 1e7), 28);
   b.writeInt32LE(alt, 32);
-  b.writeUInt16LE(0xffff, 36);
-  b.writeUInt16LE(0xffff, 38);
-  b.writeInt16LE(-32768, 40);
+  b.writeUInt16LE(gsDkt, 36);
+  b.writeUInt16LE(trackCdeg, 38);
+  b.writeInt16LE(vrateFpm, 40);
   b.writeUInt16LE(0xffff, 42);
   b.write(callsign.padEnd(8, ' '), 44, 8, 'latin1');
   b[53] = nic;

@@ -293,7 +293,7 @@ Not started. Planned (README_UPDATES.md §14): a full-day ITCH file through our 
 | Map, 150 aircraft | markers 0 m from the latest position, one render 8 ms | Laptop | gateway/README.md |
 | Render to pixels, frame rate | `TODO (benchmark host)`: not measured | | |
 
-**Limitations.** No TLS or authentication; no collision model or Postgres history in the gateway; tiles need internet access.
+**Limitations.** No TLS or authentication; no Postgres history in the gateway (cones and collisions use its 200-point trails); tiles need internet access.
 
 ## 7. Measurement
 

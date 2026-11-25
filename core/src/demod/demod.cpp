@@ -1354,6 +1354,20 @@ void Demodulator::scan(bool final) {
           bytes[i / 8] = static_cast<std::uint8_t>(bytes[i / 8] | (a > b ? 0x80u >> (i % 8) : 0u));
         }
       };
+      // Whole bytes [from, to) the same way, eight bits at a time: the first
+      // and second halves of four bits are deinterleaved into two vectors
+      // and compared lane by lane (the same a > b).
+      auto read_bytes = [&](int from, int to) {
+        const i4 hi_bits{0x80, 0x40, 0x20, 0x10}, lo_bits{0x08, 0x04, 0x02, 0x01};
+        for (int k = from; k < to; ++k) {
+          const float* c = cv + kPreambleChips + 16 * k;
+          const f4 v0 = load4(c), v1 = load4(c + 4), v2 = load4(c + 8), v3 = load4(c + 12);
+          const i4 h = (__builtin_shufflevector(v0, v1, 0, 2, 4, 6) > __builtin_shufflevector(v0, v1, 1, 3, 5, 7)) & hi_bits;
+          const i4 l = (__builtin_shufflevector(v2, v3, 0, 2, 4, 6) > __builtin_shufflevector(v2, v3, 1, 3, 5, 7)) & lo_bits;
+          const i4 b = h | l;
+          bytes[k] = static_cast<std::uint8_t>(bytes[k] | static_cast<unsigned>((b[0] | b[1]) | (b[2] | b[3])));
+        }
+      };
       // At the end of the stream the message must end inside the data.
       auto fits = [&](int nbits) {
         return !final || static_cast<double>(t) + 2.0 + (kPreambleChips + 2 * nbits) * spu_ / 2 <= static_cast<double>(valid);
@@ -1403,7 +1417,8 @@ void Demodulator::scan(bool final) {
       int score = 0;
       if (supported_df(df) && fits(bits)) {
         im.chips_into(m, t, p, kPreambleChips + 12, kPreambleChips + 2 * bits, cv);
-        read_bits(5, bits);
+        read_bits(5, 8);
+        read_bytes(1, bits / 8);
         score = check(bytes, bits);
       }
       // Remember the most promising phase that failed, for step 3b.

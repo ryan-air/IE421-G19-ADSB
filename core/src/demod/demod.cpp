@@ -322,15 +322,18 @@ struct Demodulator::Impl {
   // overlaps evaluate() adds up are computed here, by the same expressions,
   // and stored per sample: for (phase, trial), sample trial_klo + i gets
   // the chips trial_chip[i * trial_m + n] (in increasing order, padded with
-  // kMaxChips, whose sign is 0) with overlaps trial_ov[i * trial_m + n].
+  // kMaxChips, whose sign is 0) with overlaps trial_ov[i * trial_m + n];
+  // trial_m is the most any sample has (2 when a chip is longer than a
+  // sample).
   static constexpr int kTrials = 2 * (kClimbSteps + 1) + 1;
   static constexpr std::size_t kTrialTableBytes = std::size_t{8} << 20;
-  static constexpr std::size_t kTrialM = 4;  // entries per sample
+  static constexpr std::size_t kTrialM = 4;  // entries per sample, at most
+  std::size_t trial_m = kTrialM;
   int chip_span = 0;
   bool trial_table = false;
   std::size_t trial_n = 0;        // samples per trial
   std::vector<std::int32_t> trial_klo;     // [phase * kTrials + trial]
-  std::vector<std::uint16_t> trial_chip;   // [((phase * kTrials + trial) * trial_n + i) * kTrialM + n]
+  std::vector<std::uint16_t> trial_chip;   // [((phase * kTrials + trial) * trial_n + i) * trial_m + n]
   std::vector<double> trial_ov;            // same layout
 
   // Sequence detector (see detect_sequence). For every phase, the samples
@@ -794,6 +797,24 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
         im.trial_klo.clear();
         im.trial_chip.clear();
         im.trial_ov.clear();
+      } else {
+        // Keep only as many entries per sample as any sample uses.
+        std::size_t m = 1;
+        for (std::size_t i = 0; i < im.trial_chip.size(); ++i) {
+          if (im.trial_chip[i] != kMaxChips) m = std::max(m, i % tm + 1);
+        }
+        if (m < tm) {
+          const std::size_t samples = im.trial_chip.size() / tm;
+          for (std::size_t i = 0; i < samples; ++i) {
+            for (std::size_t n = 0; n < m; ++n) {
+              im.trial_chip[i * m + n] = im.trial_chip[i * tm + n];
+              im.trial_ov[i * m + n] = im.trial_ov[i * tm + n];
+            }
+          }
+          im.trial_chip.resize(samples * m);
+          im.trial_ov.resize(samples * m);
+        }
+        im.trial_m = m;
       }
     }
   }
@@ -1429,16 +1450,26 @@ void Demodulator::scan(bool final) {
         // 0; chips it skips, of sign 0, and the padding add sg * ov = +0.0,
         // which does nothing: a sample is never -0.0), then the same dot and
         // norm sums in sample order.
-        constexpr std::size_t tm = Impl::kTrialM;
-        const std::size_t at = tr * im.trial_n * tm;
-        const std::uint16_t* tc = im.trial_chip.data() + at;
-        const double* tov = im.trial_ov.data() + at;
         double dot = 0.0, norm = 0.0;
-        for (std::ptrdiff_t k = k_lo; k <= k_hi; ++k, tc += tm, tov += tm) {
-          double v = 0.0;
-          for (std::size_t n = 0; n < tm; ++n) v += sgd[tc[n]] * tov[n];
-          dot += static_cast<double>(mt[k]) * v;
-          norm += v * v;
+        auto sums = [&]<std::size_t kM>() {
+          const std::size_t at = tr * im.trial_n * kM;
+          const std::uint16_t* tc = im.trial_chip.data() + at;
+          const double* tov = im.trial_ov.data() + at;
+          double d = 0.0, q = 0.0;
+          for (std::ptrdiff_t k = k_lo; k <= k_hi; ++k, tc += kM, tov += kM) {
+            double v = 0.0;
+            for (std::size_t n = 0; n < kM; ++n) v += sgd[tc[n]] * tov[n];
+            d += static_cast<double>(mt[k]) * v;
+            q += v * v;
+          }
+          dot = d;
+          norm = q;
+        };
+        switch (im.trial_m) {
+          case 1: sums.template operator()<1>(); break;
+          case 2: sums.template operator()<2>(); break;
+          case 3: sums.template operator()<3>(); break;
+          default: sums.template operator()<4>(); break;
         }
         amp = norm > 0 ? 2.0 * dot / norm : 0.0;
         return norm > 0 ? dot / std::sqrt(norm) : 0.0;

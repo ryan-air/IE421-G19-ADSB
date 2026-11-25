@@ -169,9 +169,9 @@ what had already been applied. TLC reported `Invariant NoDoubleApply is violated
 states: receive 1..2, NAK, snapshot. This shows that the safety invariants also have
 teeth.
 
-## GitHub Actions job (ready to paste)
+## GitHub Actions job (now the `tlc` job in `.github/workflows/core.yml`)
 
-Add this under `jobs:` in a workflow. This folder does not edit any workflow file.
+The job below is what CI runs (job `tlc` in `.github/workflows/core.yml`).
 
 ```yaml
   tlc-feed-recovery:

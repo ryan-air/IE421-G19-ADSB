@@ -23,7 +23,9 @@
 #   (ticks run on recording time).
 #
 # Environment: FEED_GROUP (default 239.19.0.9), FEED_IFACE (default
-# 127.0.0.1), FEED_PORT (base port, default 45900). KEEP=1 keeps the work dir.
+# 127.0.0.1), FEED_PORT (base port, default 29900: below the ephemeral port
+# ranges of Linux (32768-60999) and macOS (49152-65535), so no client socket
+# opened meanwhile can hold one of the feed ports). KEEP=1 keeps the work dir.
 
 set -uo pipefail
 BUILD="${1:?usage: check-conflate.sh BUILD_DIR}"
@@ -34,7 +36,7 @@ done
 GROUP="${FEED_GROUP:-239.19.0.9}"
 CGROUP="${GROUP%.*}.$(( ${GROUP##*.} + 1 ))"
 IFACE="${FEED_IFACE:-127.0.0.1}"
-PORT="${FEED_PORT:-45900}"
+PORT="${FEED_PORT:-29900}"
 W="$(mktemp -d)"
 trap 'kill $(jobs -p) 2>/dev/null; [[ -n "${KEEP:-}" ]] && echo "kept $W" || rm -rf "$W"' EXIT
 FAIL=0
@@ -96,13 +98,20 @@ sleep 0.5
     --conflate "$CGROUP:$((PORT + 10))" --conflate-retransmit-port $((PORT + 11)) \
     --conflate-snapshot-port $((PORT + 12)) > "$W/L.txt" 2>&1 &
 PL=$!
+# adsb-beast-serve ends when its client has read the recording: if adsb-live
+# exits first (it failed to start), stop the server instead of waiting on it.
+while kill -0 $PS 2>/dev/null; do
+  if ! kill -0 $PL 2>/dev/null; then echo "adsb-live exited early"; kill $PS 2>/dev/null; break; fi
+  sleep 0.2
+done
 wait $PS
 sleep 0.5
-kill -INT $PL; wait $PL; RL=$?
+kill -INT $PL 2>/dev/null; wait $PL; RL=$?
 wait $PLM; RLM=$?
 wait $PLC; RLC=$?
 DL=$(state "$W/L.txt" 'state digest')
 check "adsb-live ran ($RL)"                                   '[[ $RL == 0 && -n "$DL" ]]'
+[[ $RL == 0 && -n "$DL" ]] || { echo "adsb-live output:"; cat "$W/L.txt"; }
 check "its conflated book matches its main book"              '[[ "$(state "$W/L.txt" "conflated state digest")" == "$DL" ]]'
 check "main subscriber ended and matches ($RLM)"              '[[ $RLM == 0 && "$(state "$W/LM.txt" "state digest")" == "$DL" ]]'
 check "conflated subscriber ended and matches ($RLC)"         '[[ $RLC == 0 && "$(state "$W/LC.txt" "state digest")" == "$DL" ]]'

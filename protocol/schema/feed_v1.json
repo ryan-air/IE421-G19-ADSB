@@ -30,7 +30,7 @@
         {"name": "kAirGround",    "bit": 8,  "doc": "flags.kOnGround"},
         {"name": "kHeading",      "bit": 9,  "doc": "heading_cdeg or flags.kHeadingTrue"},
         {"name": "kAirspeed",     "bit": 10, "doc": "airspeed_kt or flags.kAirspeedTrue"},
-        {"name": "kIntegrity",    "bit": 11, "doc": "nic or adsb_version"},
+        {"name": "kIntegrity",    "bit": 11, "doc": "nic, adsb_version, nac_p, sil or nuc_p"},
         {"name": "kNewTrack",     "bit": 15, "doc": "first update for this ICAO address in this session"}
       ]
     },
@@ -44,7 +44,8 @@
         {"name": "kNonIcaoAddress", "bit": 2, "doc": "icao is an anonymous / TIS-B track-file address"},
         {"name": "kSurfacePosition","bit": 3, "doc": "last position came from a surface position message"},
         {"name": "kHeadingTrue",    "bit": 4, "doc": "heading_cdeg is relative to true north (TC 31 HRD = 0); clear: magnetic north"},
-        {"name": "kAirspeedTrue",   "bit": 5, "doc": "airspeed_kt is true airspeed; clear: indicated airspeed"}
+        {"name": "kAirspeedTrue",   "bit": 5, "doc": "airspeed_kt is true airspeed; clear: indicated airspeed"},
+        {"name": "kAirDataCommB",   "bit": 6, "doc": "heading_cdeg and airspeed_kt came from a Comm-B reply (BDS 6,0: magnetic heading, indicated airspeed), not from ADS-B"}
       ]
     }
   ],
@@ -96,9 +97,12 @@
         {"name": "flags",         "type": "u8",      "doc": "TrackFlags"},
         {"name": "adsb_version",  "type": "u8",      "null": 255, "doc": "ADS-B version from operational status (TC 31): 0 DO-260, 1 DO-260A, 2 DO-260B; null until one is received (nic is then computed as for version 0)"},
         {"name": "publish_ts_ns", "type": "u64",     "doc": "Publisher software timestamp taken just before send (wall-clock domain); 0 inside the pipeline"},
-        {"name": "heading_cdeg",  "type": "u16",     "null": 65535, "doc": "Heading, 0.01 degree, [0, 36000), from airborne velocity subtypes 3/4; north reference in flags.kHeadingTrue"},
-        {"name": "airspeed_kt",   "type": "u16",     "null": 65535, "doc": "Airspeed, knots, from airborne velocity subtypes 3/4; flags.kAirspeedTrue says TAS or IAS"},
-        {"name": "reserved",      "type": "u32",     "doc": "Zero"}
+        {"name": "heading_cdeg",  "type": "u16",     "null": 65535, "doc": "Heading, 0.01 degree, [0, 36000), from airborne velocity subtypes 3/4, or Comm-B BDS 6,0 for aircraft without them (flags.kAirDataCommB); north reference in flags.kHeadingTrue"},
+        {"name": "airspeed_kt",   "type": "u16",     "null": 65535, "doc": "Airspeed, knots, from airborne velocity subtypes 3/4, or Comm-B BDS 6,0 (indicated); flags.kAirspeedTrue says TAS or IAS"},
+        {"name": "nac_p",         "type": "u8",      "doc": "Navigation accuracy category for position, 0-11, from the latest operational status (TC 31, versions 1/2) or target state (TC 29); 0 = unknown (or EPU >= 10 NM)"},
+        {"name": "sil",           "type": "u8",      "doc": "Source integrity level: bits 0-1 the SIL (0-3), bit 2 set when it is per sample (clear: per hour); from TC 31 (versions 1/2) or TC 29; 0 = unknown"},
+        {"name": "nuc_p",         "type": "u8",      "doc": "Navigation uncertainty category for position, 0-9, of the current position for version 0 (DO-260) aircraft, from its type code; 0 = unknown, or a version 1/2 aircraft (see nic)"},
+        {"name": "reserved",      "type": "u8",      "doc": "Zero"}
       ],
       "example": {
         "msg_type": 85, "version": 1, "update_mask": 545, "icao": 4735190,
@@ -106,7 +110,8 @@
         "lat_e7": 522572021, "lon_e7": 39193725, "alt_ft": 38000,
         "gs_dkt": 4500, "track_cdeg": 18288, "vrate_fpm": -832, "squawk": 30464,
         "callsign": "KLM1023 ", "category": 160, "nic": 8, "flags": 16, "adsb_version": 2,
-        "publish_ts_ns": 0, "heading_cdeg": 18105, "airspeed_kt": 452, "reserved": 0
+        "publish_ts_ns": 0, "heading_cdeg": 18105, "airspeed_kt": 452,
+        "nac_p": 10, "sil": 7, "nuc_p": 0, "reserved": 0
       }
     },
     {

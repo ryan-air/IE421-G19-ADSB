@@ -25,7 +25,7 @@ class UpdateMask:
     kAirGround = 256  # flags.kOnGround
     kHeading = 512  # heading_cdeg or flags.kHeadingTrue
     kAirspeed = 1024  # airspeed_kt or flags.kAirspeedTrue
-    kIntegrity = 2048  # nic or adsb_version
+    kIntegrity = 2048  # nic, adsb_version, nac_p, sil or nuc_p
     kNewTrack = 32768  # first update for this ICAO address in this session
 
 class TrackFlags:
@@ -36,6 +36,7 @@ class TrackFlags:
     kSurfacePosition = 8  # last position came from a surface position message
     kHeadingTrue = 16  # heading_cdeg is relative to true north (TC 31 HRD = 0); clear: magnetic north
     kAirspeedTrue = 32  # airspeed_kt is true airspeed; clear: indicated airspeed
+    kAirDataCommB = 64  # heading_cdeg and airspeed_kt came from a Comm-B reply (BDS 6,0: magnetic heading, indicated airspeed), not from ADS-B
 
 
 def _dec_chars(b):
@@ -84,9 +85,9 @@ def encode_retransmit_request(msg):
 
 
 # Full current state of one aircraft track, sent whenever any field changes. Unknown fields hold their `null` value.
-TRACK_UPDATE_FORMAT = '<BBHIQQiiiHHhH8sBBBBQHHI'
+TRACK_UPDATE_FORMAT = '<BBHIQQiiiHHhH8sBBBBQHHBBBB'
 TRACK_UPDATE_SIZE = 72
-TRACK_UPDATE_FIELDS = ('msg_type', 'version', 'update_mask', 'icao', 'event_ts_ns', 'radio_ts', 'lat_e7', 'lon_e7', 'alt_ft', 'gs_dkt', 'track_cdeg', 'vrate_fpm', 'squawk', 'callsign', 'category', 'nic', 'flags', 'adsb_version', 'publish_ts_ns', 'heading_cdeg', 'airspeed_kt', 'reserved')
+TRACK_UPDATE_FIELDS = ('msg_type', 'version', 'update_mask', 'icao', 'event_ts_ns', 'radio_ts', 'lat_e7', 'lon_e7', 'alt_ft', 'gs_dkt', 'track_cdeg', 'vrate_fpm', 'squawk', 'callsign', 'category', 'nic', 'flags', 'adsb_version', 'publish_ts_ns', 'heading_cdeg', 'airspeed_kt', 'nac_p', 'sil', 'nuc_p', 'reserved')
 TRACK_UPDATE_TYPE = 'U'
 _TRACK_UPDATE = struct.Struct(TRACK_UPDATE_FORMAT)
 TRACK_UPDATE_NULLS = {'lat_e7': -2147483648, 'lon_e7': -2147483648, 'alt_ft': -2147483648, 'gs_dkt': 65535, 'track_cdeg': 65535, 'vrate_fpm': -32768, 'squawk': 65535, 'adsb_version': 255, 'heading_cdeg': 65535, 'airspeed_kt': 65535}  # values meaning 'unknown'
@@ -100,7 +101,7 @@ def decode_track_update(buf, offset=0):
 
 
 def encode_track_update(msg):
-    return _TRACK_UPDATE.pack(msg['msg_type'], msg['version'], msg['update_mask'], msg['icao'], msg['event_ts_ns'], msg['radio_ts'], msg['lat_e7'], msg['lon_e7'], msg['alt_ft'], msg['gs_dkt'], msg['track_cdeg'], msg['vrate_fpm'], msg['squawk'], _enc_chars(msg['callsign'], 8, b' '), msg['category'], msg['nic'], msg['flags'], msg['adsb_version'], msg['publish_ts_ns'], msg['heading_cdeg'], msg['airspeed_kt'], msg['reserved'])
+    return _TRACK_UPDATE.pack(msg['msg_type'], msg['version'], msg['update_mask'], msg['icao'], msg['event_ts_ns'], msg['radio_ts'], msg['lat_e7'], msg['lon_e7'], msg['alt_ft'], msg['gs_dkt'], msg['track_cdeg'], msg['vrate_fpm'], msg['squawk'], _enc_chars(msg['callsign'], 8, b' '), msg['category'], msg['nic'], msg['flags'], msg['adsb_version'], msg['publish_ts_ns'], msg['heading_cdeg'], msg['airspeed_kt'], msg['nac_p'], msg['sil'], msg['nuc_p'], msg['reserved'])
 
 
 # The track expired or was removed; subscribers drop it.
@@ -199,7 +200,7 @@ def numpy_dtype(name):
     layouts = {
         'PacketHeader': [('session', 'S10'), ('seq', '<u8'), ('count', '<u2')],
         'RetransmitRequest': [('session', 'S10'), ('seq', '<u8'), ('count', '<u2')],
-        'TrackUpdate': [('msg_type', 'u1'), ('version', 'u1'), ('update_mask', '<u2'), ('icao', '<u4'), ('event_ts_ns', '<u8'), ('radio_ts', '<u8'), ('lat_e7', '<i4'), ('lon_e7', '<i4'), ('alt_ft', '<i4'), ('gs_dkt', '<u2'), ('track_cdeg', '<u2'), ('vrate_fpm', '<i2'), ('squawk', '<u2'), ('callsign', 'S8'), ('category', 'u1'), ('nic', 'u1'), ('flags', 'u1'), ('adsb_version', 'u1'), ('publish_ts_ns', '<u8'), ('heading_cdeg', '<u2'), ('airspeed_kt', '<u2'), ('reserved', '<u4')],
+        'TrackUpdate': [('msg_type', 'u1'), ('version', 'u1'), ('update_mask', '<u2'), ('icao', '<u4'), ('event_ts_ns', '<u8'), ('radio_ts', '<u8'), ('lat_e7', '<i4'), ('lon_e7', '<i4'), ('alt_ft', '<i4'), ('gs_dkt', '<u2'), ('track_cdeg', '<u2'), ('vrate_fpm', '<i2'), ('squawk', '<u2'), ('callsign', 'S8'), ('category', 'u1'), ('nic', 'u1'), ('flags', 'u1'), ('adsb_version', 'u1'), ('publish_ts_ns', '<u8'), ('heading_cdeg', '<u2'), ('airspeed_kt', '<u2'), ('nac_p', 'u1'), ('sil', 'u1'), ('nuc_p', 'u1'), ('reserved', 'u1')],
         'TrackDelete': [('msg_type', 'u1'), ('version', 'u1'), ('reason', 'u1'), ('reserved', 'u1'), ('icao', '<u4'), ('event_ts_ns', '<u8')],
         'SnapshotBegin': [('msg_type', 'u1'), ('version', 'u1'), ('reserved', '<u2'), ('track_count', '<u4'), ('as_of_seq', '<u8'), ('event_ts_ns', '<u8')],
         'SnapshotEnd': [('msg_type', 'u1'), ('version', 'u1'), ('reserved', '<u2'), ('reserved2', '<u4'), ('as_of_seq', '<u8')],

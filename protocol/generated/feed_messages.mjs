@@ -21,7 +21,7 @@ export const UpdateMask = Object.freeze({
   kAirGround: 256,  // flags.kOnGround
   kHeading: 512,  // heading_cdeg or flags.kHeadingTrue
   kAirspeed: 1024,  // airspeed_kt or flags.kAirspeedTrue
-  kIntegrity: 2048,  // nic or adsb_version
+  kIntegrity: 2048,  // nic, adsb_version, nac_p, sil or nuc_p
   kNewTrack: 32768,  // first update for this ICAO address in this session
 });
 
@@ -33,6 +33,7 @@ export const TrackFlags = Object.freeze({
   kSurfacePosition: 8,  // last position came from a surface position message
   kHeadingTrue: 16,  // heading_cdeg is relative to true north (TC 31 HRD = 0); clear: magnetic north
   kAirspeedTrue: 32,  // airspeed_kt is true airspeed; clear: indicated airspeed
+  kAirDataCommB: 64,  // heading_cdeg and airspeed_kt came from a Comm-B reply (BDS 6,0: magnetic heading, indicated airspeed), not from ADS-B
 });
 
 const decodeChars = (view, off, n) => {
@@ -102,7 +103,10 @@ export function decodeTrackUpdate(view, offset = 0) {
     publish_ts_ns: view.getBigUint64(offset + 56, true),
     heading_cdeg: view.getUint16(offset + 64, true),
     airspeed_kt: view.getUint16(offset + 66, true),
-    reserved: view.getUint32(offset + 68, true),
+    nac_p: view.getUint8(offset + 68),
+    sil: view.getUint8(offset + 69),
+    nuc_p: view.getUint8(offset + 70),
+    reserved: view.getUint8(offset + 71),
   };
 }
 export function encodeTrackUpdate(msg, view, offset = 0) {
@@ -127,7 +131,10 @@ export function encodeTrackUpdate(msg, view, offset = 0) {
   view.setBigUint64(offset + 56, BigInt(msg.publish_ts_ns), true);
   view.setUint16(offset + 64, msg.heading_cdeg, true);
   view.setUint16(offset + 66, msg.airspeed_kt, true);
-  view.setUint32(offset + 68, msg.reserved, true);
+  view.setUint8(offset + 68, msg.nac_p);
+  view.setUint8(offset + 69, msg.sil);
+  view.setUint8(offset + 70, msg.nuc_p);
+  view.setUint8(offset + 71, msg.reserved);
 }
 
 // The track expired or was removed; subscribers drop it.

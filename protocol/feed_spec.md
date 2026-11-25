@@ -1,6 +1,6 @@
-# ADS-B Track Feed — Wire Specification v0 (draft)
+# ADS-B Track Feed — Wire Specification v1
 
-**Status:** v0 draft for team review. Changes are expected before v1. Once a field is in v1 it can only be appended to, never moved.
+**Status:** version 1 (`protocol/schema/feed_v1.json`), used by every component in this repository. Fields are only appended to or assigned from reserved bytes, never moved.
 
 **Source of truth:** [`schema/feed_v1.json`](schema/feed_v1.json). Field tables in this document are copied from the schema. If the two disagree, the schema wins. Generated code:
 
@@ -93,17 +93,25 @@ The first byte of every message is its ASCII type, and the second is the schema 
 | 54 | `flags` | u8 | `TrackFlags` bits | |
 | 55 | `adsb_version` | u8 | ADS-B version from operational status (TC 31): 0 DO-260, 1 DO-260A, 2 DO-260B | `0xFF` (no TC 31 yet) |
 | 56 | `publish_ts_ns` | u64 | Publisher software timestamp just before send; 0 inside the pipeline | |
-| 64 | `heading_cdeg` | u16 | Heading, 0.01°, [0, 36000), from airborne velocity subtypes 3/4; reference in `flags.kHeadingTrue` | `0xFFFF` |
-| 66 | `airspeed_kt` | u16 | Airspeed, kt, from airborne velocity subtypes 3/4; `flags.kAirspeedTrue` = TAS, else IAS | `0xFFFF` |
-| 68 | `reserved` | u32 | 0 | |
+| 64 | `heading_cdeg` | u16 | Heading, 0.01°, [0, 36000), from airborne velocity subtypes 3/4, or Comm-B BDS 6,0 (below); reference in `flags.kHeadingTrue` | `0xFFFF` |
+| 66 | `airspeed_kt` | u16 | Airspeed, kt, from airborne velocity subtypes 3/4, or Comm-B BDS 6,0 (indicated); `flags.kAirspeedTrue` = TAS, else IAS | `0xFFFF` |
+| 68 | `nac_p` | u8 | Navigation accuracy category for position, 0–11, from the latest TC 31 (versions 1/2) or TC 29; 0 = unknown (or EPU ≥ 10 NM) | |
+| 69 | `sil` | u8 | Source integrity level: bits 0–1 the SIL (0–3), bit 2 set when per sample (clear: per hour); from TC 31 (versions 1/2) or TC 29; 0 = unknown | |
+| 70 | `nuc_p` | u8 | Navigation uncertainty category for position, 0–9, of the current position of a version 0 aircraft, from its type code; 0 = unknown or a version 1/2 aircraft | |
+| 71 | `reserved` | u8 | 0 | |
 
 A datagram holds up to 19 `TrackUpdate`s (22 in version 0). The shared-memory ring's 128-byte slots carry 72-byte payloads since its layout version 2.
 
 **`nic`.** Computed for every position message when it arrives, from its type code, the aircraft's ADS-B version and the NIC supplements: A and C from the latest operational status (TC 31 from DF17 or DF18 CF 0/1 only; version 1 or 2, since versions 3–7 are reserved and only reported; C only from a surface status with capability class code 0), each counting for 60 s after the status that set it; B from bit 8 of the airborne position message (DF17 or DF18 CF 0/1; for TIS-B and ADS-R that bit is the IMF flag). A global CPR fix carries the lower NIC of its two frames, a local fix against the track's previous position the lower of its frame's and the track's, a local fix against the receiver its frame's. Until a TC 31 arrives the version 0 rules apply (the NIC that the type code alone implies). `flags.kHeadingTrue` is set only while a heading is known. The rules are readsb's (`track.c`, `compute_nic`, v3.16.21), i.e. DO-260B Tables 2-14 and 2-15 with readsb's readings of versions 0 and 1; `modes::position_nic()` in `core/include/adsb/modes/decoder.hpp` implements them. A later TC 31 changes `adsb_version` at once but `nic` only with the next positions.
 
-**`UpdateMask` bits:** 0 `kPosition`, 1 `kAltitude`, 2 `kGroundSpeed`, 3 `kTrack`, 4 `kVerticalRate`, 5 `kCallsign`, 6 `kSquawk`, 7 `kCategory`, 8 `kAirGround`, 9 `kHeading` (heading or its reference), 10 `kAirspeed` (airspeed or TAS/IAS), 11 `kIntegrity` (`nic` or `adsb_version`), 15 `kNewTrack`.
+**Accuracy (bytes 68–70, 2026-11-24).** These were the `reserved` word, which was always 0. 0 means unknown, which is also each scale's worst value, so a reader that ignored the bytes reads them correctly, and the version stays 1.
+- **`nac_p` and `sil`:** from the newest operational status (TC 31, versions 1/2) or target state (TC 29). Both come from the same sources as `adsb_version`: DF17, or DF18 CF 0/1. Version 1 has no SIL supplement, and its `sil` is shown as per hour. A status for version 0 or a reserved version (3–7) clears both. Neither expires otherwise: a track keeps them until it ends.
+- **`nuc_p`:** computed per position message like `nic`, for aircraft whose version is 0, reserved (3–7, read as 0, as for `nic`) or not yet known. A global fix takes the lower value of its pair. Surface type codes 5–8 give 9, 8, 7, 6; airborne 9–18 give 9…0; GNSS 20–22 give 9, 8, 0 (`modes::position_nuc()`).
+- **Comm-B air data:** an aircraft that sends no airborne velocity subtype 3/4 (many Mode S-only aircraft) gets `heading_cdeg` and `airspeed_kt` from Comm-B BDS 6,0 replies: magnetic heading and indicated airspeed, with `flags.kAirDataCommB` set. When ADS-B air data returns with only one of the two fields, the other (still Comm-B's) is dropped (null) rather than relabelled. This applies only when there has been no subtype 3/4 for 30 s, and only when the previous BDS 6,0 reply, at most 30 s earlier, agrees: heading within 10°, IAS within 20 kt. The register is inferred from the reply's contents, so one reply alone could be another register's.
 
-**`TrackFlags` bits:** 0 `kAltitudeGnss`, 1 `kOnGround`, 2 `kNonIcaoAddress`, 3 `kSurfacePosition`, 4 `kHeadingTrue` (heading is relative to true north: TC 31 HRD = 0, version 1 or later; otherwise magnetic), 5 `kAirspeedTrue` (true airspeed; otherwise indicated).
+**`UpdateMask` bits:** 0 `kPosition`, 1 `kAltitude`, 2 `kGroundSpeed`, 3 `kTrack`, 4 `kVerticalRate`, 5 `kCallsign`, 6 `kSquawk`, 7 `kCategory`, 8 `kAirGround`, 9 `kHeading` (heading or its reference), 10 `kAirspeed` (airspeed or TAS/IAS), 11 `kIntegrity` (`nic`, `adsb_version`, `nac_p`, `sil` or `nuc_p`), 15 `kNewTrack`.
+
+**`TrackFlags` bits:** 0 `kAltitudeGnss`, 1 `kOnGround`, 2 `kNonIcaoAddress`, 3 `kSurfacePosition`, 4 `kHeadingTrue` (heading is relative to true north: TC 31 HRD = 0, version 1 or later; otherwise magnetic), 5 `kAirspeedTrue` (true airspeed; otherwise indicated), 6 `kAirDataCommB` (heading and airspeed came from Comm-B BDS 6,0, not ADS-B).
 
 ### `TrackDelete` — `'D'`, 16 bytes
 
@@ -160,7 +168,7 @@ Browsers do not join the multicast group. The WebSocket gateway (`gateway/`) is 
 
 ## 5. Open questions for review
 
-1. ~~**`nic` / position quality:** populate from TC 31 (operational status) once it is decoded, or replace with NUCp derived from the position type code?~~ **Decided (v1):** `nic` is populated, with readsb's rules (§3), and `adsb_version` tells consumers which DO-260 revision it follows. Version 0 aircraft get the NIC their type code implies, which is the NUCp ordering on the NIC scale; NACp, SIL and NUCp themselves are not carried (they can be added in the `reserved` word).
+1. ~~**`nic` / position quality:** populate from TC 31 (operational status) once it is decoded, or replace with NUCp derived from the position type code?~~ **Decided (v1):** `nic` is populated, with readsb's rules (§3), and `adsb_version` tells consumers which DO-260 revision it follows. Version 0 aircraft get the NIC their type code implies, which is the NUCp ordering on the NIC scale; NACp, SIL and NUCp have been carried since 2026-11-24, in what was the `reserved` word.
 2. ~~**Heading and airspeed:** these are decoded (velocity subtypes 3/4) but not carried. Add them in v1, at the cost of a second cache line, or as a separate `'V'` message?~~ **Decided (v1):** in `TrackUpdate`, which grows to 72 bytes. A separate message would break the rule that one `TrackUpdate` is an aircraft's whole state, on which the conflated feed, snapshots, `FeedBook` and its digest, and the gateway's per-client conflation all rely; each of them would need a second message type kept consistent with the first. The cost: 19 instead of 22 updates per datagram, and the message spans two cache lines (the shared-memory slot was 128 bytes already).
 3. ~~**Conflated feed:** same messages on a separate multicast group, or a dedicated compact message?~~ **Decided:** the same messages on a separate group (§4, "The conflated feed"), so every subscriber and the gateway work on it unchanged. A compact message can still be added later as a new type.
 4. **Multicast group and ports:** defaults are `239.19.0.1:41900` for the incremental feed, UDP 41901 for retransmit requests, TCP 41902 for snapshots, `239.19.0.3:41910` (retransmit 41911, snapshot 41912) for the conflated feed, and `239.19.0.2` for fusion. Confirm these against the lab network.

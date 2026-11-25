@@ -73,6 +73,17 @@ void write_parity(std::uint8_t* frame, std::size_t len, std::uint32_t overlay) n
 // DF5 surveillance identity reply (Address/Parity). squawk: 0xABCD octal digits.
 [[nodiscard]] Frame encode_df5(std::uint32_t icao, std::uint16_t squawk, unsigned fs = 0) noexcept;
 
+// DF20 Comm-B altitude reply (Address/Parity) carrying the 56-bit MB field
+// `mb` (bit 1 of the MB is bit 55 of the value). DR and UM are 0.
+[[nodiscard]] Frame encode_df20(std::uint32_t icao, std::int32_t alt_ft, std::uint64_t mb, unsigned fs = 0) noexcept;
+
+// MB field of BDS 6,0 (heading and speed report, ICAO Doc 9871): magnetic
+// heading (90/512 degree steps, two's complement), IAS (1 kt), Mach
+// (0.004), barometric and inertial vertical rate (32 fpm); every status
+// bit set.
+[[nodiscard]] std::uint64_t comm_b_bds60(double heading_deg, double ias_kt, double mach, int baro_vr_fpm,
+                                         int inertial_vr_fpm) noexcept;
+
 // Ground speed in knots -> 7-bit surface movement code (nearest step).
 [[nodiscard]] unsigned knots_to_surface_movement(double kt) noexcept;
 

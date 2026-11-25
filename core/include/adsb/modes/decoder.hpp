@@ -25,8 +25,9 @@
 // format rules the MB field satisfies is a candidate (CommB::candidates);
 // values are decoded only when exactly one candidate remains (5,0 and 6,0
 // are often both plausible: then nothing is decoded). Comm-B values are
-// kept apart from the ADS-B fields (DecodedMsg::comm_b) and the track engine
-// does not use them yet.
+// kept apart from the ADS-B fields (DecodedMsg::comm_b); the track engine
+// uses only BDS 6,0 heading and IAS, for aircraft without ADS-B air data,
+// when two replies agree.
 // Optional (DecodeOptions::fix_single_bit, off by default): a DF17/18 frame
 // whose syndrome is that of one wrong bit outside the DF field (bits 6-112)
 // is repaired, as readsb does by default; DecodedMsg::corrected_bit says
@@ -225,6 +226,13 @@ struct DecodedMsg {
 // 2-15 with the version 0 / 1 readings; any other type code gives 0.
 [[nodiscard]] std::uint8_t position_nic(unsigned tc, unsigned version, bool nic_a, bool nic_b,
                                         bool nic_c) noexcept;
+
+// Navigation uncertainty category for position (0-9, 0 = unknown) of a
+// version 0 (DO-260) position message, from its type code: surface 5-8 ->
+// 9, 8, 7, 6; airborne 9-18 -> 9 ... 0; GNSS height 20-22 -> 9, 8, 0
+// (DO-260 Table 2-14, as pyModeS). Any other type code gives 0. For
+// versions 1/2 the type code means a NIC instead (position_nic).
+[[nodiscard]] std::uint8_t position_nuc(unsigned tc) noexcept;
 
 // Decodes one frame. `len` must be 7 or 14 bytes. `out` is fully overwritten.
 [[nodiscard]] DecodeStatus decode(const std::uint8_t* frame, std::size_t len,

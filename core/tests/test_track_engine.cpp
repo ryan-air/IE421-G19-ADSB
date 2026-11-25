@@ -18,6 +18,7 @@
 #include "adsb/modes/encoder.hpp"
 #include "adsb/replay/replay.hpp"
 #include "adsb/sim/synth.hpp"
+#include "test_util.hpp"
 
 namespace {
 
@@ -524,6 +525,222 @@ TEST(TrackEngine, NicSupplementsExpireAMinuteAfterTheLastStatus) {
   EXPECT_EQ(sink.updates.back().nic, 9u);
 }
 
+TEST(TrackEngine, NucpForVersion0AircraftFromTheTypeCode) {
+  namespace um = protocol::update_mask;
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  const double lat = 41.9, lon = -87.9;
+  // No TC 31: version 0. TC 11 -> NUCp 7; a pair with TC 13 (NUCp 5): the weaker.
+  feed(*e, position(lat, lon, false, 11), 10 * kSec, sink);
+  feed(*e, position(lat, lon, true, 11), 10 * kSec + kSec / 2, sink);
+  ASSERT_FALSE(sink.updates.empty());
+  EXPECT_EQ(sink.updates.back().nuc_p, 7u);
+  feed(*e, position(lat + 0.01, lon, false, 13), 11 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nuc_p, 5u);
+  EXPECT_TRUE(sink.updates.back().update_mask & um::kIntegrity);
+  // A version 2 status: later positions carry a NIC, not a NUCp.
+  feed(*e, opstatus(2, false), 11 * kSec + kSec / 2, sink);
+  EXPECT_EQ(sink.updates.back().nuc_p, 5u) << "the current position's NUCp stands until the next fix";
+  feed(*e, position(lat + 0.02, lon, true, 13), 12 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nuc_p, 0u);
+  EXPECT_GT(sink.updates.back().nic, 0u);
+}
+
+TEST(TrackEngine, NacpAndSilFromOperationalStatusAndTargetState) {
+  namespace um = protocol::update_mask;
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 10 * kSec, sink);
+  modes::OperationalStatus os;
+  os.version = 2;
+  os.nac_p = 10;
+  os.sil = 3;
+  os.sil_per_sample = true;
+  feed(*e, modes::encode_operational_status(kIcao, os), 11 * kSec, sink);
+  ASSERT_FALSE(sink.updates.empty());
+  EXPECT_EQ(sink.updates.back().nac_p, 10u);
+  EXPECT_EQ(sink.updates.back().sil, 3u | 4u);
+  EXPECT_TRUE(sink.updates.back().update_mask & um::kIntegrity);
+  // Version 1 has no SIL supplement: per hour, whatever bit 55 says.
+  os.version = 1;
+  os.nac_p = 9;
+  os.sil = 2;
+  feed(*e, modes::encode_operational_status(kIcao, os), 12 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nac_p, 9u);
+  EXPECT_EQ(sink.updates.back().sil, 2u);
+  // An older status arriving late does not go back.
+  os.nac_p = 4;
+  feed(*e, modes::encode_operational_status(kIcao, os), 11 * kSec + kSec / 2, sink);
+  EXPECT_EQ(sink.updates.back().nac_p, 9u);
+  // From a TIS-B rebroadcast (DF18 CF 2): ignored.
+  os.nac_p = 3;
+  const std::size_t before = sink.updates.size();
+  modes::Frame tisb = modes::encode_operational_status(kIcao, os);
+  tisb.bytes[0] = static_cast<std::uint8_t>((18u << 3) | 2u);
+  modes::write_parity(tisb.bytes, 14, 0);
+  feed(*e, tisb, 13 * kSec, sink);
+  EXPECT_EQ(sink.updates.size(), before) << "the rebroadcast changed nothing";
+  // Target state (TC 29, published frame, NACp 9 SIL 3 per hour) of another aircraft.
+  auto e2 = std::make_unique<TrackEngine>();
+  CollectSink s2;
+  const auto ts = test::hex("8DA05629EA21485CBF3F8CADAEEB");
+  FrameMeta meta;
+  meta.rx_ns = 20 * kSec;
+  e2->on_frame(ts.data(), ts.size(), meta, s2);
+  ASSERT_FALSE(s2.updates.empty());
+  EXPECT_EQ(s2.updates.back().icao, 0xA05629u);
+  EXPECT_EQ(s2.updates.back().nac_p, 9u);
+  EXPECT_EQ(s2.updates.back().sil, 3u);
+  // The same target state rebroadcast as TIS-B (DF18 CF 2): ignored.
+  auto e3 = std::make_unique<TrackEngine>();
+  CollectSink s3;
+  feed(*e3, modes::encode_df11(0xA05629), 19 * kSec, s3);
+  auto tisb_ts = ts;
+  tisb_ts[0] = static_cast<std::uint8_t>((18u << 3) | 2u);
+  modes::write_parity(tisb_ts.data(), 14, 0);
+  meta.rx_ns = 20 * kSec;
+  e3->on_frame(tisb_ts.data(), tisb_ts.size(), meta, s3);
+  EXPECT_EQ(s3.updates.back().nac_p, 0u);
+  // Only NACp changes (same version): kIntegrity, and nothing else.
+  modes::OperationalStatus v2;
+  v2.version = 2;
+  v2.nac_p = 9;
+  v2.sil = 3;
+  feed(*e2, modes::encode_operational_status(0xA05629, v2), 21 * kSec, s2);
+  v2.nac_p = 11;
+  feed(*e2, modes::encode_operational_status(0xA05629, v2), 22 * kSec, s2);
+  EXPECT_EQ(s2.updates.back().nac_p, 11u);
+  EXPECT_EQ(s2.updates.back().update_mask, protocol::update_mask::kIntegrity);
+  // A status older than the newest target state (it passes the status
+  // freshness check: the last status is older still) does not go back.
+  meta.rx_ns = 30 * kSec;
+  e2->on_frame(ts.data(), ts.size(), meta, s2);  // TC 29 again: NACp 9
+  ASSERT_EQ(s2.updates.back().nac_p, 9u);
+  v2.nac_p = 4;
+  feed(*e2, modes::encode_operational_status(0xA05629, v2), 25 * kSec, s2);
+  EXPECT_EQ(s2.updates.back().nac_p, 9u);
+}
+
+modes::Frame bds60(double hdg, double ias) {
+  return modes::encode_df20(kIcao, 31000, modes::comm_b_bds60(hdg, ias, 0.7, 0, 0));
+}
+
+TEST(TrackEngine, CommBAirDataNeedsTwoAgreeingRepliesAndNoAdsbAirData) {
+  namespace tf = protocol::track_flags;
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 10 * kSec, sink);
+  ASSERT_EQ(e->track_count(), 1u);
+  // One reply: not yet.
+  feed(*e, bds60(120.0, 250), 11 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().heading_cdeg, TrackUpdate::kHeadingCdegNull);
+  // A disagreeing one: still not (and it becomes the one to confirm).
+  feed(*e, bds60(200.0, 250), 12 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().heading_cdeg, TrackUpdate::kHeadingCdegNull);
+  // Agreeing with the previous one (within 10 degrees, 20 kt): applied.
+  feed(*e, bds60(203.0, 262), 13 * kSec, sink);
+  const TrackUpdate& u = sink.updates.back();
+  EXPECT_NEAR(u.heading_cdeg, 20300, 20);
+  EXPECT_EQ(u.airspeed_kt, 262u);
+  EXPECT_TRUE(u.flags & tf::kAirDataCommB);
+  EXPECT_FALSE(u.flags & tf::kHeadingTrue) << "BDS 6,0 heading is magnetic";
+  EXPECT_FALSE(u.flags & tf::kAirspeedTrue) << "indicated";
+  // Across north: 358 and 3 degrees agree.
+  feed(*e, bds60(358.0, 262), 14 * kSec, sink);
+  feed(*e, bds60(3.0, 262), 15 * kSec, sink);
+  EXPECT_NEAR(sink.updates.back().heading_cdeg, 300, 20);
+  // Too far apart in time (> 30 s): the pair does not confirm, even agreeing.
+  feed(*e, bds60(5.0, 263), 50 * kSec, sink);
+  EXPECT_NEAR(sink.updates.back().heading_cdeg, 300, 20);
+  // ADS-B air data takes over and clears the Comm-B flag ...
+  feed(*e, modes::encode_airspeed_heading(kIcao, 45.0, 410, true, 0), 51 * kSec, sink);
+  EXPECT_NEAR(sink.updates.back().heading_cdeg, 4500, 20);
+  EXPECT_FALSE(sink.updates.back().flags & tf::kAirDataCommB);
+  // ... and Comm-B is ignored while it is fresh (30 s) ...
+  feed(*e, bds60(91.0, 300), 52 * kSec, sink);
+  feed(*e, bds60(92.0, 300), 53 * kSec, sink);
+  EXPECT_NEAR(sink.updates.back().heading_cdeg, 4500, 20);
+  // ... and used again once it is not.
+  feed(*e, bds60(93.0, 300), 82 * kSec, sink);
+  feed(*e, bds60(94.0, 301), 83 * kSec, sink);
+  EXPECT_NEAR(sink.updates.back().heading_cdeg, 9400, 20);
+  EXPECT_TRUE(sink.updates.back().flags & tf::kAirDataCommB);
+}
+
+// Found by review: ADS-B air data with only one of the two fields used to
+// relabel the other (still Comm-B's magnetic heading) as ADS-B, and a TC 31
+// then marked it true north.
+TEST(TrackEngine, PartialAdsbAirDataDropsTheCommBFieldItDoesNotReplace) {
+  namespace tf = protocol::track_flags;
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 10 * kSec, sink);
+  feed(*e, bds60(120.0, 250), 11 * kSec, sink);
+  feed(*e, bds60(121.0, 251), 12 * kSec, sink);
+  ASSERT_TRUE(sink.updates.back().flags & tf::kAirDataCommB);
+  ASSERT_NE(sink.updates.back().heading_cdeg, TrackUpdate::kHeadingCdegNull);
+  // Subtype 3 with IAS and no heading.
+  feed(*e, modes::encode_airspeed_heading(kIcao, -1, 300, false, 0), 13 * kSec, sink);
+  {
+    const TrackUpdate& u = sink.updates.back();
+    EXPECT_EQ(u.airspeed_kt, 300u);
+    EXPECT_EQ(u.heading_cdeg, TrackUpdate::kHeadingCdegNull) << "Comm-B's heading must not pass as ADS-B";
+    EXPECT_FALSE(u.flags & tf::kAirDataCommB);
+    EXPECT_TRUE(u.update_mask & protocol::update_mask::kHeading);
+  }
+  // A true-north TC 31 afterwards: no heading, so no reference shown.
+  feed(*e, opstatus(2, false, true), 14 * kSec, sink);
+  EXPECT_FALSE(sink.updates.back().flags & tf::kHeadingTrue);
+  EXPECT_EQ(sink.updates.back().heading_cdeg, TrackUpdate::kHeadingCdegNull);
+  // Both fields from ADS-B: nothing dropped.
+  feed(*e, bds60(122.0, 252), 50 * kSec, sink);
+  feed(*e, bds60(123.0, 253), 51 * kSec, sink);
+  ASSERT_TRUE(sink.updates.back().flags & tf::kAirDataCommB);
+  feed(*e, modes::encode_airspeed_heading(kIcao, 200.0, 310, false, 0), 52 * kSec, sink);
+  EXPECT_NEAR(sink.updates.back().heading_cdeg, 20000, 20);
+  EXPECT_EQ(sink.updates.back().airspeed_kt, 310u);
+  EXPECT_TRUE(sink.updates.back().flags & tf::kHeadingTrue) << "ADS-B heading, true north per the TC 31";
+}
+
+TEST(TrackEngine, AVersion0OrReservedStatusClearsNacpAndSilAndGivesNucp) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  modes::OperationalStatus os;
+  os.version = 2;
+  os.nac_p = 10;
+  os.sil = 3;
+  feed(*e, modes::encode_operational_status(kIcao, os), 10 * kSec, sink);
+  ASSERT_EQ(sink.updates.back().nac_p, 10u);
+  os.version = 3;  // reserved
+  feed(*e, modes::encode_operational_status(kIcao, os), 11 * kSec, sink);
+  EXPECT_EQ(sink.updates.back().nac_p, 0u);
+  EXPECT_EQ(sink.updates.back().sil, 0u);
+  EXPECT_TRUE(sink.updates.back().update_mask & protocol::update_mask::kIntegrity);
+  // Read as version 0: positions get a NUCp (TC 12 -> 6), as they get a version 0 NIC.
+  feed(*e, position(41.9, -87.9, false, 12), 12 * kSec, sink);
+  feed(*e, position(41.9, -87.9, true, 12), 12 * kSec + kSec / 2, sink);
+  EXPECT_EQ(sink.updates.back().nuc_p, 6u);
+}
+
+// A Comm-B heading is magnetic: it never carries the true-north flag, not
+// from an earlier ADS-B heading nor from a later TC 31.
+TEST(TrackEngine, CommBHeadingIsNeverMarkedTrueNorth) {
+  namespace tf = protocol::track_flags;
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, opstatus(2, false, true), 10 * kSec, sink);  // HRD true north
+  feed(*e, modes::encode_airspeed_heading(kIcao, 90.0, 300, false, 0), 11 * kSec, sink);
+  ASSERT_TRUE(sink.updates.back().flags & tf::kHeadingTrue);
+  // ADS-B air data goes stale; Comm-B takes over.
+  feed(*e, bds60(95.0, 300), 50 * kSec, sink);
+  feed(*e, bds60(96.0, 301), 51 * kSec, sink);
+  ASSERT_TRUE(sink.updates.back().flags & tf::kAirDataCommB);
+  EXPECT_FALSE(sink.updates.back().flags & tf::kHeadingTrue);
+  feed(*e, opstatus(2, false, true), 52 * kSec, sink);
+  EXPECT_FALSE(sink.updates.back().flags & tf::kHeadingTrue) << "a TC 31 does not make it true north";
+  EXPECT_TRUE(sink.updates.back().flags & tf::kAirDataCommB);
+}
+
 TEST(TrackEngine, ReservedVersionsAreReportedButReadAsVersion0) {
   auto e = std::make_unique<TrackEngine>();
   CollectSink sink;
@@ -691,6 +908,16 @@ TEST_F(EndToEnd, NicHeadingAndAirspeedMatchTheSimulatedAvionics) {
       EXPECT_EQ((u.flags & protocol::track_flags::kHeadingTrue) != 0, shown) << std::hex << icao;
     }
     ASSERT_EQ(u.nic, a->nic) << std::hex << icao << " tc " << int(a->position_tc) << " v" << int(a->adsb_version);
+    // Accuracy: NACp and SIL from the generator's TC 31 (versions 1/2),
+    // NUCp from the type code (version 0).
+    if (a->adsb_version == 0) {
+      EXPECT_EQ(u.nac_p, 0u) << std::hex << icao;
+      EXPECT_EQ(u.nuc_p, modes::position_nuc(a->position_tc)) << std::hex << icao;
+    } else {
+      EXPECT_EQ(u.nac_p, a->nic >= 8 ? 9u : 7u) << std::hex << icao;
+      EXPECT_EQ(u.sil, 3u) << std::hex << icao;
+      EXPECT_EQ(u.nuc_p, 0u) << std::hex << icao;
+    }
     nics.insert(u.nic);
     versions.insert(a->adsb_version);
     ++nic_checked;

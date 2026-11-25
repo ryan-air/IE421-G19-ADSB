@@ -110,8 +110,8 @@ const U8_NULL = 0xff;
 
 // One TrackUpdate in the JSON shape the Fall 2025 map expects from
 // /api/aircraft (ads/server.js): null for unknown fields. Feed v1 adds
-// heading, airspeed (with their references), nic and adsb_version, which the
-// Fall 2025 API did not have.
+// heading, airspeed (with their references and source), nic, adsb_version,
+// nac_p, sil and nuc_p, which the Fall 2025 API did not have.
 export function toAircraft(u, seenSec = null) {
   const v = new DataView(u.buffer, u.byteOffset, u.byteLength);
   const icao = v.getUint32(4, true);
@@ -144,8 +144,14 @@ export function toAircraft(u, seenSec = null) {
     heading_ref: hdg === U16_NULL ? null : (flags & 16) !== 0 ? 'true' : 'magnetic',
     airspeed: ias === U16_NULL ? null : ias,
     airspeed_type: ias === U16_NULL ? null : (flags & 32) !== 0 ? 'tas' : 'ias',
+    air_data_source: hdg === U16_NULL && ias === U16_NULL ? null : (flags & 64) !== 0 ? 'comm_b' : 'adsb',
     nic: lat === INT32_NULL ? null : u[53],
     adsb_version: ver === U8_NULL ? null : ver,
+    // 0 = unknown on the wire (also the worst category): null here.
+    nac_p: u[68] === 0 ? null : u[68],
+    sil: u[69] === 0 ? null : u[69] & 3,
+    sil_type: u[69] === 0 ? null : (u[69] & 4) !== 0 ? 'per_sample' : 'per_hour',
+    nuc_p: lat === INT32_NULL || u[70] === 0 ? null : u[70],
     seen: seenSec,
   };
 }

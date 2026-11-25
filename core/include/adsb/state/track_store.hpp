@@ -70,6 +70,7 @@ struct CprSlot {
   bool valid = false;
   bool surface = false;
   std::uint8_t nic = 0;  // of this frame (modes::position_nic at receipt, as readsb)
+  std::uint8_t nuc = 0;  // of this frame (modes::position_nuc), version 0 aircraft only
 };
 
 struct ColdTrack {
@@ -90,6 +91,17 @@ struct ColdTrack {
   std::uint8_t nic = 0;
   std::uint64_t nic_a_ts_ns = 0;     // NIC-A / NIC-C count for 60 s after the TC 31 that set them
   std::uint64_t nic_c_ts_ns = 0;
+  std::uint8_t nuc_p = 0;            // current position, version 0 aircraft
+  std::uint8_t nac_p = 0;            // latest TC 31 (v1/2) or TC 29
+  std::uint8_t sil = 0;              // wire byte: SIL bits 0-1, per-sample bit 2
+  std::uint64_t accuracy_ts_ns = 0;  // newest TC 29 / TC 31 that set nac_p / sil
+  // Air data (heading, airspeed): from ADS-B velocity subtypes 3/4, or, for
+  // aircraft without them for 30 s, Comm-B BDS 6,0 confirmed by two agreeing
+  // replies (the register is inferred, so one reply could be another one's).
+  std::uint64_t adsb_airdata_ts_ns = 0;  // newest subtype 3/4 heading or airspeed
+  std::uint64_t commb_ts_ns = 0;         // newest BDS 6,0 candidate
+  float commb_heading_deg = 0.0f;
+  float commb_ias_kt = 0.0f;
   CprSlot cpr_even;
   CprSlot cpr_odd;
   std::uint8_t position_reject_streak = 0;

@@ -662,6 +662,15 @@ DecodeStatus decode(const std::uint8_t* frame, std::size_t len, DecodedMsg& out,
   }
 }
 
+std::uint8_t position_nuc(unsigned tc) noexcept {
+  static constexpr std::uint8_t kSurface[4] = {9, 8, 7, 6};  // TC 5-8
+  static constexpr std::uint8_t kGnss[3] = {9, 8, 0};         // TC 20-22
+  if (tc >= 5 && tc <= 8) return kSurface[tc - 5];
+  if (tc >= 9 && tc <= 18) return static_cast<std::uint8_t>(18 - tc);
+  if (tc >= 20 && tc <= 22) return kGnss[tc - 20];
+  return 0;
+}
+
 std::uint8_t position_nic(unsigned tc, unsigned version, bool nic_a, bool nic_b, bool nic_c) noexcept {
   switch (tc) {
     case 5: case 9: case 20: return 11;

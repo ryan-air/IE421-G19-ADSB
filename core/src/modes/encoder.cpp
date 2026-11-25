@@ -1,5 +1,6 @@
 #include "adsb/modes/encoder.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 #include "adsb/modes/altitude.hpp"
@@ -184,6 +185,45 @@ Frame encode_df11(std::uint32_t icao, unsigned ca, unsigned iid) noexcept {
   f.bytes[3] = static_cast<std::uint8_t>(icao);
   write_parity(f.bytes, 7, iid & 0x7Fu);
   return f;
+}
+
+Frame encode_df20(std::uint32_t icao, std::int32_t alt_ft, std::uint64_t mb, unsigned fs) noexcept {
+  Frame f;
+  f.len = 14;
+  const std::uint16_t ac = encode_ac13(alt_ft).value_or(0);
+  f.bytes[0] = static_cast<std::uint8_t>((20u << 3) | (fs & 7u));
+  f.bytes[2] = static_cast<std::uint8_t>((ac >> 8) & 0x1Fu);
+  f.bytes[3] = static_cast<std::uint8_t>(ac & 0xFFu);
+  for (int i = 0; i < 7; ++i) f.bytes[4 + i] = static_cast<std::uint8_t>(mb >> (8 * (6 - i)));
+  write_parity(f.bytes, 14, icao & 0xFFFFFFu);
+  return f;
+}
+
+std::uint64_t comm_b_bds60(double heading_deg, double ias_kt, double mach, int baro_vr_fpm,
+                           int inertial_vr_fpm) noexcept {
+  std::uint64_t mb = 0;
+  auto put = [&](int first, int last, std::uint64_t v) {  // MB bits, 1-based
+    const int w = last - first + 1;
+    mb |= (v & ((std::uint64_t{1} << w) - 1)) << (56 - last);
+  };
+  double h = std::fmod(heading_deg, 360.0);
+  if (h < 0) h += 360.0;
+  auto hc = static_cast<std::int64_t>(std::lround(h * 512.0 / 90.0));
+  if (hc >= 1024) hc -= 2048;  // two's complement, sign in bit 2
+  put(1, 1, 1);
+  put(2, 12, static_cast<std::uint64_t>(hc) & 0x7FFu);
+  put(13, 13, 1);
+  put(14, 23, static_cast<std::uint64_t>(std::clamp<long>(std::lround(ias_kt), 0, 1023)));
+  put(24, 24, 1);
+  put(25, 34, static_cast<std::uint64_t>(std::clamp<long>(std::lround(mach / 0.004), 0, 1023)));
+  auto vr = [&](int first, int fpm) {
+    const auto c = static_cast<std::int64_t>(std::lround(fpm / 32.0));
+    put(first, first, 1);
+    put(first + 1, first + 10, static_cast<std::uint64_t>(c) & 0x3FFu);  // sign + 9 bits
+  };
+  vr(35, baro_vr_fpm);
+  vr(46, inertial_vr_fpm);
+  return mb;
 }
 
 Frame encode_df4(std::uint32_t icao, std::int32_t alt_ft, unsigned fs) noexcept {

@@ -47,7 +47,7 @@ The 3D globe keeps its 2 s poll of `/api/aircraft/enriched` while in sync, but o
 
 Served by the Fall 2025 `server.js`, there is no protocol module, so the page polls as before.
 
-`/api/aircraft`, `/api/aircraft/:hex/trail` (from an in-memory ring of 200 positions per aircraft), `/api/statistics` and `/api/health` are answered from memory in the Fall 2025 JSON shapes. Aircraft objects also carry the feed v1 fields the Fall 2025 API did not have: `heading` (degrees) with `heading_ref` (`true`/`magnetic`), `airspeed` (kt) with `airspeed_type` (`tas`/`ias`), `nic` and `adsb_version` (null when unknown). `/api/collisions/kalman` returns an empty list: the gateway does not run the Fall 2025 collision model.
+`/api/aircraft`, `/api/aircraft/:hex/trail` (from an in-memory ring of 200 positions per aircraft), `/api/statistics` and `/api/health` are answered from memory in the Fall 2025 JSON shapes. Aircraft objects also carry the feed v1 fields the Fall 2025 API did not have: `heading` (degrees) with `heading_ref` (`true`/`magnetic`), `airspeed` (kt) with `airspeed_type` (`tas`/`ias`) and `air_data_source` (`adsb`/`comm_b`), `nic`, `adsb_version`, `nac_p`, `sil` with `sil_type` (`per_hour`/`per_sample`) and `nuc_p` (null when unknown). `/api/collisions/kalman` returns an empty list: the gateway does not run the Fall 2025 collision model.
 
 Static files: only known file types are served, never dotfiles (`ads/.env` holds the database password) or `node_modules`, and nothing outside the map directory.
 
@@ -98,7 +98,7 @@ The server accepts client messages up to 64 KiB.
 ## Tests
 
 ```bash
-cd gateway && node --test test/*.test.mjs          # 69 tests, about 6 s
+cd gateway && node --test test/*.test.mjs          # about 80 tests, about 10 s
 gateway/scripts/check-gateway.sh core/build/release # integration against the C++ publisher (26 checks)
 ```
 

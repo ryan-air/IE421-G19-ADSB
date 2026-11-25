@@ -176,6 +176,11 @@ inline f4 load4(const float* p) noexcept {
 }
 inline void store4(float* p, f4 v) noexcept { std::memcpy(p, &v, sizeof v); }
 inline f4 splat4(float x) noexcept { return f4{x, x, x, x}; }
+using i4 = std::int32_t __attribute__((vector_size(16)));
+// Lane-wise mask ? a : b (mask lanes all ones or all zeros, as comparisons give).
+inline f4 select4(i4 mask, f4 a, f4 b) noexcept {
+  return std::bit_cast<f4>((std::bit_cast<i4>(a) & mask) | (std::bit_cast<i4>(b) & ~mask));
+}
 
 // Correctly rounded square root of each lane (IEEE: equal to std::sqrt).
 inline f4 sqrt4(f4 v) noexcept {
@@ -520,6 +525,32 @@ struct Demodulator::Impl {
   std::vector<float> w4;            // [(phase * kMaxChips + chip) * 4]
   std::vector<std::int32_t> first4;  // [phase * kMaxChips + chip]
 
+  // Steps 2's preamble test for four phases at once, one per lane (fixed4
+  // only): the phases of group g are 4g .. 4g + 3. A chip of the four
+  // starts at sample lane_first[g * 16 + c] or one later (lane_late, all
+  // ones in that lane), as the phases are less than a sample apart; its
+  // weights are lane_w[((g * 16 + c) * 4 + j) * 4 + lane].
+  int lane_groups = 0;
+  std::vector<std::int32_t> lane_first;
+  std::vector<std::int32_t> lane_late;  // [(g * 16 + c) * 4 + lane]
+  std::vector<float> lane_w;
+
+  // Preamble chip c of group g's four phases: in each lane the sum
+  // ((w0 x0 + w1 x1) + w2 x2) + w3 x3 that chip4() forms for that phase.
+  [[nodiscard]] f4 lane_chip(const float* m, std::ptrdiff_t t, int g, int c) const noexcept {
+    const std::size_t gc = static_cast<std::size_t>(g * kPreambleChips + c);
+    const float* x = m + t + lane_first[gc];
+    i4 late;
+    std::memcpy(&late, lane_late.data() + 4 * gc, sizeof late);
+    const float* w = lane_w.data() + 16 * gc;
+    const f4 s0 = splat4(x[0]), s1 = splat4(x[1]), s2 = splat4(x[2]), s3 = splat4(x[3]), s4 = splat4(x[4]);
+    const f4 p0 = load4(w) * select4(late, s1, s0);
+    const f4 p1 = load4(w + 4) * select4(late, s2, s1);
+    const f4 p2 = load4(w + 8) * select4(late, s3, s2);
+    const f4 p3 = load4(w + 12) * select4(late, s4, s3);
+    return ((p0 + p1) + p2) + p3;
+  }
+
   // Chips c .. c + 3 of a phase at once (fixed4 only). Each lane is
   // ((w0 x0 + w1 x1) + w2 x2) + w3 x3, the scalar chip()'s sum: the four
   // products of each chip are formed in place, then transposed so that the
@@ -602,6 +633,25 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
     for (std::size_t i = 0; i < im.chips.size(); ++i) {
       im.first4[i] = im.chips[i].first;
       for (std::uint32_t j = 0; j < im.chips[i].count; ++j) im.w4[4 * i + j] = im.weights[im.chips[i].off + j];
+    }
+    im.lane_groups = im.phases / 4;
+    const auto groups = static_cast<std::size_t>(im.lane_groups);
+    im.lane_first.assign(groups * kPreambleChips, 0);
+    im.lane_late.assign(groups * kPreambleChips * 4, 0);
+    im.lane_w.assign(groups * kPreambleChips * 16, 0.0f);
+    for (std::size_t g = 0; g < groups; ++g) {
+      for (std::size_t c = 0; c < kPreambleChips; ++c) {
+        const std::size_t gc = g * kPreambleChips + c;
+        const std::int32_t f = im.first4[4 * g * kMaxChips + c];
+        im.lane_first[gc] = f;
+        for (std::size_t lane = 0; lane < 4; ++lane) {
+          const std::size_t idx = (4 * g + lane) * kMaxChips + c;
+          const std::int32_t d = im.first4[idx] - f;
+          if (d != 0 && d != 1) im.lane_groups = 0;  // not expected: the scalar test then
+          im.lane_late[4 * gc + lane] = d == 1 ? -1 : 0;
+          for (std::size_t j = 0; j < 4; ++j) im.lane_w[16 * gc + 4 * j + lane] = im.w4[4 * idx + j];
+        }
+      }
     }
   }
   // Gate (see Impl): a window of floor(chip) + 1 samples starting at the
@@ -1230,9 +1280,38 @@ void Demodulator::scan(bool final) {
     bool saw_unknown_address = false;
     int seq_phase = -1;
     float seq_quality = 0.0f;
+    // Steps 2's tests for the phases in lane groups: per lane the
+    // operations of the per-phase code below, in its order, for every phase
+    // (without the early exit after the signal test; the quiet chips of a
+    // phase that fails it are computed and ignored). Four phases' chains of
+    // dependent additions then run side by side.
+    alignas(16) float lane_signal[16], lane_quiet[16];
+    alignas(16) std::int32_t lane_pass[16];
+    for (int g = 0; g < im.lane_groups; ++g) {
+      f4 pmin = splat4(1e30f), psum = splat4(0.0f);
+      for (int c : kPulseChips) {
+        const f4 v = im.lane_chip(m, t, g, c);
+        pmin = select4(v < pmin, v, pmin);  // std::min(pmin, v)
+        psum += v;
+      }
+      const f4 signal = psum / splat4(4.0f * chip_len);
+      f4 qsum = splat4(0.0f);
+      for (int c : kQuietChips) qsum += im.lane_chip(m, t, g, c);
+      const f4 quiet = qsum / splat4(12.0f);
+      const i4 pass = ~(signal < splat4(min_signal)) & ~(pmin < quiet * splat4(pulse_quiet));
+      store4(lane_signal + 4 * g, signal);
+      store4(lane_quiet + 4 * g, quiet);
+      std::memcpy(lane_pass + 4 * g, &pass, sizeof pass);
+    }
     for (int p = 0; p < im.phases; ++p) {
       // Chip energies of this phase, filled as far as they are needed.
       alignas(16) float cv[kMaxChips];
+      float signal = 0.0f, quiet = 0.0f;
+      if (p < 4 * im.lane_groups) {
+        if (lane_pass[p] == 0) continue;
+        signal = lane_signal[p];
+        quiet = lane_quiet[p];
+      } else {
       float pulse[4];
       const int pb = p * kMaxChips;
       if (im.fixed4) {
@@ -1245,7 +1324,7 @@ void Demodulator::scan(bool final) {
         pmin = std::min(pmin, pulse[i]);
         psum += pulse[i];
       }
-      const float signal = psum / (4.0f * chip_len);
+      signal = psum / (4.0f * chip_len);
       if (signal < min_signal) continue;
       float quiet_chips[12];
       if (im.fixed4) {
@@ -1258,8 +1337,9 @@ void Demodulator::scan(bool final) {
       }
       float qsum = 0.0f;
       for (float q : quiet_chips) qsum += q;
-      const float quiet = qsum / 12.0f;
+      quiet = qsum / 12.0f;
       if (pmin < quiet * pulse_quiet) continue;
+      }
       any_preamble = true;
 
       // Step 3: bits. (The margin, the sum of |first - second half| in bit

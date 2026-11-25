@@ -36,6 +36,21 @@ bool json_value(const std::string& text, const std::string& key, std::string& ou
   return !out.empty();
 }
 
+// A device delivers cu8 in USB transfers of a multiple of 512 bytes.
+bool device_config_ok(const IqSourceConfig& c, std::string* why) {
+  auto fail = [&](const char* m) {
+    if (why) *why = m;
+    return false;
+  };
+  if (c.format != demod::SampleFormat::kCu8) return fail("an RTL-SDR delivers cu8 samples");
+  if ((c.block_samples * 2) % 512 != 0) {
+    return fail("an RTL-SDR's USB transfer must be a multiple of 512 bytes: block_samples must be a multiple of 256");
+  }
+  if (!rtl_rate_ok(c.sample_rate_hz)) return fail("an RTL-SDR's sample rate must be in 225-300 kHz or 0.9-3.2 MHz");
+  if (c.rtl.stall_timeout_ns < 1'000'000) return fail("rtl.stall_timeout_ns must be at least 1 ms");
+  return true;
+}
+
 bool ends_with(const std::string& s, const char* suffix) {
   const std::size_t n = std::strlen(suffix);
   return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
@@ -56,6 +71,7 @@ bool validate(const IqSourceConfig& c, std::string* why) {
   if (!(c.speed >= 0.0 && c.speed <= 200.0)) return fail("speed must be in [0, 200] (0 = unpaced)");
   if (c.speed > 0 && c.speed < 1e-3) return fail("speed must be at least 0.001 (or 0 = unpaced)");
   if (c.timing_window < 1 || c.timing_window > 65536) return fail("timing_window must be in [1, 65536]");
+  if (parse_rtlsdr_path(c.path) && !device_config_ok(c, why)) return false;
   return demod::validate(demod_config(c), why);
 }
 
@@ -110,6 +126,7 @@ IqSource::IqSource(IqSourceConfig cfg)
 
 IqSource::~IqSource() {
   join_reader();
+  finish_device();
   if (own_in_ && in_) std::fclose(in_);
 }
 
@@ -118,6 +135,7 @@ bool IqSource::open(std::string* error) {
     if (error) *error = invalid_why_;
     return false;
   }
+  if (device_ || parse_rtlsdr_path(cfg_.path)) return open_device(error);
   if (cfg_.path == "-") {
     in_ = stdin;
     own_in_ = false;
@@ -134,6 +152,12 @@ bool IqSource::open(std::string* error) {
 
 void IqSource::start_reader(const std::atomic<bool>& stop) {
   reader_done_.store(false);
+  if (device_open_) {
+    stop_ = &stop;
+    last_transfer_ns_.store(mono_ns(), std::memory_order_relaxed);
+    reader_ = std::thread([this, &stop] { device_loop(stop); });
+    return;
+  }
   if (!in_) {  // open() was not called or failed: nothing to read
     read_error_.store(true);
     reader_done_.store(true, std::memory_order_release);
@@ -244,8 +268,141 @@ IqSourceStats IqSource::stats() const noexcept {
   s.frames = frames_;
   s.time_clamped = clamped_;
   s.read_error = read_error_.load();
+  s.device = device_mode_;
   s.demod = demod_.stats();
   return s;
+}
+
+// ---------------------------------------------------------------------------
+// Device input
+// ---------------------------------------------------------------------------
+
+bool IqSource::open_device(std::string* error) {
+  if (!device_config_ok(cfg_, error)) return false;
+  // The device from the path ("rtlsdr" = index 0); a device handed over
+  // with use_device() under another name opens as index 0.
+  std::string dev_name = "0";
+  (void)parse_rtlsdr_path(cfg_.path, &dev_name);
+  if (!device_) {
+    device_ = make_librtlsdr_device();
+    if (!device_) {
+      if (error) {
+        *error = "built without librtlsdr (install librtlsdr-dev and pkg-config, then configure with -DADSB_RTLSDR=ON)";
+      }
+      return false;
+    }
+  }
+  if (!device_->open(dev_name, error)) return false;
+  device_open_ = true;
+  if (!configure_rtl(*device_, cfg_.rtl, cfg_.sample_rate_hz, &info_, error)) {
+    finish_device();
+    return false;
+  }
+  if (!(device_->pace() > 0)) {
+    if (error) *error = "device pace must be > 0";
+    finish_device();
+    return false;
+  }
+  device_mode_ = true;
+  // A live receiver: frames are timed by arrival, at the device's pace.
+  arrival_clock_ = true;
+  ns_per_sample_ = 1e9 / (cfg_.sample_rate_hz * device_->pace());
+  return true;
+}
+
+void IqSource::device_loop(const std::atomic<bool>& stop) {
+  int r = 0;
+  if (!stop.load(std::memory_order_relaxed)) {
+    r = device_->read_async(&IqSource::on_transfer, this, cfg_.rtl.usb_buffers,
+                            static_cast<std::uint32_t>(ring_->block_bytes()));
+  } else {
+    cancel_requested_.store(true);
+  }
+  if (r == RtlDevice::kEndOfInput) {
+    // The test device's file ended: a clean end, like a file.
+  } else if (r < 0) {
+    error_ = "reading from the device failed (librtlsdr error " + std::to_string(r) + ")";
+    read_error_.store(true);
+  } else if (!cancel_requested_.load()) {
+    // librtlsdr returns 0 on its own when the device is lost.
+    error_ = "the device stopped delivering samples (unplugged?)";
+    read_error_.store(true);
+  }
+  reader_done_.store(true, std::memory_order_release);
+}
+
+void IqSource::on_transfer(unsigned char* buf, std::uint32_t len, void* ctx) {
+  static_cast<IqSource*>(ctx)->transfer(buf, len);
+}
+
+// The USB callback: copy into free blocks, never wait.
+void IqSource::transfer(const unsigned char* buf, std::size_t len) noexcept {
+  const std::uint64_t now = mono_ns();
+  last_transfer_ns_.store(now, std::memory_order_relaxed);
+  if (stop_->load(std::memory_order_relaxed)) {
+    request_cancel();
+    return;
+  }
+  const std::size_t block_bytes = ring_->block_bytes();
+  std::size_t off = 0;
+  while (len - off >= 2) {
+    const std::size_t chunk = std::min(len - off, block_bytes) & ~std::size_t{1};
+    const std::size_t n = chunk / 2;
+    ++blocks_;
+    samples_ += n;
+    IqBlock* slot = ring_->acquire();
+    if (slot) {
+      std::memcpy(slot->data, buf + off, chunk);
+      slot->samples = n;
+      slot->first_sample = index_;
+      slot->host_ns = now;
+      ring_->commit();
+    } else {
+      ++blocks_dropped_;
+      samples_dropped_ += n;
+    }
+    index_ += n;
+    off += chunk;
+  }
+}
+
+void IqSource::request_cancel() noexcept {
+  cancel_requested_.store(true);
+  (void)device_->cancel_async();
+}
+
+// Consumer side, every loop: on stop or a stall, cancel (repeated every
+// 10 ms: librtlsdr ignores a cancel that comes before streaming started).
+void IqSource::poll_device(const std::atomic<bool>& stop, bool idle) noexcept {
+  if (reader_done_.load(std::memory_order_relaxed)) return;
+  const bool stopping = stop.load(std::memory_order_relaxed);
+  if (!stopping && !stalled_ && !idle) return;
+  const std::uint64_t now = mono_ns();
+  if (!stopping && !stalled_) {
+    const std::uint64_t last = last_transfer_ns_.load(std::memory_order_relaxed);
+    if (now <= last || now - last <= cfg_.rtl.stall_timeout_ns) return;
+    stalled_ = true;
+    read_error_.store(true);
+  }
+  if (last_cancel_ns_ == 0 || now - last_cancel_ns_ >= 10'000'000) {
+    last_cancel_ns_ = now;
+    request_cancel();
+  }
+}
+
+// After the reader has been joined: the device is closed on this thread, so
+// no cancel can race with it.
+void IqSource::finish_device() {
+  if (stalled_ && error_.empty()) {
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "no samples from the device for %.1f s",
+                  static_cast<double>(cfg_.rtl.stall_timeout_ns) * 1e-9);
+    error_ = buf;
+  }
+  if (device_open_) {
+    device_->close();
+    device_open_ = false;
+  }
 }
 
 }  // namespace adsb::ingest

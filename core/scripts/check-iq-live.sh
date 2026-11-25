@@ -16,6 +16,9 @@
 #     trade-off of README_UPDATES.md §5.1, simulated)
 #   * overload: input 100 times faster than real time loses whole blocks,
 #     counted, and the pipeline keeps going
+#   * RTL-SDR device path, with the test device (--iq fake:FILE): the same
+#     frames, a USB error / unplug / stall each exit 1 with a message,
+#     SIGTERM stops cleanly, and --iq rtlsdr without a dongle fails cleanly
 set -euo pipefail
 
 BUILD="${1:?usage: check-iq-live.sh BUILD_DIR}"
@@ -109,6 +112,47 @@ dropped=$(num "$WORK/o.txt" "[0-9]+ blocks dropped")
 frames=$(num "$WORK/o.txt" "^demod +[0-9]+ frames")
 check "100x real time: blocks dropped and counted ($dropped)" '(( dropped > 0 ))'
 check "and the frames that remain decode ($frames)" '(( frames > 0 ))'
+
+echo "== RTL-SDR source (test device)"
+# --iq fake:FILE is a TESTING ONLY stand-in for a dongle: it plays the file
+# through the same device path as --iq rtlsdr (librtlsdr's read_async
+# callback -> block ring), in USB-sized transfers, and can fail on request.
+"$T/adsb-live" --iq "fake:$WORK/s.sigmf-meta" --iq-speed 4 --iq-buffers 256 --stats-every 0 --quiet \
+  --record "$WORK/f.adsbrec" >"$WORK/f.txt"
+payloads "$WORK/f.adsbrec" >"$WORK/f.hex"
+sed 's/^/    /' <(field "$WORK/f.txt" "source ") <(field "$WORK/f.txt" "iq ")
+fd=$(num "$WORK/f.txt" "[0-9]+ transfers dropped")
+if [[ "$fd" == 0 ]]; then
+  check "device path: the recording holds adsb-demod's frames, in order" 'cmp -s "$WORK/demod.hex" "$WORK/f.hex"'
+else
+  check "device path: $fd transfers dropped and counted (a stalled machine)" '[[ -s "$WORK/f.hex" ]]'
+fi
+rc=0
+"$T/adsb-live" --iq "fake:$WORK/s.sigmf-meta" --iq-speed 4 --fake-error-after 327680 --stats-every 0 \
+  >"$WORK/fe.txt" 2>"$WORK/fe.err" || rc=$?
+check "a USB error ends the run with exit 1 and says so" '(( rc == 1 )) && grep -q "device error" "$WORK/fe.err"'
+rc=0
+"$T/adsb-live" --iq "fake:$WORK/s.sigmf-meta" --iq-speed 4 --fake-unplug-after 327680 --stats-every 0 \
+  >"$WORK/fu.txt" 2>"$WORK/fu.err" || rc=$?
+check "an unplugged device ends the run with exit 1" '(( rc == 1 )) && grep -q "stopped delivering" "$WORK/fu.err"'
+rc=0
+s0=$SECONDS
+"$T/adsb-live" --iq "fake:$WORK/s.sigmf-meta" --iq-speed 4 --fake-stall-after 327680 --rtl-stall-s 0.3 \
+  --stats-every 0 >"$WORK/fs.txt" 2>"$WORK/fs.err" || rc=$?
+check "a stalled device is given up (exit 1, $((SECONDS - s0)) s)" \
+  '(( rc == 1 && SECONDS - s0 < 10 )) && grep -q "no samples from the device" "$WORK/fs.err"'
+# SIGTERM (a background job from a script ignores SIGINT) stops it cleanly.
+"$T/adsb-live" --iq "fake:$WORK/s.sigmf-meta" --iq-speed 1 --stats-every 0 >"$WORK/ft.txt" 2>"$WORK/ft.err" &
+FPID=$!
+sleep 1
+kill -TERM "$FPID"
+rc=0
+wait "$FPID" || rc=$?
+check "SIGTERM cancels the transfers: exit 0, stopped" '(( rc == 0 )) && grep -q "stopped" "$WORK/ft.err"'
+rc=0
+"$T/adsb-live" --iq rtlsdr:0 --stats-every 0 >"$WORK/fr.txt" 2>"$WORK/fr.err" || rc=$?
+sed 's/^/    /' "$WORK/fr.err" | head -3
+check "--iq rtlsdr without a dongle (or without librtlsdr) fails with a message" '(( rc != 0 )) && [[ -s "$WORK/fr.err" ]]'
 
 echo
 echo "$PASS passed, $FAIL failed"

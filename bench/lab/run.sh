@@ -318,6 +318,7 @@ step_host() {
     command -v "$t" >/dev/null && echo "$t: $("$t" --version 2>&1 | head -1)" || echo "$t: missing"
   done
   pkg-config --modversion liburing 2>/dev/null || echo "liburing: missing (io_uring transport not built)"
+  pkg-config --modversion librtlsdr 2>/dev/null || echo "librtlsdr: missing (live RTL-SDR source not built)"
 }
 
 step_build() {
@@ -327,7 +328,7 @@ step_build() {
     cmake --preset "$p" -DADSB_WERROR=ON
     cmake --build --preset "$p" -j"$(nproc)"
   done
-  grep -E "ADSB_HAVE_(IO_URING|AF_XDP)" build/release/CMakeCache.txt || true
+  grep -E "ADSB_HAVE_(IO_URING|AF_XDP)|LIBRTLSDR_FOUND" build/release/CMakeCache.txt || true
 }
 
 step_test() {

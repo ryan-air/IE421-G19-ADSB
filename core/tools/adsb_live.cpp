@@ -1,5 +1,6 @@
 // adsb-live: run the pipeline on a live Beast feed (readsb / dump1090), or
-// on raw IQ samples through our own demodulator (--iq).
+// on raw IQ samples through our own demodulator (--iq), from a file, stdin
+// or a live RTL-SDR (--iq rtlsdr[:INDEX|:SERIAL], librtlsdr).
 //
 //   adsb-live [--host 127.0.0.1] [--port 30005] [--record FILE.adsbrec]
 //             [--duration SECONDS] [--receiver LAT,LON] [--stats-every SECONDS]
@@ -53,6 +54,7 @@
 #include "adsb/ingest/arbiter.hpp"
 #include "adsb/ingest/beast_tcp.hpp"
 #include "adsb/ingest/iq_source.hpp"
+#include "adsb/ingest/rtl_device.hpp"
 #include "adsb/record/recording.hpp"
 #include "adsb/state/track_engine.hpp"
 
@@ -104,6 +106,21 @@ void on_signal(int) { g_stop.store(true); }
                "  --iq-first-arrival US echoes: a frame whose direct path failed up to US earlier takes its\n"
                "                        time (default 40; 0 = off)\n"
                "  --iq-duplicate-window US  drop copies of a frame within US (long echoes; default 200, 0 = off)\n"
+               "live RTL-SDR (--iq rtlsdr, rtlsdr:INDEX or rtlsdr:SERIAL; needs a build with librtlsdr):\n"
+               "                        reads the dongle with librtlsdr's read_async; each USB transfer of\n"
+               "                        --iq-block samples (x2 bytes, a multiple of 512) goes into the next free\n"
+               "                        --iq-buffers block, or is dropped and counted; --iq-rate sets the rate\n"
+               "  --rtl-gain DB|max|auto tuner gain: the nearest supported step, the highest one (default,\n"
+               "                        like readsb and dump1090-fa), or the tuner's own AGC\n"
+               "  --rtl-freq HZ         centre frequency (default 1090e6)\n"
+               "  --rtl-ppm N           crystal correction in ppm (default 0)\n"
+               "  --rtl-agc             the RTL2832's digital AGC (readsb --enable-agc)\n"
+               "  --rtl-bias-tee        power an LNA through the antenna cable\n"
+               "  --rtl-usb-buffers N   librtlsdr transfer buffers (default 0 = its default, 15)\n"
+               "  --rtl-stall-s S       no transfer for this long = a dead device, exit 1 (default 3)\n"
+               "  TESTING ONLY: --iq fake:FILE plays a cu8 file (or cu8 SigMF) through the same device path,\n"
+               "                        paced at --iq-speed; --fake-error-after B, --fake-unplug-after B and\n"
+               "                        --fake-stall-after B make it fail, vanish or stall after B bytes\n"
                "overload (README_UPDATES.md §10.1):\n"
                "  --overload drop|block when decode/state falls behind: drop the frame at the input and\n"
                "                        count it (default), or stop reading the socket until it catches up\n"
@@ -190,7 +207,8 @@ int main(int argc, char** argv) {
   adsb::ingest::BeastTcpConfig src_cfg;
   adsb::ingest::IqSourceConfig iq_cfg;
   std::string iq_path, iq_format;
-  bool iq_rate_given = false;
+  bool iq_rate_given = false, iq_speed_given = false;
+  adsb::ingest::FakeRtlOptions fake_opt;
   adsb::state::EngineConfig eng_cfg;
   std::string record_path;
   double duration_s = 0, stats_every_s = 10;
@@ -256,7 +274,25 @@ int main(int argc, char** argv) {
     else if (a == "--iq-rate") { iq_cfg.sample_rate_hz = std::strtod(val().c_str(), nullptr); iq_rate_given = true; }
     else if (a == "--iq-block") iq_cfg.block_samples = std::strtoull(val().c_str(), nullptr, 10);
     else if (a == "--iq-buffers") iq_cfg.buffers = std::strtoull(val().c_str(), nullptr, 10);
-    else if (a == "--iq-speed") iq_cfg.speed = std::strtod(val().c_str(), nullptr);
+    else if (a == "--iq-speed") { iq_cfg.speed = std::strtod(val().c_str(), nullptr); iq_speed_given = true; }
+    else if (a == "--rtl-gain") {
+      if (!adsb::ingest::parse_rtl_gain(val(), iq_cfg.rtl.gain, iq_cfg.rtl.gain_db)) usage(1);
+    } else if (a == "--rtl-freq") iq_cfg.rtl.freq_hz = std::strtod(val().c_str(), nullptr);
+    else if (a == "--rtl-ppm") iq_cfg.rtl.ppm = static_cast<int>(std::strtol(val().c_str(), nullptr, 10));
+    else if (a == "--rtl-agc") iq_cfg.rtl.agc = true;
+    else if (a == "--rtl-bias-tee") iq_cfg.rtl.bias_tee = true;
+    else if (a == "--rtl-usb-buffers") {
+      const long n = std::strtol(val().c_str(), nullptr, 10);
+      if (n < 0 || n > 1024) usage(1);
+      iq_cfg.rtl.usb_buffers = static_cast<std::uint32_t>(n);
+    } else if (a == "--rtl-stall-s") {
+      const double v = std::strtod(val().c_str(), nullptr);
+      if (!(v >= 0.001 && v <= 3600)) usage(1);
+      iq_cfg.rtl.stall_timeout_ns = static_cast<std::uint64_t>(v * 1e9);
+    }
+    else if (a == "--fake-error-after") fake_opt.error_after_bytes = std::strtoull(val().c_str(), nullptr, 10);
+    else if (a == "--fake-unplug-after") fake_opt.unplug_after_bytes = std::strtoull(val().c_str(), nullptr, 10);
+    else if (a == "--fake-stall-after") fake_opt.stall_after_bytes = std::strtoull(val().c_str(), nullptr, 10);
     else if (a == "--iq-fix") iq_cfg.demod.fix_single_bit = true;
     else if (a == "--iq-first-arrival") iq_cfg.demod.first_arrival_us = std::strtod(val().c_str(), nullptr);
     else if (a == "--iq-duplicate-window") iq_cfg.demod.duplicate_window_us = std::strtod(val().c_str(), nullptr);
@@ -328,6 +364,63 @@ int main(int argc, char** argv) {
                      adsb::ingest::IqSourceConfig& cfg) -> std::unique_ptr<adsb::ingest::IqSource> {
     std::string err;
     cfg.path = path;
+    // A live RTL-SDR (or the test device that stands in for one).
+    const bool fake = path.starts_with("fake:");
+    if (adsb::ingest::parse_rtlsdr_path(path) || fake) {
+      if (!iq_format.empty() && iq_format != "cu8") {
+        std::fprintf(stderr, "adsb-live: an RTL-SDR delivers cu8 (--iq-format does not apply)\n");
+        return nullptr;
+      }
+      if (cfg.drop_when_full || (iq_speed_given && !fake)) {
+        std::fprintf(stderr, "adsb-live: --iq-speed / --iq-drop do not apply to a live RTL-SDR (it always drops when full)\n");
+        return nullptr;
+      }
+      cfg.format = adsb::demod::SampleFormat::kCu8;
+      cfg.line = line;
+      std::unique_ptr<adsb::ingest::FakeRtlDevice> dev;
+      if (fake) {
+        adsb::ingest::FakeRtlOptions fo = fake_opt;
+        fo.path = path.substr(5);
+        if (fo.path.ends_with(".sigmf-meta") || fo.path.ends_with(".sigmf-data")) {
+          double rate = 0;
+          adsb::demod::SampleFormat f{};
+          std::string data;
+          if (!adsb::ingest::read_sigmf(fo.path, data, f, rate, &err)) {
+            std::fprintf(stderr, "adsb-live: %s\n", err.c_str());
+            return nullptr;
+          }
+          if (f != adsb::demod::SampleFormat::kCu8) {
+            std::fprintf(stderr, "adsb-live: %s: the fake device plays cu8 only\n", fo.path.c_str());
+            return nullptr;
+          }
+          fo.path = data;
+          if (!iq_rate_given) cfg.sample_rate_hz = rate;
+        }
+        if (!(cfg.speed > 0)) {
+          std::fprintf(stderr, "adsb-live: the fake device needs --iq-speed > 0\n");
+          return nullptr;
+        }
+        fo.speed = cfg.speed;
+        dev = std::make_unique<adsb::ingest::FakeRtlDevice>(fo);
+      } else {
+        cfg.speed = 1;
+      }
+      if (!adsb::ingest::validate(cfg, &err)) {
+        std::fprintf(stderr, "adsb-live: %s: %s\n", path.c_str(), err.c_str());
+        return nullptr;
+      }
+      auto src = std::make_unique<adsb::ingest::IqSource>(cfg);
+      if (dev) src->use_device(std::move(dev));
+      if (!src->open(&err)) {
+        std::fprintf(stderr, "adsb-live: %s: %s\n", path.c_str(), err.c_str());
+        return nullptr;
+      }
+      if (!quiet) {
+        std::fprintf(stderr, "adsb-live: %s: %s\n", path.c_str(),
+                     adsb::ingest::rtl_info_text(src->device_info()).c_str());
+      }
+      return src;
+    }
     const bool sigmf = path.size() > 11 && (path.ends_with(".sigmf-meta") || path.ends_with(".sigmf-data"));
     if (sigmf) {
       double rate = 0;
@@ -748,7 +841,23 @@ int main(int argc, char** argv) {
       l.resize(std::max<std::size_t>(l.size() + 1, 12), ' ');
       return l;
     };
-    if (iq) {
+    if (iq && iq->device_mode()) {
+      const auto q = iq->stats();
+      input_frames += q.frames;
+      std::printf("%sRTL-SDR %s: %s; %zu-sample transfers, %zu buffers%s%s\n", lab("source").c_str(), ic.path.c_str(),
+                  adsb::ingest::rtl_info_text(iq->device_info()).c_str(), ic.block_samples, ic.buffers,
+                  q.read_error ? " DEVICE ERROR: " : "", q.read_error ? iq->error_text().c_str() : "");
+      std::printf("%s%llu transfers (%llu samples, %.2f s), %llu transfers dropped (%llu samples, %.4f%%), "
+                  "ring high water %llu of %zu\n",
+                  lab("iq").c_str(), u(q.blocks), u(q.samples), static_cast<double>(q.samples) / ic.sample_rate_hz,
+                  u(q.blocks_dropped), u(q.samples_dropped),
+                  q.samples ? 100.0 * static_cast<double>(q.samples_dropped) / static_cast<double>(q.samples) : 0.0,
+                  u(q.ring_high_water), ic.buffers);
+      std::printf("%s%llu frames (%llu by the sequence detector, %llu fixed), %llu preambles, %llu failed; "
+                  "%llu frame times raised to stay monotonic\n",
+                  lab("demod").c_str(), u(q.demod.frames), u(q.demod.sequence_decoded), u(q.demod.corrected), u(q.demod.preambles),
+                  u(q.demod.bad_crc), u(q.time_clamped));
+    } else if (iq) {
       const auto q = iq->stats();
       input_frames += q.frames;
       std::printf("%sIQ %s (%s, %.3f MS/s, %zu-sample blocks, %zu buffers, %s)%s\n", lab("source").c_str(), ic.path.c_str(),
@@ -835,5 +944,15 @@ int main(int argc, char** argv) {
   std::printf("latency (receive -> track state updated%s, per frame):\n", pub ? " and published" : "");
   print_hist("queue wait", *queue_wait);
   print_hist(iq_mode ? "last sample -> state" : "receive -> state done", *recv_to_state);
-  return rec_ok && !conf_failed ? 0 : 1;
+  // An IQ input that failed (a read error, a device error or a lost device)
+  // fails the run.
+  bool iq_failed = false;
+  for (adsb::ingest::IqSource* iq : {iq_source.get(), iq_source_b.get()}) {
+    if (iq && iq->stats().read_error) {
+      std::fprintf(stderr, "adsb-live: %s: %s\n", iq->config().path.c_str(),
+                   iq->error_text().empty() ? "read error" : iq->error_text().c_str());
+      iq_failed = true;
+    }
+  }
+  return rec_ok && !conf_failed && !iq_failed ? 0 : 1;
 }

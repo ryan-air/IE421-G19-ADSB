@@ -35,6 +35,16 @@
 // recording, and the latency report means nothing. rx_ns never decreases from one frame to the next
 // (it is raised to the previous one's when needed, and counted). radio_ts is the sample position on a 12 MHz
 // clock, like readsb's Beast timestamps for file input.
+//
+// Live RTL-SDR (path "rtlsdr", "rtlsdr:INDEX" or "rtlsdr:SERIAL", or a
+// device handed over with use_device()): the reader thread runs the
+// device's read_async; its callback copies each USB transfer into the next
+// free block (cu8, `block_samples` * 2 bytes per transfer, a multiple of
+// 512) and stamps the arrival, or drops and counts it when the ring is full.
+// It never waits. Frames are timed by arrival, as for a live pipe. The run
+// ends on `stop` (the consumer cancels the transfers), when the device
+// fails or is unplugged (read_async returns on its own), or when no transfer
+// arrived for rtl.stall_timeout_ns; the last two are errors (error_text()).
 
 #include <atomic>
 #include <chrono>
@@ -52,6 +62,7 @@
 #include "adsb/common/clock.hpp"
 #include "adsb/demod/demod.hpp"
 #include "adsb/ingest/iq_ring.hpp"
+#include "adsb/ingest/rtl_device.hpp"
 #include "adsb/record/recording.hpp"
 
 namespace adsb::ingest {
@@ -69,6 +80,7 @@ struct IqSourceConfig {
   bool drop_when_full = false;
   std::uint8_t line = 0;                  // receiver line id stamped on records
   std::size_t timing_window = 64;         // blocks in the arrival-time envelope
+  RtlConfig rtl;                          // live RTL-SDR (path "rtlsdr[:INDEX|:SERIAL]")
 };
 
 [[nodiscard]] bool validate(const IqSourceConfig& cfg, std::string* why = nullptr);
@@ -87,7 +99,8 @@ struct IqSourceStats {
   std::uint64_t max_lateness_ns = 0;      // paced: a block later than its due time, at most
   std::uint64_t frames = 0;               // handed to the sink
   std::uint64_t time_clamped = 0;         // frames whose rx_ns was raised to keep time monotonic
-  bool read_error = false;
+  bool read_error = false;                // a file read error, or a device error (error_text())
+  bool device = false;                    // streamed from a device (blocks = USB transfers)
   demod::DemodStats demod{};
 };
 
@@ -98,6 +111,12 @@ class IqSource {
   IqSource(const IqSource&) = delete;
   IqSource& operator=(const IqSource&) = delete;
 
+  // Streams from this device instead of the path (before open(); the tests'
+  // fake device, adsb-live's --iq fake:FILE). A path "rtlsdr[:...]" opens a
+  // real one through librtlsdr.
+  void use_device(std::unique_ptr<RtlDevice> dev) noexcept { device_ = std::move(dev); }
+
+  // Opens the file, or opens and configures the device.
   [[nodiscard]] bool open(std::string* error);
 
   // Runs until the input ends or `stop` is set; calls sink(const Record&)
@@ -111,6 +130,7 @@ class IqSource {
     std::uint64_t idle = 0;
     for (;;) {
       const IqBlock* b = ring_->peek();
+      if (device_mode_) poll_device(stop, b == nullptr);
       if (b == nullptr) {
         if (reader_done_.load(std::memory_order_acquire)) {
           b = ring_->peek();
@@ -134,8 +154,14 @@ class IqSource {
       ring_->release();
     }
     join_reader();
+    finish_device();
     emit(demod_.flush(), sink);
-    on_status(read_error_.load() ? "read error" : "end of input");
+    if (device_mode_) {
+      const std::string end = read_error_.load() ? "device error: " + error_ : stop.load() ? "stopped" : "end of input";
+      on_status(end.c_str());
+    } else {
+      on_status(read_error_.load() ? "read error" : "end of input");
+    }
   }
 
   template <typename Sink>
@@ -146,6 +172,11 @@ class IqSource {
   // Read after run() returns.
   [[nodiscard]] IqSourceStats stats() const noexcept;
   [[nodiscard]] const IqSourceConfig& config() const noexcept { return cfg_; }
+  [[nodiscard]] bool device_mode() const noexcept { return device_mode_; }
+  // What the device runs at (after open()).
+  [[nodiscard]] const RtlInfo& device_info() const noexcept { return info_; }
+  // Why the run ended with an error (after run(); empty otherwise).
+  [[nodiscard]] const std::string& error_text() const noexcept { return error_; }
   // Host time (mono_ns) of absolute sample index i, from the envelope.
   [[nodiscard]] std::uint64_t host_ns_of(double sample) const noexcept {
     const double t = offset_ns_ + sample * ns_per_sample_;
@@ -157,6 +188,13 @@ class IqSource {
   void join_reader();
   void reader_loop(const std::atomic<bool>& stop);
   void note_arrival(const IqBlock& b) noexcept;
+  bool open_device(std::string* error);
+  void device_loop(const std::atomic<bool>& stop);
+  static void on_transfer(unsigned char* buf, std::uint32_t len, void* ctx);
+  void transfer(const unsigned char* buf, std::size_t len) noexcept;
+  void poll_device(const std::atomic<bool>& stop, bool idle) noexcept;
+  void request_cancel() noexcept;
+  void finish_device();
   record::Record to_record(const demod::DemodFrame& f) const noexcept;
 
   template <typename Sink>
@@ -195,6 +233,18 @@ class IqSource {
   double offset_ns_ = 0.0;
   std::vector<double> offsets_;           // ring of (arrival - end_sample * ns_per_sample)
   std::size_t n_offsets_ = 0;
+  // Device (live RTL-SDR or the test device).
+  std::unique_ptr<RtlDevice> device_;
+  RtlInfo info_;
+  bool device_mode_ = false;
+  bool device_open_ = false;
+  const std::atomic<bool>* stop_ = nullptr;        // for the transfer callback
+  std::atomic<bool> cancel_requested_{false};
+  std::atomic<std::uint64_t> last_transfer_ns_{0}; // reader -> consumer (stall check)
+  std::uint64_t index_ = 0;                        // reader: absolute index of the next sample
+  std::uint64_t last_cancel_ns_ = 0;               // consumer
+  bool stalled_ = false;                           // consumer
+  std::string error_;                              // reader (before reader_done_), consumer after join
 };
 
 }  // namespace adsb::ingest

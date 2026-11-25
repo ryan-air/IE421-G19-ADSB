@@ -29,6 +29,7 @@ set(ADSB_TEST_SOURCES
   test_demod.cpp
   test_carrier.cpp
   test_iq_source.cpp
+  test_rtl_source.cpp
 )
 
 add_executable(adsb_tests ${ADSB_TEST_SOURCES})

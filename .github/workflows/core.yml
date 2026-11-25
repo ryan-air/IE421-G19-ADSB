@@ -553,16 +553,19 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build g++-14 libncurses-dev zlib1g-dev libzstd-dev
+          sudo apt-get install -y ninja-build g++-14 libncurses-dev zlib1g-dev libzstd-dev librtlsdr-dev pkg-config
       # The same pinned readsb as the bench image (bench/legacy/Dockerfile),
       # without SDR libraries: it only reads IQ files.
       - name: Build readsb
         run: |
           git clone --depth 1 --branch v3.16.21 https://github.com/wiedehopf/readsb.git /tmp/readsb
           make -C /tmp/readsb -j"$(nproc)" RTLSDR=no
+      # ADSB_RTLSDR=ON: adsb-live is built with the real librtlsdr source
+      # (a missing librtlsdr fails the build); without a dongle on the runner
+      # only its "no device" path runs, the rest through the test device.
       - name: Build
         run: |
-          CXX=g++-14 cmake -S . -B build/iq -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF
+          CXX=g++-14 cmake -S . -B build/iq -G Ninja -DCMAKE_BUILD_TYPE=Release -DADSB_WERROR=ON -DADSB_BUILD_TESTS=OFF -DADSB_RTLSDR=ON
           cmake --build build/iq --target adsb-iqsynth adsb-demod adsb-live adsb-feed-cli adsb-carrier
       # Determinism and formats, then readsb decodes cu8 and cs16 files
       # (clean 15-30 dB messages >= 97%, timestamps within one sample),
@@ -576,7 +579,9 @@ jobs:
         run: scripts/check-demod.sh build/iq /tmp/readsb/readsb
       # adsb-live --iq: the same frames as adsb-demod (file and stdin), a
       # real-time run whose feed subscriber ends with the publisher's book,
-      # latency against block size, and blocks dropped and counted at 100x.
+      # latency against block size, blocks dropped and counted at 100x, and
+      # the RTL-SDR device path (test device: same frames, USB error, unplug,
+      # stall, SIGTERM; --iq rtlsdr:0 with no dongle fails cleanly).
       - name: IQ into the live pipeline
         run: scripts/check-iq-live.sh build/iq
       # Transponder frequency study (plan 22.5): adsb-carrier + carrier-study.py

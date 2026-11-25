@@ -33,6 +33,14 @@ sudo apt-get install -y build-essential cmake ninja-build pkg-config liburing-de
 
 Docker is needed only for the `legacy` step, and `rtl-sdr` (`sudo apt-get install -y rtl-sdr`) only for the `carrier` step.
 
+With `librtlsdr-dev` installed as well (`sudo apt-get install -y librtlsdr-dev`), the build includes the live RTL-SDR source, so the whole pipeline runs on the dongle (stop `rtl_sdr` or any other program using it first; Ctrl-C to stop; `--iq rtlsdr:SERIAL` picks a dongle by serial number):
+
+```bash
+core/build/release/tools/adsb-live --iq rtlsdr:0 --rtl-gain 40 --receiver LAT,LON --stats-every 10
+```
+
+The report's `source` line gives the tuner, actual rate and gain; its `iq` line the USB transfers dropped.
+
 First see what it would do. This changes nothing:
 
 ```bash

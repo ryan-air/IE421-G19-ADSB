@@ -277,7 +277,7 @@ Every start is within 0.14 samples (0.06 µs) of the truth, against readsb's 0.5
 
 At **2.0 MS/s** a half-bit is exactly one sample, and a frame that starts at a sample centre puts half of every pulse into each of two samples, so the half-bit comparison cannot read it (dump1090's 2 MS/s demodulator has the same blind phase). The sequence detector reads such frames when the signal is strong; in noise some are lost. Use 2.4 MS/s.
 
-**Speed** (one thread, M2 laptop; main and this version run alternately, 5 rounds, medians). Two rounds of work, each with byte-identical output: first removing waste found by profiling each stage, then four-wide SIMD (NEON on ARM64, SSE2 on x86-64, through the GCC/Clang vector extension):
+**Speed** (one thread, M2 laptop; main and this version run alternately, 5 rounds, medians). Three rounds of work, each with byte-identical output: first removing waste found by profiling each stage, then four-wide SIMD (NEON on ARM64, SSE2 on x86-64, through the GCC/Clang vector extension), then a third round (below) on dependency chains, branches and precomputed geometry:
 
 | Recording | First version | After profiling | Now (SIMD) | Real time |
 |---|---|---|---|---|
@@ -303,9 +303,41 @@ SIMD round:
 
 Every output field is byte-identical to the version before each round: the four recordings above and 29 more runs (2.0, 3, 8 and 12 MS/s, cs16, `--fix`, `--no-sequence`, 1 to 8 phases, every magnitude method) compared byte for byte against the previous build; two pinned hashes in `test_demod.cpp` that print every float field in `%a` (exact bits) plus the counts of the decisions on the way, one of them on weak signals where the sequence detector decides many frames; the pins match on macOS Clang and on Linux GCC 14 and Clang 18, ARM64 and x86-64. Independent reviews checked each claim. The first round's review caught two changes that were not identical (one moved the noise floor's rounding, one lost a real overlapping reply); both were reverted. The second round's review compared every frame field, in `%a`, on 15 more rates from 1.9 to 100 MS/s, random block sizes, gaps and truncated files, and found no difference. It also checked 2.6e10 cases of the fixed per-chip sample count. Its one finding was NaN passed straight to `feed_magnitudes()`, which now counts as silence as it does in `feed()`. Rejected because they were slower: keeping the template's shared sample in a register, gathering the detector's errors ahead of the recursion, a fixed number of sample slots per bit, and stopping the quiet sum early (their branches mispredict).
 
-readsb decodes the same 40 s recording at 5.35 ns per sample on this laptop (process time in Docker's Linux VM), so it is now about 1.13 times faster than us (1.8 before the SIMD round), and we decode more frames. Where the time goes now: preamble checks 26%, sequence detector 27%, timing 18%, bit reading and checks 10%, noise floor 10%, gate 6%, magnitudes 4%. Magnitudes alone: exact `sqrt` 0.42 ns per sample (vectorized), the classic 64K-entry, 128 KB lookup table 0.78 ns (it does not fit in L1, §5.2), alpha-max-beta-min 0.47 ns (`bench_demod.cpp`).
+readsb decodes the same 40 s recording at 5.35 ns per sample on this laptop (process time in Docker's Linux VM), so after the SIMD round it was about 1.13 times faster than us (1.8 before), and we decode more frames. Where the time went after the SIMD round: preamble checks 26%, sequence detector 27%, timing 18%, bit reading and checks 10%, noise floor 10%, gate 6%, magnitudes 4%. Magnitudes alone: exact `sqrt` 0.42 ns per sample (vectorized), the classic 64K-entry, 128 KB lookup table 0.78 ns (it does not fit in L1, §5.2), alpha-max-beta-min 0.47 ns (`bench_demod.cpp`).
 
 The plan's target of 10 cycles per sample (about 3 ns) is not met: what remains is serial by construction (the detector's path costs add sample by sample, in order) or would change the output (a cheaper second-stage test). Shortcuts measured and rejected because they lost frames: reading only the clearest phase in a frame's tail (−8 of 25,035) and skipping the detector there (one lost overlapping reply).
+
+Third round (after the first-arrival search, step 6, was added; byte-identical again). The processes of this round ran on a core clamped to about 1.5 ns per dependent float addition (an efficiency core, or a throttled one), so its absolute numbers are higher than the table above and cannot be compared with it or with readsb; the two builds were run alternately on the same core, 7–11 rounds, thread CPU time, medians (minima within 1%):
+
+| Recording | Before | After | Speed-up |
+|---|---|---|---|
+| 150 aircraft, 40 s, 2.4 MS/s | 11.00 ns/sample | 6.78 ns | 1.62× |
+| 150 aircraft, 20 s, noise figure 22 dB | 7.97 | 5.83 | 1.37× |
+| 200 aircraft, 6 s, 6 MS/s | 10.15 | 6.92 | 1.47× |
+| 400 aircraft, 10 s, 2.0 MS/s, reflector 3 dB down | 34.6 | 23.0 | 1.50× |
+| 100 aircraft, 6 s, 2.4 MS/s, multipath (ground 0.7 + reflector) | 9.96 | 6.69 | 1.49× |
+
+Per change, on the 40 s recording (median before → after):
+
+| Change | ns/sample |
+|---|---|
+| detector: one square root per distinct overlap (a phase's overlaps take 4–8 values) instead of one per sample | 10.99 → 10.45 |
+| timing: the trials are rel0 + j · step (\|j\| ≤ 14), so every trial's chip overlaps are computed at construction and stored per sample, in chip order; a trial forms each sample's template value and the dot and norm sums in one pass (tables over 8 MB keep the old loop) | 10.45 → 9.34 |
+| first arrival: the decoded copy's pulses only mark samples (a sum of positive overlaps is positive where any overlap is), built when a start is first tried; covered samples add +0.0 instead of branching | 9.23 → 9.04 |
+| noise floor: the 16 lowest of a block's 64 window means by a sorting network (Batcher, 63 comparators, on each lane), a transpose and three bitonic merges, no branches; the same values in the same order, so the same sum (the insertion was 0.9 µs per block) | 9.12 → 8.27 |
+| detector: the recursion's pace is its chain of dependent additions. The 1e30 guard is skipped by a predictable branch while no cost has reached 1e30, and the surviving cost is a minimum instruction (`fminnm`) instead of a compare and a select: equal costs are the same float and none is −0.0; when a cost can be NaN (a2 infinite, only from magnitudes near the float range) the select is kept | 8.27 → 7.78 |
+| timing table: two entries per sample instead of four (no sample meets more than two chips from 2 MS/s up), sums in local accumulators | 7.91 → 7.70 |
+| preamble: the 16 chips and both tests of four phases at once, one phase per lane (a chip of the four starts at the same sample or one later: a select per lane), the four phases' addition chains side by side; the fifth phase keeps the scalar code | 7.70 → 7.49 |
+| gate: window sums and their pairwise maximum in one pass | 7.48 → 7.39 |
+| bits: a byte at a time (deinterleave the half-bit chips, compare lane by lane, pack the masks), instead of a branch-prone loop per bit | 7.38 → 6.89 |
+
+Identity: 51 runs compared field by field in `%a` plus every statistic against the starting build (the four recordings above; multipath, far reflector, 1.9, 2.0, 6, 12 and 20 MS/s, cs16, `--fix`, `--no-sequence`, 1 to 16 phases, every magnitude method, `--first-arrival 0` and 80, random block sizes with gaps, and `feed_magnitudes()` with magnitudes scaled by 1e-38 to 1e37 or shifted negative, which reach the NaN and 1e30 paths), on ARM64 and on x86-64 (SSE2, the same 51 runs, identical to ARM64); the pins in `test_demod.cpp` are unchanged. The sorting network was also checked against the insertion on 2 million random blocks with ties, negative values and infinities, on both architectures.
+
+Rejected (slower or no gain, all identical): the detector's four hypotheses in the lanes of one vector with a byte-shuffle gather of the roots (+0.8% at best; slower once combined with the shorter chain, also with a two-register table, alternating lane orders and unrolled bit pairs), a fixed number of sample slots per bit in that version, a fixed number of trials per chip when marking the copy's pulses in step 6, a hand-written NEON magnitude loop (the compiler's is as fast, 0.42 ns per sample), and a first chip-by-chip version of the timing table (a third of the per-sample version's gain). Not tried: running two consecutive positions' detectors interleaved (a third of detector calls follow one at the previous position; their chains would overlap).
+
+Where the time goes now (this round's core, 40 s recording): preamble tests 32%, sequence detector 23%, magnitudes 7.5%, timing 7%, gate 7%, first arrival 6.5%, bits and checks 6%, noise floor 3.5%.
+
+If the third round's 1.37–1.62× held on the faster core the table above was measured on, the 40 s recording (with step 6, about 6.4 ns there before this round) would take about 4 ns per sample, below readsb's 5.35; that is not measured.
 
 ```bash
 ./build/release/tools/adsb-demod /tmp/scene.sigmf-meta --beast /tmp/scene.beast      # SigMF: format and rate from the metadata
@@ -313,7 +345,7 @@ The plan's target of 10 cycles per sample (about 3 ns) is not met: what remains 
 python3 scripts/iq-score.py /tmp/scene.sigmf-meta /tmp/scene.beast
 ```
 
-Not done: real RTL-SDR recordings (§5.3; the generator is the only input so far), live `librtlsdr` ingest (§5.1; the IQ path into `adsb-live` below takes files and stdin), SIMD preamble and sequence detector, and Mode A/C replies.
+Not done: real RTL-SDR recordings (§5.3; the generator is the only input so far), live `librtlsdr` ingest (§5.1; the IQ path into `adsb-live` below takes files and stdin), a vectorized sequence detector (tried, slower; see the third round), and Mode A/C replies.
 
 ### IQ into the live pipeline (README_UPDATES.md §5.1)
 

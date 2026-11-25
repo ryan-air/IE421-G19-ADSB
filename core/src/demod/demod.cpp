@@ -328,8 +328,8 @@ struct Demodulator::Impl {
   // and stored per sample: for (phase, trial), sample trial_klo + i gets
   // the chips trial_chip[i * trial_m + n] (in increasing order, padded with
   // kMaxChips, whose sign is 0) with overlaps trial_ov[i * trial_m + n];
-  // trial_m is the most any sample has (2 when a chip is longer than a
-  // sample).
+  // trial_m is the most any sample has (2 from 2 MS/s up, where a chip is
+  // at least a sample long).
   static constexpr int kTrials = 2 * (kClimbSteps + 1) + 1;
   static constexpr std::size_t kTrialTableBytes = std::size_t{8} << 20;
   static constexpr std::size_t kTrialM = 4;  // entries per sample, at most
@@ -525,7 +525,7 @@ struct Demodulator::Impl {
   std::vector<float> w4;            // [(phase * kMaxChips + chip) * 4]
   std::vector<std::int32_t> first4;  // [phase * kMaxChips + chip]
 
-  // Steps 2's preamble test for four phases at once, one per lane (fixed4
+  // Step 2's preamble test for four phases at once, one per lane (fixed4
   // only): the phases of group g are 4g .. 4g + 3. A chip of the four
   // starts at sample lane_first[g * 16 + c] or one later (lane_late, all
   // ones in that lane), as the phases are less than a sample apart; its
@@ -1282,7 +1282,7 @@ void Demodulator::scan(bool final) {
     bool saw_unknown_address = false;
     int seq_phase = -1;
     float seq_quality = 0.0f;
-    // Steps 2's tests for the phases in lane groups: per lane the
+    // Step 2's tests for the phases in lane groups: per lane the
     // operations of the per-phase code below, in its order, for every phase
     // (without the early exit after the signal test; the quiet chips of a
     // phase that fails it are computed and ignored). Four phases' chains of

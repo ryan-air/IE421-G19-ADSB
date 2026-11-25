@@ -41,7 +41,7 @@ inline constexpr std::uint16_t kCategory = static_cast<std::uint16_t>(1u << 7); 
 inline constexpr std::uint16_t kAirGround = static_cast<std::uint16_t>(1u << 8);  // flags.kOnGround
 inline constexpr std::uint16_t kHeading = static_cast<std::uint16_t>(1u << 9);  // heading_cdeg or flags.kHeadingTrue
 inline constexpr std::uint16_t kAirspeed = static_cast<std::uint16_t>(1u << 10);  // airspeed_kt or flags.kAirspeedTrue
-inline constexpr std::uint16_t kIntegrity = static_cast<std::uint16_t>(1u << 11);  // nic or adsb_version
+inline constexpr std::uint16_t kIntegrity = static_cast<std::uint16_t>(1u << 11);  // nic, adsb_version, nac_p, sil or nuc_p
 inline constexpr std::uint16_t kNewTrack = static_cast<std::uint16_t>(1u << 15);  // first update for this ICAO address in this session
 }  // namespace update_mask
 
@@ -53,6 +53,7 @@ inline constexpr std::uint8_t kNonIcaoAddress = static_cast<std::uint8_t>(1u << 
 inline constexpr std::uint8_t kSurfacePosition = static_cast<std::uint8_t>(1u << 3);  // last position came from a surface position message
 inline constexpr std::uint8_t kHeadingTrue = static_cast<std::uint8_t>(1u << 4);  // heading_cdeg is relative to true north (TC 31 HRD = 0); clear: magnetic north
 inline constexpr std::uint8_t kAirspeedTrue = static_cast<std::uint8_t>(1u << 5);  // airspeed_kt is true airspeed; clear: indicated airspeed
+inline constexpr std::uint8_t kAirDataCommB = static_cast<std::uint8_t>(1u << 6);  // heading_cdeg and airspeed_kt came from a Comm-B reply (BDS 6,0: magnetic heading, indicated airspeed), not from ADS-B
 }  // namespace track_flags
 
 // Starts every UDP datagram. Followed by `count` message blocks, each a u16 length then that many bytes.
@@ -131,9 +132,12 @@ struct TrackUpdate {
   std::uint8_t flags = 0;  // @54: TrackFlags
   std::uint8_t adsb_version = kAdsbVersionNull;  // @55: ADS-B version from operational status (TC 31): 0 DO-260, 1 DO-260A, 2 DO-260B; null until one is received (nic is then computed as for version 0)
   std::uint64_t publish_ts_ns = 0;  // @56: Publisher software timestamp taken just before send (wall-clock domain); 0 inside the pipeline
-  std::uint16_t heading_cdeg = kHeadingCdegNull;  // @64: Heading, 0.01 degree, [0, 36000), from airborne velocity subtypes 3/4; north reference in flags.kHeadingTrue
-  std::uint16_t airspeed_kt = kAirspeedKtNull;  // @66: Airspeed, knots, from airborne velocity subtypes 3/4; flags.kAirspeedTrue says TAS or IAS
-  std::uint32_t reserved = 0;  // @68: Zero
+  std::uint16_t heading_cdeg = kHeadingCdegNull;  // @64: Heading, 0.01 degree, [0, 36000), from airborne velocity subtypes 3/4, or Comm-B BDS 6,0 for aircraft without them (flags.kAirDataCommB); north reference in flags.kHeadingTrue
+  std::uint16_t airspeed_kt = kAirspeedKtNull;  // @66: Airspeed, knots, from airborne velocity subtypes 3/4, or Comm-B BDS 6,0 (indicated); flags.kAirspeedTrue says TAS or IAS
+  std::uint8_t nac_p = 0;  // @68: Navigation accuracy category for position, 0-11, from the latest operational status (TC 31, versions 1/2) or target state (TC 29); 0 = unknown (or EPU >= 10 NM)
+  std::uint8_t sil = 0;  // @69: Source integrity level: bits 0-1 the SIL (0-3), bit 2 set when it is per sample (clear: per hour); from TC 31 (versions 1/2) or TC 29; 0 = unknown
+  std::uint8_t nuc_p = 0;  // @70: Navigation uncertainty category for position, 0-9, of the current position for version 0 (DO-260) aircraft, from its type code; 0 = unknown, or a version 1/2 aircraft (see nic)
+  std::uint8_t reserved = 0;  // @71: Zero
 };
 static_assert(sizeof(TrackUpdate) == TrackUpdate::kWireSize);
 static_assert(offsetof(TrackUpdate, msg_type) == 0);
@@ -157,7 +161,10 @@ static_assert(offsetof(TrackUpdate, adsb_version) == 55);
 static_assert(offsetof(TrackUpdate, publish_ts_ns) == 56);
 static_assert(offsetof(TrackUpdate, heading_cdeg) == 64);
 static_assert(offsetof(TrackUpdate, airspeed_kt) == 66);
-static_assert(offsetof(TrackUpdate, reserved) == 68);
+static_assert(offsetof(TrackUpdate, nac_p) == 68);
+static_assert(offsetof(TrackUpdate, sil) == 69);
+static_assert(offsetof(TrackUpdate, nuc_p) == 70);
+static_assert(offsetof(TrackUpdate, reserved) == 71);
 
 // Serializes to exactly 72 bytes.
 inline void write(const TrackUpdate& m, std::uint8_t* out) noexcept {
@@ -182,7 +189,10 @@ inline void write(const TrackUpdate& m, std::uint8_t* out) noexcept {
   std::memcpy(out + 56, &m.publish_ts_ns, 8);
   std::memcpy(out + 64, &m.heading_cdeg, 2);
   std::memcpy(out + 66, &m.airspeed_kt, 2);
-  std::memcpy(out + 68, &m.reserved, 4);
+  std::memcpy(out + 68, &m.nac_p, 1);
+  std::memcpy(out + 69, &m.sil, 1);
+  std::memcpy(out + 70, &m.nuc_p, 1);
+  std::memcpy(out + 71, &m.reserved, 1);
 }
 inline void read(const std::uint8_t* in, TrackUpdate& m) noexcept {
   std::memcpy(&m.msg_type, in + 0, 1);
@@ -206,7 +216,10 @@ inline void read(const std::uint8_t* in, TrackUpdate& m) noexcept {
   std::memcpy(&m.publish_ts_ns, in + 56, 8);
   std::memcpy(&m.heading_cdeg, in + 64, 2);
   std::memcpy(&m.airspeed_kt, in + 66, 2);
-  std::memcpy(&m.reserved, in + 68, 4);
+  std::memcpy(&m.nac_p, in + 68, 1);
+  std::memcpy(&m.sil, in + 69, 1);
+  std::memcpy(&m.nuc_p, in + 70, 1);
+  std::memcpy(&m.reserved, in + 71, 1);
 }
 
 // The track expired or was removed; subscribers drop it.

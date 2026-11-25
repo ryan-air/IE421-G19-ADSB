@@ -832,3 +832,11 @@ TEST(Decoder, SingleBitRepairLeavesAddressParityFormatsAlone) {
 }
 
 }  // namespace
+
+// NUCp of a version 0 position message (DO-260 Table 2-14, as pyModeS's
+// TC_NUCp_lookup).
+TEST(Decoder, PositionNucFollowsTheTypeCode) {
+  const int want[32] = {0, 0, 0, 0, 0, 9, 8, 7, 6, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 9, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  for (unsigned tc = 0; tc < 32; ++tc) EXPECT_EQ(position_nuc(tc), want[tc]) << tc;
+  EXPECT_EQ(position_nuc(255), 0);
+}

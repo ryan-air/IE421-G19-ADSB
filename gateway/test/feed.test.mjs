@@ -206,6 +206,16 @@ test('gateway frames round-trip and the table follows them', () => {
     [271.4, 'true', 452, 'tas', 8, 2]);
   const v1b = toAircraft(trackUpdate({ icao: 1, nic: 8, heading: 9000, airspeed: 300 }));
   assert.deepEqual([v1b.heading_ref, v1b.airspeed_type, v1b.nic], ['magnetic', 'ias', null], 'no position: no nic');
+  assert.equal(v1.air_data_source, 'adsb');
+  assert.equal(a.air_data_source, null);
+  // Accuracy bytes 68-70: NACp, SIL (+ per-sample bit 2), NUCp; 0 = unknown.
+  assert.deepEqual([a.nac_p, a.sil, a.sil_type, a.nuc_p], [null, null, null, null]);
+  const acc = toAircraft(trackUpdate({ icao: 1, lat: 40, lon: -88, nacp: 10, sil: 3 | 4, nucp: 7,
+    flags: 64, heading: 9000, airspeed: 250 }));
+  assert.deepEqual([acc.nac_p, acc.sil, acc.sil_type, acc.nuc_p, acc.air_data_source, acc.heading_ref],
+    [10, 3, 'per_sample', 7, 'comm_b', 'magnetic']);
+  const accHour = toAircraft(trackUpdate({ icao: 1, nacp: 9, sil: 2, nucp: 7 }));
+  assert.deepEqual([accHour.sil, accHour.sil_type, accHour.nuc_p], [2, 'per_hour', null], 'no position: no nuc_p');
   // Malformed frames.
   assert.throws(() => decodeFrame(snap.subarray(0, 15)), RangeError);
   assert.throws(() => decodeFrame(snap.subarray(0, snap.length - 1)), RangeError);

@@ -30,6 +30,9 @@
         "publish_ts_ns": "0",
         "heading_cdeg": 18105,
         "airspeed_kt": 452,
+        "nac_p": 10,
+        "sil": 7,
+        "nuc_p": 0,
         "reserved": 0
       }
     },

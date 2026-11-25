@@ -245,8 +245,13 @@ class BasicTrackEngine {
     if (h.valid & kHasCategory) u.category = h.category;
     if (h.valid & kHasHeading) u.heading_cdeg = c.heading_cdeg;
     if (h.valid & kHasAirspeed) u.airspeed_kt = c.airspeed_kt;
-    if (h.valid & kHasPosition) u.nic = c.nic;
+    if (h.valid & kHasPosition) {
+      u.nic = c.nic;
+      u.nuc_p = c.nuc_p;
+    }
     u.adsb_version = c.adsb_version;
+    u.nac_p = c.nac_p;
+    u.sil = c.sil;
     u.flags = h.wire_flags;
     return u;
   }
@@ -306,6 +311,65 @@ class BasicTrackEngine {
     mask |= mask_bit;
   }
 
+  static constexpr auto kAirData =
+      static_cast<std::uint16_t>(protocol::update_mask::kHeading | protocol::update_mask::kAirspeed);
+  static void drop_heading(HotTrack& h, std::uint16_t& mask) noexcept {
+    h.valid = static_cast<std::uint16_t>(h.valid & ~kHasHeading);
+    set_flag(h, protocol::track_flags::kHeadingTrue, false, mask, protocol::update_mask::kHeading);
+    mask |= protocol::update_mask::kHeading;
+  }
+  static void drop_airspeed(HotTrack& h, std::uint16_t& mask) noexcept {
+    h.valid = static_cast<std::uint16_t>(h.valid & ~kHasAirspeed);
+    set_flag(h, protocol::track_flags::kAirspeedTrue, false, mask, protocol::update_mask::kAirspeed);
+    mask |= protocol::update_mask::kAirspeed;
+  }
+
+  // NACp and SIL from the newest TC 29 / TC 31 (an older one arriving late
+  // is ignored).
+  static void set_accuracy(ColdTrack& c, std::uint8_t nac_p, std::uint8_t sil, bool per_sample, std::uint64_t rx,
+                           std::uint16_t& mask) noexcept {
+    if (rx < c.accuracy_ts_ns) return;
+    c.accuracy_ts_ns = rx;
+    const auto s = static_cast<std::uint8_t>((sil & 3u) | (per_sample ? 4u : 0u));
+    if (c.nac_p != nac_p || c.sil != s) mask |= protocol::update_mask::kIntegrity;
+    c.nac_p = nac_p;
+    c.sil = s;
+  }
+
+  // Comm-B BDS 6,0 heading and indicated airspeed, for an aircraft without
+  // ADS-B air data in the last 30 s. The register is inferred from its
+  // contents (modes::decode_comm_b), so a value counts only when the
+  // previous BDS 6,0 reply, at most 30 s earlier, agrees with it (heading
+  // within 10 degrees, IAS within 20 kt).
+  void apply_comm_b_air_data(HotTrack& h, ColdTrack& c, const modes::CommB& b, std::uint64_t rx,
+                             std::uint16_t& mask) noexcept {
+    namespace um = protocol::update_mask;
+    namespace tf = protocol::track_flags;
+    constexpr std::uint64_t kWindowNs = 30'000'000'000ULL;
+    if (b.bds != 0x60 || !(b.valid & modes::CommB::kMagneticHeading) ||
+        !(b.valid & modes::CommB::kIndicatedAirspeed))
+      return;
+    if (rx < c.commb_ts_ns) return;  // older than the last one
+    const bool adsb = c.adsb_airdata_ts_ns != 0 && rx <= c.adsb_airdata_ts_ns + kWindowNs;
+    const bool confirmed = c.commb_ts_ns != 0 && rx <= c.commb_ts_ns + kWindowNs && [&] {
+      const float d = std::fabs(b.magnetic_heading_deg - c.commb_heading_deg);
+      return std::min(d, 360.0f - d) <= 10.0f && std::fabs(b.indicated_airspeed_kt - c.commb_ias_kt) <= 20.0f;
+    }();
+    c.commb_ts_ns = rx;
+    c.commb_heading_deg = b.magnetic_heading_deg;
+    c.commb_ias_kt = b.indicated_airspeed_kt;
+    if (adsb || !confirmed) return;
+    auto hd = static_cast<std::uint16_t>(std::lround(static_cast<double>(b.magnetic_heading_deg) * 100.0));
+    if (hd >= 36000) hd = 0;
+    const auto as = static_cast<std::uint16_t>(
+        std::min<long>(65534, std::lround(static_cast<double>(b.indicated_airspeed_kt))));
+    set_field(c.heading_cdeg, hd, h.valid, kHasHeading, mask, um::kHeading);
+    set_field(c.airspeed_kt, as, h.valid, kHasAirspeed, mask, um::kAirspeed);
+    set_flag(h, tf::kHeadingTrue, false, mask, um::kHeading);  // magnetic
+    set_flag(h, tf::kAirspeedTrue, false, mask, um::kAirspeed);  // indicated
+    set_flag(h, tf::kAirDataCommB, true, mask, kAirData);
+  }
+
   void apply_fields(HotTrack& h, ColdTrack& c, const modes::DecodedMsg& m, std::uint64_t rx,
                     std::uint16_t& mask) noexcept {
     namespace um = protocol::update_mask;
@@ -343,14 +407,23 @@ class BasicTrackEngine {
         if (hd >= 36000) hd = 0;
         set_field(c.heading_cdeg, hd, h.valid, kHasHeading, mask, um::kHeading);
         set_flag(h, tf::kHeadingTrue, c.heading_true_north, mask, um::kHeading);
+        c.adsb_airdata_ts_ns = rx;
+        // The airspeed was Comm-B's and this message has none: it is dropped,
+        // since the flag can no longer say where it came from.
+        if ((h.wire_flags & tf::kAirDataCommB) && !m.has(modes::kFieldAirspeed)) drop_airspeed(h, mask);
+        set_flag(h, tf::kAirDataCommB, false, mask, kAirData);
       }
       if (m.has(modes::kFieldAirspeed)) {
         const auto as = static_cast<std::uint16_t>(
             std::min<long>(65534, std::lround(static_cast<double>(m.airspeed_kt))));
         set_field(c.airspeed_kt, as, h.valid, kHasAirspeed, mask, um::kAirspeed);
         set_flag(h, tf::kAirspeedTrue, m.airspeed_true, mask, um::kAirspeed);
+        c.adsb_airdata_ts_ns = rx;
+        if ((h.wire_flags & tf::kAirDataCommB) && !m.has(modes::kFieldHeading)) drop_heading(h, mask);
+        set_flag(h, tf::kAirDataCommB, false, mask, kAirData);
       }
     }
+    if (m.has(modes::kFieldCommB)) apply_comm_b_air_data(h, c, m.comm_b, rx, mask);
 
     // Operational status (TC 31) from an ADS-B source (DF17, or DF18 CF 0/1;
     // not TIS-B or ADS-R rebroadcasts): version, NIC supplements A and C,
@@ -363,6 +436,9 @@ class BasicTrackEngine {
         c.adsb_version = os.version;
         mask |= um::kIntegrity;
       }
+      // Version 0 has no NACp / SIL; 3-7 are reserved: a status of either
+      // clears what an earlier version 1/2 status set.
+      if (os.version != 1 && os.version != 2) set_accuracy(c, 0, 0, false, rx, mask);
       if (os.version == 1 || os.version == 2) {  // 3-7 are reserved
         c.nic_a = os.nic_supplement_a;
         c.nic_a_ts_ns = rx;
@@ -370,10 +446,19 @@ class BasicTrackEngine {
           c.nic_c = os.nic_supplement_c;
           c.nic_c_ts_ns = rx;
         }
-        // The wire flag shows the reference only once there is a heading.
+        // The wire flag shows the reference only once there is a heading
+        // (and only for an ADS-B heading: Comm-B's is magnetic).
         c.heading_true_north = os.heading_true_north;
-        if (h.valid & kHasHeading) set_flag(h, tf::kHeadingTrue, c.heading_true_north, mask, um::kHeading);
+        if ((h.valid & kHasHeading) && !(h.wire_flags & tf::kAirDataCommB))
+          set_flag(h, tf::kHeadingTrue, c.heading_true_north, mask, um::kHeading);
+        // Version 1 has no SIL supplement: per hour.
+        set_accuracy(c, os.nac_p, os.sil, os.version == 2 && os.sil_per_sample, rx, mask);
       }
+    }
+    // Target state and status (TC 29 subtype 1, version 2) also carries
+    // NACp and SIL; same sources as TC 31.
+    if (m.has(modes::kFieldTargetState) && (m.df == 17 || (m.df == 18 && m.ca <= 1))) {
+      set_accuracy(c, m.target.nac_p, m.target.sil, m.target.sil_per_sample, rx, mask);
     }
 
     // Callsign and category arrive together in identification messages and
@@ -434,7 +519,8 @@ class BasicTrackEngine {
     const unsigned version = c.adsb_version == 0xFF ? 0u : c.adsb_version;
     const bool nic_a = c.nic_a && rx <= c.nic_a_ts_ns + kSupplementTtlNs;
     const bool nic_c = c.nic_c && rx <= c.nic_c_ts_ns + kSupplementTtlNs;
-    slot = CprSlot{m.cpr, rx, true, surface, modes::position_nic(m.tc, version, nic_a, m.nic_supplement_b, nic_c)};
+    slot = CprSlot{m.cpr, rx, true, surface, modes::position_nic(m.tc, version, nic_a, m.nic_supplement_b, nic_c),
+                   (version == 0 || version > 2) ? modes::position_nuc(m.tc) : std::uint8_t{0}};
 
     const std::uint64_t window = surface ? cfg_.surface_pair_window_ns : cfg_.cpr_pair_window_ns;
     const bool have_pos = (h.valid & kHasPosition) != 0;
@@ -498,8 +584,12 @@ class BasicTrackEngine {
     const std::uint8_t nic = global           ? std::min(slot.nic, other.nic)
                              : track_relative ? std::min(slot.nic, c.nic)
                                               : slot.nic;
-    if (nic != c.nic) mask |= protocol::update_mask::kIntegrity;
+    const std::uint8_t nuc = global           ? std::min(slot.nuc, other.nuc)
+                             : track_relative ? std::min(slot.nuc, c.nuc_p)
+                                              : slot.nuc;
+    if (nic != c.nic || nuc != c.nuc_p) mask |= protocol::update_mask::kIntegrity;
     c.nic = nic;
+    c.nuc_p = nuc;
     h.lat_e7 = lat_e7;
     h.lon_e7 = lon_e7;
     h.valid |= kHasPosition;

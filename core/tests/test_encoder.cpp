@@ -212,3 +212,37 @@ TEST(Encoder, OperationalStatusRoundTrip) {
 }
 
 }  // namespace
+
+// DF20 with a BDS 6,0 MB: the published reply A00004128F39F91A7E27C46ADC21
+// (pyModeS) is reproduced byte for byte from its decoded values, and a
+// built MB decodes back as a unique BDS 6,0.
+TEST(Encoder, CommBHeadingAndSpeedReply) {
+  using namespace adsb::modes;
+  const auto pub = adsb::test::hex("A00004128F39F91A7E27C46ADC21");
+  DecodedMsg m;
+  ASSERT_EQ(decode(pub.data(), pub.size(), m), DecodeStatus::kAddressParity);
+  std::uint64_t mb = 0;
+  for (int i = 4; i < 11; ++i) mb = (mb << 8) | pub[static_cast<std::size_t>(i)];
+  const Frame again = encode_df20(m.icao, m.altitude_ft, mb);
+  ASSERT_EQ(again.len, 14);
+  for (std::size_t i = 0; i < 14; ++i) EXPECT_EQ(again.bytes[i], pub[i]) << i;
+  EXPECT_EQ(comm_b_bds60(static_cast<double>(m.comm_b.magnetic_heading_deg),
+                         static_cast<double>(m.comm_b.indicated_airspeed_kt), static_cast<double>(m.comm_b.mach),
+                         m.comm_b.baro_vertical_rate_fpm, m.comm_b.inertial_vertical_rate_fpm),
+            mb);
+
+  for (double hdg : {0.0, 42.7, 179.9, 180.0, 271.5, 359.9}) {
+    const Frame f = encode_df20(0xA1B2C3, 31000, comm_b_bds60(hdg, 280, 0.78, -640, -608));
+    DecodedMsg d;
+    ASSERT_EQ(decode(f.bytes, f.len, d), DecodeStatus::kAddressParity);
+    EXPECT_EQ(d.icao, 0xA1B2C3u);
+    EXPECT_EQ(d.altitude_ft, 31000);
+    EXPECT_EQ(d.comm_b.bds, 0x60) << hdg;
+    EXPECT_NEAR(static_cast<double>(d.comm_b.magnetic_heading_deg), std::fmod(hdg, 360.0), 90.0 / 512 / 2 + 1e-6)
+        << hdg;
+    EXPECT_EQ(d.comm_b.indicated_airspeed_kt, 280.0f);
+    EXPECT_NEAR(static_cast<double>(d.comm_b.mach), 0.78, 0.0021);
+    EXPECT_EQ(d.comm_b.baro_vertical_rate_fpm, -640);
+    EXPECT_EQ(d.comm_b.inertial_vertical_rate_fpm, -608);
+  }
+}

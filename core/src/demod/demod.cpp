@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
@@ -330,7 +331,14 @@ struct Demodulator::Impl {
   // the pattern gives (0, hi, lo, lo + hi), computed as before.
   std::vector<std::uint8_t> sov_pat;     // [(phase * sov_n + j) * 4 + lane]
   std::vector<float> sov_x;              // [(phase * sov_n + j) * 4 + pattern]
-  std::vector<float> errs;               // detector scratch: [j * 4 + pattern]
+  // The distinct overlaps of each phase's samples (sx_vals[sx_off[p] ..
+  // sx_off[p + 1]), padded with zeros to a multiple of 4), for every sample
+  // and hypothesis lane the index of its overlap among them, and the
+  // detector's scratch for their square roots.
+  std::vector<std::size_t> sx_off;
+  std::vector<float> sx_vals;
+  std::vector<std::uint16_t> sx_idx;     // [(phase * sov_n + j) * 4 + lane]
+  std::vector<float> sx_sqrt;
 
   // Maximum-likelihood bits for a frame of `bits` bits starting at phase p
   // of position t. Each sample's expected magnitude is sqrt((A x)^2 + mu^2),
@@ -372,17 +380,23 @@ struct Demodulator::Impl {
     // possible pulse patterns: (y - sqrt(a2 x^2 + mu2))^2, x = its overlap
     // with the chips that carry a pulse. Four lanes at once, each the same
     // operations in the same order as one scalar evaluation.
-    const float* xs = sov_x.data() + static_cast<std::size_t>(p) * sov_n * 4;
-    const std::uint8_t* pat = sov_pat.data() + static_cast<std::size_t>(p) * sov_n * 4;
-    float* er = errs.data();
+    // A phase's overlaps take few distinct values (the chip grid repeats
+    // every few samples), so the square roots are taken once per distinct
+    // overlap: sx_sqrt[i] = sqrt(a2 x_i^2 + mu2), the same operations on the
+    // same values as per sample (each lane of the vector expression is
+    // ((a2 x) x) + mu2, then a correctly rounded square root).
+    const std::size_t xo = sx_off[static_cast<std::size_t>(p)];
+    const std::size_t nx = sx_off[static_cast<std::size_t>(p) + 1] - xo;
+    float* sq = sx_sqrt.data();
     {
       const f4 a2v = splat4(a2), mu2v = splat4(mu2);
-      for (std::size_t j = bb[0]; j < bb[bits]; ++j) {
-        const f4 x = load4(xs + 4 * j);
-        const f4 d = splat4(mt[sov_k0 + static_cast<std::ptrdiff_t>(j)]) - sqrt4(a2v * x * x + mu2v);
-        store4(er + 4 * j, d * d);
+      for (std::size_t i = 0; i < nx; i += 4) {
+        const f4 x = load4(sx_vals.data() + xo + i);
+        store4(sq + i, sqrt4(a2v * x * x + mu2v));
       }
     }
+    // For each sample, the index of each lane's (hypothesis's) root.
+    const std::uint16_t* sidx = sx_idx.data() + static_cast<std::size_t>(p) * sov_n * 4;
     // Survivor paths: the bits of the best path into each state, bit i at
     // (63 - i % 64) of word i / 64, so the frame's bytes are the words in
     // big-endian order. Taking the survivor of the chosen predecessor is
@@ -395,12 +409,13 @@ struct Demodulator::Impl {
       // (and so the decisions) of a loop over the states.
       float c00 = cost[0], c01 = cost[0], c10 = cost[1], c11 = cost[1];
       for (std::size_t j = bb[i]; j < bb[i + 1]; ++j) {
-        const float* e = er + 4 * j;
-        const std::uint8_t* q = pat + 4 * j;
-        c00 += e[q[0]];
-        c01 += e[q[1]];
-        c10 += e[q[2]];
-        c11 += e[q[3]];
+        const float y = mt[sov_k0 + static_cast<std::ptrdiff_t>(j)];
+        const std::uint16_t* q = sidx + 4 * j;
+        const float d0 = y - sq[q[0]], d1 = y - sq[q[1]], d2 = y - sq[q[2]], d3 = y - sq[q[3]];
+        c00 += d0 * d0;
+        c01 += d1 * d1;
+        c10 += d2 * d2;
+        c11 += d3 * d3;
       }
       const float c0[2] = {c00, c01}, c1[2] = {c10, c11};
       float next[2];
@@ -625,7 +640,6 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
     // (the previous bit's second half) never occurs in bit 0.
     im.sov_pat.assign(static_cast<std::size_t>(im.phases) * im.sov_n * 4, 0);
     im.sov_x.assign(static_cast<std::size_t>(im.phases) * im.sov_n * 4, 0.0f);
-    im.errs.assign(im.sov_n * 4, 0.0f);
     for (std::size_t pj = 0; pj < static_cast<std::size_t>(im.phases) * im.sov_n; ++pj) {
       const std::uint8_t r_lo = im.sov_role[2 * pj], r_hi = im.sov_role[2 * pj + 1];
       for (int prev = 0; prev < 2; ++prev) {
@@ -647,6 +661,28 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
       im.sov_x[4 * pj + 2] = lo * 1.0f + hi * 0.0f;
       im.sov_x[4 * pj + 3] = lo * 1.0f + hi * 1.0f;
     }
+    // Distinct overlaps per phase (by bits; first seen first).
+    im.sx_off.assign(static_cast<std::size_t>(im.phases) + 1, 0);
+    im.sx_idx.assign(static_cast<std::size_t>(im.phases) * im.sov_n * 4, 0);
+    std::size_t widest = 0;
+    for (int p = 0; p < im.phases; ++p) {
+      const std::size_t first = im.sx_vals.size();
+      im.sx_off[static_cast<std::size_t>(p)] = first;
+      std::unordered_map<std::uint32_t, std::uint16_t> seen;
+      for (std::size_t j = 0; j < im.sov_n; ++j) {
+        const std::size_t pj = static_cast<std::size_t>(p) * im.sov_n + j;
+        for (int lane = 0; lane < 4; ++lane) {
+          const float x = im.sov_x[4 * pj + im.sov_pat[4 * pj + static_cast<std::size_t>(lane)]];
+          const auto [it, added] = seen.try_emplace(std::bit_cast<std::uint32_t>(x), static_cast<std::uint16_t>(seen.size()));
+          if (added) im.sx_vals.push_back(x);
+          im.sx_idx[4 * pj + static_cast<std::size_t>(lane)] = it->second;
+        }
+      }
+      while ((im.sx_vals.size() - first) % 4 != 0) im.sx_vals.push_back(0.0f);
+      widest = std::max(widest, im.sx_vals.size() - first);
+    }
+    im.sx_off[static_cast<std::size_t>(im.phases)] = im.sx_vals.size();
+    im.sx_sqrt.assign(widest, 0.0f);
   }
   im.ttl = static_cast<std::uint64_t>(cfg_.address_ttl_s * cfg_.sample_rate_hz);
   im.templ_limit = static_cast<std::size_t>(im.need + im.back) + 16;

@@ -246,6 +246,16 @@ class AddressTable {
   std::array<Entry, kSize> t_{};
 };
 
+// The smaller of two costs, b only if strictly smaller (equal costs are
+// the same float, so either is right). One instruction where there is one.
+inline float min_cost(float a, float b) noexcept {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  return __builtin_fminf(a, b);  // fminnm
+#else
+  return b < a ? b : a;
+#endif
+}
+
 inline bool address_parity_df(unsigned df) noexcept {
   return df == 0 || df == 4 || df == 5 || df == 16 || df == 20 || df == 21;
 }
@@ -418,44 +428,78 @@ struct Demodulator::Impl {
     // the same choice the traceback through the decisions made.
     std::uint64_t path[2][2] = {{0, 0}, {0, 0}};
     std::uint64_t path56[2][2] = {{0, 0}, {0, 0}};
-    for (int i = 0; i < bits; ++i) {
-      // Path cost of each (previous bit, this bit), accumulated sample by
-      // sample onto the previous path's cost, in float: exactly the sums
-      // (and so the decisions) of a loop over the states.
-      float c00 = cost[0], c01 = cost[0], c10 = cost[1], c11 = cost[1];
-      for (std::size_t j = bb[i]; j < bb[i + 1]; ++j) {
-        const float y = mt[sov_k0 + static_cast<std::ptrdiff_t>(j)];
-        const std::uint16_t* q = sidx + 4 * j;
-        const float d0 = y - sq[q[0]], d1 = y - sq[q[1]], d2 = y - sq[q[2]], d3 = y - sq[q[3]];
-        c00 += d0 * d0;
-        c01 += d1 * d1;
-        c10 += d2 * d2;
-        c11 += d3 * d3;
+    // kMin: take the smaller cost with a minimum instruction (see below).
+    auto viterbi = [&]<bool kMin>() {
+      float cost0 = cost[0], cost1 = cost[1];
+      std::uint64_t p00 = 0, p01 = 0, p10 = 0, p11 = 0;  // path[state][word]
+      for (int i = 0; i < bits; ++i) {
+        // Path cost of each (previous bit, this bit), accumulated sample by
+        // sample onto the previous path's cost, in float: exactly the sums
+        // (and so the decisions) of a loop over the states.
+        float c00 = cost0, c01 = cost0, c10 = cost1, c11 = cost1;
+        for (std::size_t j = bb[i]; j < bb[i + 1]; ++j) {
+          const float y = mt[sov_k0 + static_cast<std::ptrdiff_t>(j)];
+          const std::uint16_t* q = sidx + 4 * j;
+          const float d0 = y - sq[q[0]], d1 = y - sq[q[1]], d2 = y - sq[q[2]], d3 = y - sq[q[3]];
+          c00 += d0 * d0;
+          c01 += d1 * d1;
+          c10 += d2 * d2;
+          c11 += d3 * d3;
+        }
+        // A path through a previous state of cost 1e30 or more (only the
+        // start's "previous bit 1", short of overflow) costs 1e30. Usually
+        // there is none: then the selects are skipped (a predictable branch
+        // keeps them off the chain of dependent additions that sets the pace
+        // here).
+        float v00 = c00, v01 = c01, v10 = c10, v11 = c11;
+        if (!(cost0 < 1e30f && cost1 < 1e30f)) {
+          v00 = cost0 < 1e30f ? c00 : 1e30f;
+          v01 = cost0 < 1e30f ? c01 : 1e30f;
+          v10 = cost1 < 1e30f ? c10 : 1e30f;
+          v11 = cost1 < 1e30f ? c11 : 1e30f;
+        }
+        // Ties go to previous bit 0, as the earlier per-state loop did. The
+        // cost taken is the smaller one either way (equal costs are the same
+        // float, never -0.0), so with no NaN a minimum gives it in one step.
+        const bool one0 = v10 < v00, one1 = v11 < v01;
+        if constexpr (kMin) {
+          cost0 = min_cost(v00, v10);
+          cost1 = min_cost(v01, v11);
+        } else {
+          cost0 = one0 ? v10 : v00;
+          cost1 = one1 ? v11 : v01;
+        }
+        const std::uint64_t bit0 = i < 64 ? std::uint64_t{1} << (63 - i) : 0;
+        const std::uint64_t bit1 = i < 64 ? 0 : std::uint64_t{1} << (127 - i);
+        const std::uint64_t n00 = one0 ? p10 : p00, n01 = one0 ? p11 : p01;
+        const std::uint64_t n10 = (one1 ? p10 : p00) | bit0, n11 = (one1 ? p11 : p01) | bit1;
+        p00 = n00;
+        p01 = n01;
+        p10 = n10;
+        p11 = n11;
+        if (i == 55) {
+          cost56[0] = cost0;
+          cost56[1] = cost1;
+          path56[0][0] = p00;
+          path56[0][1] = p01;
+          path56[1][0] = p10;
+          path56[1][1] = p11;
+        }
       }
-      const float c0[2] = {c00, c01}, c1[2] = {c10, c11};
-      float next[2];
-      std::uint64_t npath[2][2];
-      const int w = i / 64;
-      const std::uint64_t bit = std::uint64_t{1} << (63 - i % 64);
-      for (int b = 0; b < 2; ++b) {
-        const float via0 = cost[0] < 1e30f ? c0[b] : 1e30f;
-        const float via1 = cost[1] < 1e30f ? c1[b] : 1e30f;
-        // Ties go to previous bit 0, as the earlier per-state loop did.
-        const bool one = via1 < via0;
-        next[b] = one ? via1 : via0;
-        const std::uint64_t* from = path[one ? 1 : 0];
-        npath[b][0] = from[0];
-        npath[b][1] = from[1];
-        if (b) npath[b][w] |= bit;
-      }
-      cost[0] = next[0];
-      cost[1] = next[1];
-      std::memcpy(path, npath, sizeof path);
-      if (i == 55) {
-        cost56[0] = cost[0];
-        cost56[1] = cost[1];
-        std::memcpy(path56, path, sizeof path);
-      }
+      cost[0] = cost0;
+      cost[1] = cost1;
+      path[0][0] = p00;
+      path[0][1] = p01;
+      path[1][0] = p10;
+      path[1][1] = p11;
+    };
+    // Costs are sums of squared differences of finite samples and finite or
+    // infinite roots, so never NaN unless a2 is infinite (inf * 0 for an
+    // empty pattern: magnitudes near the float range, from feed_magnitudes()).
+    if (std::isfinite(a2)) {
+      viterbi.template operator()<true>();
+    } else {
+      viterbi.template operator()<false>();
     }
     auto emit = [](const float* end_cost, const std::uint64_t (*paths)[2], std::uint8_t* out) {
       const std::uint64_t* best = paths[end_cost[1] < end_cost[0] ? 1 : 0];

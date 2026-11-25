@@ -283,8 +283,7 @@ struct Demodulator::Impl {
   // first_arrival_us before a frame are still there.
   std::ptrdiff_t hist = 0;
   std::vector<double> fa_templ;  // step-6 direct-path pulses, one value per sample
-  std::vector<double> fa_echo;   // ... and the decoded copy's
-  std::vector<std::uint8_t> fa_code;  // ... and the prefilter's per-sample codes
+  std::vector<std::uint8_t> fa_code;  // ... and per sample: under the decoded copy's pulses, or the prefilter's code
   // Duplicates: the most recent frames emitted.
   struct Recent {
     double pos = 0.0;
@@ -581,7 +580,6 @@ Demodulator::Demodulator(const DemodConfig& cfg) : cfg_(cfg), impl_(std::make_un
   if (cfg_.first_arrival_us > 0) {
     im.hist = static_cast<std::ptrdiff_t>(std::ceil(cfg_.first_arrival_us * spu_)) + climb + 8;
     im.fa_templ.assign(static_cast<std::size_t>(im.hist + im.need) + 32, 0.0);
-    im.fa_echo.assign(im.fa_templ.size(), 0.0);
     im.fa_code.assign(im.fa_templ.size(), 0);
   }
   // Single-bit error syndromes (CRC is linear: the syndrome of a frame with
@@ -1382,7 +1380,6 @@ void Demodulator::scan(bool final) {
       const double min_delay = 2 * h;  // 1 us; this copy's pulses are left out, so it never matches itself
       const double max_delay = cfg_.first_arrival_us * spu_;
       std::vector<double>& fe = im.fa_templ;
-      std::vector<double>& echo = im.fa_echo;
       // Samples relative to t from k_base on; this copy's pulse overlaps.
       const auto k_base = static_cast<std::ptrdiff_t>(std::floor(rel_best - max_delay - (kMaxSteps + 1) * kStep)) - 2;
       const auto k_end = static_cast<std::ptrdiff_t>(std::floor(rel_best + nchips * h + 0.5)) + 1;  // exclusive
@@ -1397,8 +1394,8 @@ void Demodulator::scan(bool final) {
           }
         }
       };
-      const bool room = t + k_base >= 0 && static_cast<std::size_t>(k_end - k_base) <= echo.size();
-      if (room) pulses_into(echo, rel_best, k_base, k_end, nchips);
+      const bool room = t + k_base >= 0 && static_cast<std::size_t>(k_end - k_base) <= fe.size();
+      std::uint8_t* code = im.fa_code.data();
       // Correlation coefficient for a direct-path start rel, and the
       // direct path's amplitude (least-squares slope).
       auto direct = [&](double rel, double& amp, int upto) {
@@ -1408,17 +1405,19 @@ void Demodulator::scan(bool final) {
         if (hi <= lo) return -1.0;
         pulses_into(fe, rel, lo, hi, upto);
         double n = 0, sx = 0, se = 0, sxx = 0, see = 0, sxe = 0;
+        // Samples under this copy's pulses are left out. Without a branch:
+        // they add +0.0 instead, which changes no sum (none is ever -0.0).
         for (std::ptrdiff_t k = lo; k < hi; ++k) {
           const auto u = static_cast<std::size_t>(k - k_base);
-          if (echo[u] > 0) continue;
+          const bool use = code[u] != 2;
           const auto x = static_cast<double>(mt[k]);
           const double v = fe[u];
-          n += 1;
-          sx += x;
-          se += v;
-          sxx += x * x;
-          see += v * v;
-          sxe += x * v;
+          n += use ? 1.0 : 0.0;
+          sx += use ? x : 0.0;
+          se += use ? v : 0.0;
+          sxx += use ? x * x : 0.0;
+          see += use ? v * v : 0.0;
+          sxe += use ? x * v : 0.0;
         }
         const double vx = n * sxx - sx * sx, ve = n * see - se * se;
         if (!(vx > 0 && ve > 0)) return -1.0;
@@ -1431,13 +1430,24 @@ void Demodulator::scan(bool final) {
       // least half the weakest acceptable pulse. Per sample: 2 = under this
       // copy's pulses, 1 = that strong, 0 = not.
       const double pulse_floor = 0.5 * static_cast<double>(min_signal);
-      std::uint8_t* code = im.fa_code.data();
-      if (room) {
+      // Built when a start is first tried. A sample is under this copy's
+      // pulses where the sum of its positive overlaps with them would be
+      // positive, that is where any of them is.
+      bool built = false;
+      auto build_code = [&] {
+        built = true;
         for (std::ptrdiff_t k = k_base; k < k_end; ++k) {
-          const auto u = static_cast<std::size_t>(k - k_base);
-          code[u] = echo[u] > 0 ? 2 : (static_cast<double>(mt[k]) >= pulse_floor ? 1 : 0);
+          code[static_cast<std::size_t>(k - k_base)] = static_cast<double>(mt[k]) >= pulse_floor ? 1 : 0;
         }
-      }
+        for (int c = 0; c < nchips; ++c) {
+          if (sign[c] <= 0) continue;
+          const double a = rel_best + c * h, bnd = a + h;
+          for (auto k = static_cast<std::ptrdiff_t>(std::floor(a + 0.5)); k < k_end && static_cast<double>(k) - 0.5 < bnd; ++k) {
+            const double ov = std::min(bnd, static_cast<double>(k) + 0.5) - std::max(a, static_cast<double>(k) - 0.5);
+            if (ov > 0 && k >= k_base) code[static_cast<std::size_t>(k - k_base)] = 2;
+          }
+        }
+      };
       double best_rel = 0.0, best_amp = 0.0;
       bool found = false;
       // Starts from the earliest on, every half sample: the first that
@@ -1490,6 +1500,7 @@ void Demodulator::scan(bool final) {
         if (rel_c > last_rel) break;
         if (rel_c <= floor_rel + 1.0) continue;
         double a0 = 0.0;
+        if (!built) build_code();
         if (!pulses_there(i) || !(direct(rel_c, a0, kPreambleChips) >= cfg_.first_arrival_match)) continue;
         const double y0 = direct(rel_c, a0, nchips);
         if (!(y0 >= cfg_.first_arrival_match) || !(a0 >= static_cast<double>(min_signal))) continue;

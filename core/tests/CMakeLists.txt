@@ -9,6 +9,7 @@ set(ADSB_TEST_SOURCES
   test_cpr.cpp
   test_decoder.cpp
   test_beast.cpp
+  test_beast_import.cpp
   test_protocol.cpp
   test_hash.cpp
   test_encoder.cpp

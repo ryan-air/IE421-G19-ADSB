@@ -171,6 +171,10 @@ jobs:
       # build, and compilers (possible because -ffp-contract=off).
       - name: Check
         run: ./scripts/check-determinism.sh build/release build/naive-baseline build/clang-release
+      # A recorded Beast capture imported as .adsbrec (time from its own
+      # 12 MHz counter), then replayed.
+      - name: Beast import
+        run: ./scripts/check-beast-import.sh build/release
 
   protocol:
     name: feed protocol (generator + C++/JS/Python golden tests)

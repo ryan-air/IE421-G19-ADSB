@@ -191,10 +191,12 @@ Not modelled yet: aircraft antenna patterns and fuselage shadowing, terrain, int
 | `build/<preset>/tools/adsb-ring-stress` | Long concurrent stress run of the SPSC ring and the shm ring (`--seconds`, `--seed`): order, exactly-once delivery, torn contents, laps. Run it on ARM; see `spec/memory-model/README.md` |
 | `build/<preset>/tools/adsb-tx-bench` | The feed's UDP transports on identical histograms: kernel `sendto()` vs io_uring with and without SQPOLL vs AF_XDP (`--transport all --rounds N` alternates them; `--interface`/`--dest`/`--rx-netns` to cross a real device such as a veth pair; `--rx kernel\|xdp\|all` receives with `recv()`, AF_XDP, or both, crossed with every transport); `send()` cost, send → recv latency, busy cores, loss and reorders |
 | `build/<preset>/tools/adsb-dst` | Deterministic simulation sweep: `--seeds N --start S --threads T` (`--profile deep` for larger worlds, `--time-limit` for budgets); prints totals per recovery path and a sweep hash (equal across compilers); a failure prints the seed, its world and the replay command (`--seed S --trace` prints every event) |
+| `build/<preset>/tools/adsb-beast-import` | Convert a recorded Beast byte stream (a capture of dump1090-fa / readsb port 30005 written to disk) into an `.adsbrec`, timed by the frames' own 12 MHz counter: see *Importing a Beast capture* below |
 | `build/<preset>/tools/adsb-beast-serve` | Serve a recording as a Beast TCP stream (like readsb's output) at a fixed rate, with optional bursts; reports whether the consumer pushed back. The load source for overload tests; `--line N` serves one receiver line (one server per line for A/B) |
 | `build/<preset>/tools/adsb-publish` | Replay a recording through decode + track state and publish it as the feed, with the retransmit and snapshot servers; fault injection; prints the final book digest |
 | `build/<preset>/tools/adsb-feed-cli` | Subscribe: verify sequencing, recover gaps, report counters and publish → applied latency, print the reconstructed book's digest; `--rx xdp` receives the feed through AF_XDP |
 | `build/<preset>/tools/adsb-clock` | Answers clock queries on stdin with `mono_ns()`, so the Node gateway can measure latency against the publisher's clock ([gateway/](../gateway/README.md)) |
+| [`scripts/check-beast-import.sh`](scripts/check-beast-import.sh) | Beast import test on `adsb-synth --beast` output: every frame, file == stdin, header fields, windows, a restarted decoder, refusals; the import replays (CI, job `determinism`) |
 | [`scripts/check-feed.sh`](scripts/check-feed.sh) | Feed integration test: loss, small ring, late join, publisher restart; every subscriber's book must equal the publisher's and a plain replay's (CI) |
 | [`scripts/check-shm.sh`](scripts/check-shm.sh) | Shared-memory transport test: a subscriber that keeps up, one that is lapped, a late joiner, a publisher restart; every book must equal the publisher's (CI) |
 | [`scripts/check-conflate.sh`](scripts/check-conflate.sh) | Conflated feed test: subscribers that keep up, lose bursts, or join late, from `adsb-publish` and `adsb-live`; every conflated book must equal the main feed's state, and the conflated feed must send less (CI) |
@@ -253,6 +255,23 @@ cmake --preset debug && cmake --build --preset debug -j && ctest --preset debug
 ```
 
 At `--speed max` the reader outruns the worker, so "queue" latency mostly measures the backlog. Use a paced `--speed N` for latency numbers.
+
+### Importing a Beast capture
+
+[`adsb-beast-import`](tools/adsb_beast_import.cpp) turns a Beast byte stream recorded to disk (for example days of dump1090-fa output) into an `.adsbrec` that every tool above reads. The conversion ([`beast_import.hpp`](include/adsb/ingest/beast_import.hpp)) depends only on the input bytes:
+
+- `rx_ns` comes from the frame's 12 MHz counter (exact floor of ticks × 1e9 / 12e6), so replays of an import are deterministic and two windows of one capture line up; `radio_ts` keeps the raw counter.
+- The counter is unwrapped across a 48-bit wrap (exactly) and a decoder restart (any step back of more than `--reorder-ms`, default 1 s: time continues `--reset-gap-ms` after the last frame, since the outage's length is unknown). A smaller step back is reordering: the frame keeps the previous time. Forward gaps are kept and reported.
+- Receiver status frames (type `'4'`) are skipped; Mode A/C and Mode S frames are kept.
+- `--from H --hours H` selects a window measured from the input's first frame and stops reading at its end, so a long capture can be imported a day at a time straight from its archive. `--start` (ISO 8601 with an explicit zone) labels the header with the window's first frame's wall time; `--receiver` stores the position that local CPR decoding uses.
+
+```bash
+tar -xOzf capture.tar.gz | ./build/release/tools/adsb-beast-import - -o day2.adsbrec \
+    --from 24 --hours 24 --receiver LAT,LON --source dump1090-fa --start 2026-11-19T09:36:00-06:00
+./build/release/tools/adsb-replay day2.adsbrec
+```
+
+On a 5.1-day dump1090-fa capture from Chicago (M2 laptop): 171.8 M frames, about 3.15 GB of Beast, imported with no clock resets and no gap over 0.75 s; one day (34.4 M frames, 1.0 GB as `.adsbrec`) imports in 12 s from the gzip archive and replays through decode + track state in 10.5 s (3.3 M frames/s, about 8,200× real time).
 
 ### Demodulator (Workstream A, README_UPDATES.md §5.2)
 

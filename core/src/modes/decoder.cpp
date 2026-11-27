@@ -77,9 +77,12 @@ void set_ground_from_ca(DecodedMsg& out, unsigned ca) noexcept {
 }
 
 void set_ground_from_fs(DecodedMsg& out, unsigned fs) noexcept {
-  // Flight status: 0/2 airborne, 1/3 on ground, 4/5 either (SPI / alert).
-  if (fs <= 3) {
-    out.on_ground = (fs & 1u) != 0;
+  // Flight status: 1/3 on ground; 0/2 "airborne" and 4/5 either. As in
+  // readsb, only "on ground" is taken: an Address/Parity reply's address
+  // comes from its CRC, and many transponders report "airborne" while
+  // parked, so a reply that does not say "on ground" says nothing.
+  if (fs == 1 || fs == 3) {
+    out.on_ground = true;
     out.fields |= kFieldAirGround;
   }
 }
@@ -622,8 +625,10 @@ DecodeStatus decode(const std::uint8_t* frame, std::size_t len, DecodedMsg& out,
     case 0:
     case 16: {
       out.icao = out.syndrome;
-      out.on_ground = b.bit(6) != 0;  // VS: 1 = on ground
-      out.fields |= kFieldAirGround;
+      if (b.bit(6) != 0) {  // VS: 1 = on ground; 0 is not taken as airborne (see set_ground_from_fs)
+        out.on_ground = true;
+        out.fields |= kFieldAirGround;
+      }
       set_altitude(out, decode_ac13(u16(b.get(20, 32))), false);
       return DecodeStatus::kAddressParity;
     }

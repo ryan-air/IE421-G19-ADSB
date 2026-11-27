@@ -60,7 +60,7 @@ struct alignas(64) HotTrack {
   std::uint64_t last_seen_ns = 0;  // newest frame of any kind
   std::uint64_t pos_ts_ns = 0;     // newest accepted position
   std::uint64_t vel_ts_ns = 0;     // newest velocity / surface movement
-  std::uint64_t alt_ts_ns = 0;     // newest altitude
+  std::uint64_t alt_ts_ns = 0;     // newest accepted altitude
 };
 static_assert(sizeof(HotTrack) == 64, "HotTrack must be exactly one cache line");
 
@@ -105,6 +105,12 @@ struct ColdTrack {
   CprSlot cpr_even;
   CprSlot cpr_odd;
   std::uint8_t position_reject_streak = 0;
+  // Altitude plausibility (readsb's alt_reliable, 0-20) and the source of
+  // the stored altitude (TrackEngine AltSource; 0 = none).
+  std::int8_t alt_reliable = 0;
+  std::uint8_t alt_source = 0;
+  std::uint8_t ground_source = 0;  // of the air/ground state: 0 none, 1 Address/Parity reply, 2 CRC-checked frame
+  std::uint64_t vrate_ts_ns = 0;  // newest vertical rate (HotTrack::vel_ts_ns also moves on surface movement etc.)
   // Duplicate filter: the last few frames' payload hashes.
   static constexpr std::size_t kDedupEntries = 4;
   std::uint32_t dedup_hash[kDedupEntries] = {};

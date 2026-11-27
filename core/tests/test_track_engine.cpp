@@ -12,6 +12,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "adsb/common/rng.hpp"
@@ -569,18 +570,380 @@ TEST(TrackEngine, ImplausibleJumpIsRejectedThenReanchored) {
   pos(40.0, -88.0, false);
   pos(40.0, -88.0, true);  // established at (40, -88)
   ASSERT_EQ(e->stats().cpr_global, 1u);
-  // The aircraft "teleports" 3 degrees north. The first new frame pairs with
-  // the old odd frame, cannot be resolved globally, and its local decode is
-  // rejected. The next two global fixes are rejected too (reanchor after 2),
-  // and the third consecutive disagreeing global fix replaces the position.
+  // The aircraft "teleports" 3 degrees north. Each new frame pairs with an
+  // old one (rejected frames are not kept), so every fix disagrees with the
+  // stored position: the third rejection in a row (reanchor after 2) clears
+  // both CPR slots.
   pos(43.0, -88.0, false);
   pos(43.0, -88.0, true);
   pos(43.0, -88.0, false);
   EXPECT_EQ(e->stats().cpr_rejected, 3u);
   EXPECT_EQ(e->stats().cpr_reanchored, 0u);
+  // The next frame has no partner and may not decode against the doubted
+  // position; the one after it completes a pair of new frames, and that
+  // global fix replaces the position without the jump check.
   pos(43.0, -88.0, true);
+  EXPECT_EQ(e->stats().cpr_reanchored, 0u);
+  EXPECT_NEAR(sink.updates.back().lat_e7 / 1e7, 40.0, 1e-3);
+  pos(43.0, -88.0, false);
   EXPECT_EQ(e->stats().cpr_reanchored, 1u);
+  EXPECT_EQ(e->stats().cpr_rejected, 3u);
   EXPECT_NEAR(sink.updates.back().lat_e7 / 1e7, 43.0, 1e-3);
+  // Afterwards the track is checked again as usual.
+  pos(40.0, -88.0, true);
+  EXPECT_EQ(e->stats().cpr_rejected, 4u);
+  EXPECT_NEAR(sink.updates.back().lat_e7 / 1e7, 43.0, 1e-3);
+}
+
+// The reset forgets both CPR frames: the fix that re-anchors the track is
+// never made with a frame from before the reset, which is unchecked.
+TEST(TrackEngine, AfterTheResetOnlyNewFramesPair) {
+  EngineConfig cfg;
+  cfg.reanchor_after_rejects = 2;
+  auto e = std::make_unique<TrackEngine>(cfg);
+  CollectSink sink;
+  std::uint64_t t = 10 * kSec;
+  auto pos = [&](double la, double lo, bool odd) {
+    feed(*e, modes::encode_airborne_position(kIcao, 35000, modes::cpr_encode(la, lo, odd, false)), t, sink);
+    t += 500'000'000;
+  };
+  pos(40.0, -88.0, false);
+  pos(40.0, -88.0, true);
+  ASSERT_EQ(e->stats().cpr_global, 1u);
+  // Three even frames 18 NM east (same longitude zones, so a pair with the
+  // stored odd frame resolves): rejected three times, then both slots are
+  // cleared.
+  pos(40.0, -87.6, false);
+  pos(40.0, -87.6, false);
+  pos(40.0, -87.6, false);
+  ASSERT_EQ(e->stats().cpr_rejected, 3u);
+  // Another even frame: the old odd frame is gone, so there is no pair (and
+  // no local decode against the doubted position).
+  pos(40.0, -87.6, false);
+  EXPECT_EQ(e->stats().cpr_global, 1u);
+  EXPECT_EQ(e->stats().cpr_reanchored, 0u);
+  EXPECT_NEAR(sink.updates.back().lon_e7 / 1e7, -88.0, 1e-3);
+  pos(40.0, -87.6, true);
+  EXPECT_EQ(e->stats().cpr_reanchored, 1u);
+  EXPECT_NEAR(sink.updates.back().lon_e7 / 1e7, -87.6, 1e-3);
+}
+
+// Real frames (professor's capture, 2026-11-19, receiver near Chicago): one
+// CRC-valid frame in each sequence carries CPR values of another place (a
+// frame wrongly repaired upstream, most likely). Kept in its slot, it paired
+// with each later frame of the other format, and the third rejection in a
+// row used to re-anchor the track there: A12AA1 showed in Antarctica for 5 s,
+// A35254 near (-1.6, 0.3). A rejected frame is now dropped, so every
+// position stays on the real track.
+struct TimedHex {
+  std::uint64_t ms;
+  const char* hex;
+};
+
+void expect_no_phantom(const std::vector<TimedHex>& frames, double lat, double lon, std::uint64_t min_fixes) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  for (const auto& f : frames) {
+    const auto b = adsb::test::hex(f.hex);
+    FrameMeta meta;
+    meta.rx_ns = 100 * kSec + f.ms * 1'000'000ULL;
+    e->on_frame(b.data(), b.size(), meta, sink);
+  }
+  std::uint64_t positions = 0;
+  for (const auto& u : sink.updates) {
+    if (!(u.update_mask & protocol::update_mask::kPosition)) continue;
+    ++positions;
+    EXPECT_NEAR(u.lat_e7 / 1e7, lat, 0.05) << "update at seq " << positions;
+    EXPECT_NEAR(u.lon_e7 / 1e7, lon, 0.05) << "update at seq " << positions;
+  }
+  EXPECT_GE(e->stats().cpr_global, min_fixes);
+  EXPECT_GE(e->stats().cpr_rejected, 1u) << "the corrupt frame's fix is rejected";
+  EXPECT_EQ(e->stats().cpr_reanchored, 0u);
+  EXPECT_GE(positions, min_fixes);
+}
+
+TEST(TrackEngine, OneCorruptOddFrameDoesNotMoveTheTrack) {
+  expect_no_phantom({{0, "8DA12AA158A5871CC63C835EEEB6"},
+                     {919, "8DA12AA158A5871CD83C5FC5DC0A"},
+                     {2852, "8DA12AA158A58392A3BD710CF5DB"},
+                     {5984, "8DA12AA158A5871D3A3B9A016012"},
+                     {7047, "8DA12AA158A5871D4E3B71DE2D13"},
+                     {10593, "8DA12AA158A583933BBC3D732C87"},
+                     {12102, "8DA12AA158A584612AB1E57E222A"},  // odd, CPR of another place
+                     {13265, "8DA12AA158A583936FBBD33CF110"},
+                     {15037, "8DA12AA158A5839391BB8C7AADA8"},  // was the phantom fix
+                     {16979, "8DA12AA158A5871E0E39EECC8FE4"},
+                     {18815, "8DA12AA158A5871E3039A6151F5F"},
+                     {19820, "8DA12AA158A58393EFBACE27A4B6"}},
+                    41.36, -89.05, 9);
+}
+
+TEST(TrackEngine, OneCorruptEvenFrameDoesNotMoveTheTrack) {
+  expect_no_phantom({{0, "8DA3525458A7B36D7D98E1A66031"},
+                     {840, "8DA3525458A7B6F85818311189A4"},
+                     {3024, "8DA3525458A7936D17986A8529BE"},
+                     {3521, "8DA3525458A796F80017CCE99A35"},
+                     {4113, "8DA3525458A796F7EC17B4E4D7A3"},
+                     {4633, "8DA3525458A7836CE1982A49C62D"},
+                     {5073, "8DA3525458A786F7CA178EBCB3F3"},
+                     {6921, "8DA3525458A766F78E1748DCC261"},
+                     {7889, "8DA3525458A766F76A171D32BC34"},
+                     {8481, "8DA3525458A756F7561705A21295"},
+                     {9033, "8DA3525458A756F74416F290876B"},
+                     {10642, "8DA3525458A742F71016B4CF4AB8"},  // even, CPR of another place
+                     {12090, "8DA3525458A736F6DC1679B9EC73"},
+                     {13098, "8DA3525458A726F6BE1656A30D92"},  // was the phantom fix
+                     {15018, "8DA3525458A7136B7F968D08461A"},
+                     {17147, "8DA3525458A706F63215B3993D5C"},
+                     {17731, "8DA3525458A5F36B1F961D0CE51D"},
+                     {19347, "8DA3525458A5E6F5E8155DE459F9"}},
+                    41.13, -89.63, 15);
+}
+
+// Review scenarios (synthetic). Receiver near Chicago.
+EngineConfig chicago_receiver() {
+  EngineConfig cfg;
+  cfg.has_receiver = true;
+  cfg.receiver_lat = 41.878;
+  cfg.receiver_lon = -87.647;
+  return cfg;
+}
+
+double last_lat(const CollectSink& s) {
+  for (auto it = s.updates.rbegin(); it != s.updates.rend(); ++it)
+    if (it->update_mask & protocol::update_mask::kPosition) return it->lat_e7 / 1e7;
+  return 0.0;
+}
+
+double last_lon(const CollectSink& s) {
+  for (auto it = s.updates.rbegin(); it != s.updates.rend(); ++it)
+    if (it->update_mask & protocol::update_mask::kPosition) return it->lon_e7 / 1e7;
+  return 0.0;
+}
+
+// Landing 64 NM from the receiver (Milwaukee): a surface frame decoded
+// against the receiver lands 1.5 degrees off. The track's own position or a
+// pair places the frames, so no correct fix is rejected (a first version of
+// this change rejected every one of them and never placed the aircraft on
+// the ground).
+TEST(TrackEngine, SurfacePositionsFarFromTheReceiverFollowTheTrack) {
+  auto e = std::make_unique<TrackEngine>(chicago_receiver());
+  CollectSink sink;
+  std::uint64_t t = 10 * kSec;
+  for (std::uint64_t i = 0; i < 4; ++i, t += kSec / 2)
+    feed(*e, modes::encode_airborne_position(kIcao, 1000, modes::cpr_encode(42.95, -87.90, i % 2 == 1, false)), t, sink);
+  for (std::uint64_t i = 0; i < 60; ++i, t += kSec / 2)
+    feed(*e, modes::encode_surface_position(kIcao, 20, 90, modes::cpr_encode(42.947, -87.897, i % 2 == 1, true)), t, sink);
+  EXPECT_EQ(e->stats().cpr_rejected, 0u);
+  EXPECT_GE(e->stats().cpr_global, 60u);
+  EXPECT_NEAR(last_lat(sink), 42.947, 1e-3);
+  EXPECT_TRUE(sink.updates.back().flags & protocol::track_flags::kOnGround);
+}
+
+// On landing the first surface frame has no surface partner yet; it decodes
+// against the track's last (airborne) position, as readsb does.
+TEST(TrackEngine, TheFirstSurfaceFrameAfterLandingDecodesAgainstTheTrack) {
+  auto e = std::make_unique<TrackEngine>();  // no receiver position
+  CollectSink sink;
+  std::uint64_t t = 10 * kSec;
+  for (std::uint64_t i = 0; i < 2; ++i, t += kSec / 2)
+    feed(*e, modes::encode_airborne_position(kIcao, 700, modes::cpr_encode(41.786, -87.752, i % 2 == 1, false)), t, sink);
+  ASSERT_EQ(e->stats().cpr_global, 1u);
+  feed(*e, modes::encode_surface_position(kIcao, 40, 90, modes::cpr_encode(41.7855, -87.7510, true, true)), t, sink);
+  EXPECT_EQ(e->stats().cpr_local, 1u);
+  EXPECT_NEAR(last_lat(sink), 41.7855, 1e-3);
+  EXPECT_NEAR(last_lon(sink), -87.7510, 1e-3);
+  EXPECT_TRUE(sink.updates.back().flags & protocol::track_flags::kSurfacePosition);
+}
+
+// A surface track whose frames come more than a minute apart: too old to
+// decode against the track. Near the receiver (O'Hare, 15 NM) the receiver
+// places the frame; at an airport 64 NM away that decode is a zone off and
+// is ignored, but the frame is kept, so the next frame pairs with it.
+TEST(TrackEngine, SparseSurfaceFramesNearAndFarFromTheReceiver) {
+  for (const auto& [lat, lon, near] : {std::tuple{41.9868, -87.9029, true}, std::tuple{42.947, -87.897, false}}) {
+    auto e = std::make_unique<TrackEngine>(chicago_receiver());
+    CollectSink sink;
+    std::uint64_t t = 10 * kSec;
+    // 20 frames: a track 107 km out first lands on the aliased place and is
+    // re-anchored (ASurfaceTrackStartedAtTheWrongPlaceRecovers).
+    for (std::uint64_t i = 0; i < 20; ++i, t += kSec / 2)
+      feed(*e, modes::encode_surface_position(kIcao, 5, 90, modes::cpr_encode(lat, lon, i % 2 == 1, true)), t, sink);
+    ASSERT_GE(e->stats().cpr_global, 2u) << near;
+    ASSERT_NEAR(last_lat(sink), lat, 1e-3) << near;
+    // 90 s without positions (past local_decode_max_age_ns); all-call
+    // replies keep the track alive (track_timeout_ns 60 s).
+    for (int k = 0; k < 9; ++k) {
+      t += 10 * kSec;
+      feed(*e, modes::encode_df11(kIcao, 4), t, sink);
+    }
+    const std::uint64_t global = e->stats().cpr_global;
+    const std::uint64_t local = e->stats().cpr_local;
+    const std::uint64_t rejected = e->stats().cpr_rejected;
+    ASSERT_EQ(e->stats().tracks_expired, 0u) << near;
+    feed(*e, modes::encode_surface_position(kIcao, 5, 90, modes::cpr_encode(lat + 0.0005, lon, true, true)), t, sink);
+    EXPECT_EQ(e->stats().cpr_local, local + (near ? 1u : 0u)) << near;
+    EXPECT_EQ(e->stats().cpr_rejected, rejected) << near;
+    t += kSec / 2;
+    feed(*e, modes::encode_surface_position(kIcao, 5, 90, modes::cpr_encode(lat + 0.0005, lon, false, true)), t, sink);
+    EXPECT_EQ(e->stats().cpr_global, global + 1u) << "pairs with the frame before: " << near;
+    EXPECT_NEAR(last_lat(sink), lat + 0.0005, 1e-3) << near;
+  }
+}
+
+// A surface-only track far from the receiver starts at the aliased place
+// (its first fix is against the receiver, unchecked); the pairs disagree,
+// and the reset re-anchors it on the real airport.
+TEST(TrackEngine, ASurfaceTrackStartedAtTheWrongPlaceRecovers) {
+  auto e = std::make_unique<TrackEngine>(chicago_receiver());
+  CollectSink sink;
+  std::uint64_t t = 10 * kSec;
+  for (std::uint64_t i = 0; i < 20; ++i, t += kSec / 2)
+    feed(*e, modes::encode_surface_position(kIcao, 20, 90, modes::cpr_encode(42.947, -87.897, i % 2 == 1, true)), t, sink);
+  EXPECT_EQ(e->stats().cpr_reanchored, 1u);
+  EXPECT_NEAR(last_lat(sink), 42.947, 1e-3);
+}
+
+// A corrupt frame in the first pair of a new track: its fix is unchecked
+// (there is nothing to check it against) and lands a whole number of
+// longitude zones away. Later good frames of the other format keep pairing
+// with the corrupt one and "confirm" the phantom; that confirmation must not
+// clear the rejections, or the track stays there.
+TEST(TrackEngine, ACorruptFrameInTheFirstPairIsCorrected) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  std::uint64_t t = 10 * kSec;
+  auto pos = [&](double la, double lo, bool odd) {
+    feed(*e, modes::encode_airborne_position(kIcao, 35000, modes::cpr_encode(la, lo, odd, false)), t, sink);
+    t += kSec / 2;
+  };
+  pos(40.0, -70.0, false);  // corrupt even creates the track
+  pos(40.0, -88.0, true);   // first fix: phantom
+  ASSERT_GT(std::abs(last_lon(sink) + 88.0), 10.0);
+  for (int i = 0; i < 12; ++i) pos(40.0, -88.0, i % 2 == 0);
+  EXPECT_EQ(e->stats().cpr_resets, 1u);
+  EXPECT_NEAR(last_lon(sink), -88.0, 1e-3);
+  EXPECT_NEAR(last_lat(sink), 40.0, 1e-3);
+}
+
+// The same right after a reset (the fix that re-anchors is unchecked, so a
+// corrupt frame there gives a phantom too): it is corrected the same way.
+TEST(TrackEngine, ACorruptFrameRightAfterAResetIsCorrected) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  std::uint64_t t = 10 * kSec;
+  auto pos = [&](double la, double lo, bool odd) {
+    feed(*e, modes::encode_airborne_position(kIcao, 35000, modes::cpr_encode(la, lo, odd, false)), t, sink);
+    t += kSec / 2;
+  };
+  pos(40.0, -88.0, false);
+  pos(40.0, -88.0, true);
+  pos(40.0, -70.0, false);
+  pos(40.0, -70.0, true);
+  pos(40.0, -70.0, false);  // three rejections: reset
+  ASSERT_EQ(e->stats().cpr_resets, 1u);
+  pos(40.0, -88.0, true);
+  pos(40.0, -70.0, false);  // corrupt: re-anchors unchecked at a phantom
+  ASSERT_EQ(e->stats().cpr_reanchored, 1u);
+  ASSERT_GT(std::abs(last_lon(sink) + 88.0), 10.0);
+  for (int i = 0; i < 12; ++i) pos(40.0, -88.0, i % 2 == 0);
+  EXPECT_EQ(e->stats().cpr_resets, 2u);
+  EXPECT_NEAR(last_lon(sink), -88.0, 1e-3);
+}
+
+// CPR fields both zero are bogus (readsb's rule): such a frame neither
+// creates a position nor pairs. On real traffic one surface frame with CPR
+// (0, 0) placed an aircraft parked at Midway 16 NM away for minutes.
+TEST(TrackEngine, ZeroCprFieldsAreIgnored) {
+  auto e = std::make_unique<TrackEngine>(chicago_receiver());
+  CollectSink sink;
+  feed(*e, modes::encode_surface_position(kIcao, 5, 90, modes::CprFrame{0, 0, false}), 10 * kSec, sink);
+  EXPECT_EQ(e->stats().cpr_rejected, 1u);
+  EXPECT_EQ(e->stats().cpr_global + e->stats().cpr_local, 0u);
+  feed(*e, modes::encode_surface_position(kIcao, 5, 90, modes::cpr_encode(41.7807, -87.7546, true, true)),
+       10 * kSec + kSec / 2, sink);
+  EXPECT_EQ(e->stats().cpr_global, 0u) << "no pair with the bogus frame";
+  EXPECT_NEAR(last_lat(sink), 41.7807, 1e-3);
+}
+
+// Real frames (professor's capture, day 1): ABE2B2 parked at Midway sent a
+// surface position with every CPR bit zero first (a placeholder); decoded
+// against the receiver it put the aircraft 16 NM north-west, and a first
+// version of this change kept it there for 300 s. Ignored now, the real
+// frames place it at Midway at once.
+TEST(TrackEngine, APlaceholderSurfaceFrameDoesNotPlaceTheAircraft) {
+  auto e = std::make_unique<TrackEngine>(chicago_receiver());
+  CollectSink sink;
+  const std::vector<TimedHex> frames = {{0, "8CABE2B240000000000000011B05"},  // CPR (0, 0)
+                                        {440, "8CABE2B24000058EF62548881F2A"},
+                                        {984, "8CABE2B24010036A52320EAFB868"},
+                                        {1504, "8CABE2B24010058EF425483E76C0"},
+                                        {1936, "8CABE2B23810036A52320EE43214"},
+                                        {2344, "8CABE2B23810036A52320EE43214"},
+                                        {2944, "8CABE2B23810036A52320EE43214"},
+                                        {3441, "8CABE2B23810058EF4254875FCBC"},
+                                        {3961, "8CABE2B23810036A52320EE43214"},
+                                        {4457, "8CABE2B23810058EF4254875FCBC"}};
+  for (const auto& f : frames) {
+    const auto b = adsb::test::hex(f.hex);
+    FrameMeta meta;
+    meta.rx_ns = 100 * kSec + f.ms * 1'000'000ULL;
+    e->on_frame(b.data(), b.size(), meta, sink);
+  }
+  bool any = false;
+  for (const auto& u : sink.updates) {
+    if (!(u.update_mask & protocol::update_mask::kPosition)) continue;
+    any = true;
+    EXPECT_NEAR(u.lat_e7 / 1e7, 41.7807, 0.002);
+    EXPECT_NEAR(u.lon_e7 / 1e7, -87.7546, 0.002);
+  }
+  EXPECT_TRUE(any);
+  EXPECT_EQ(e->stats().cpr_rejected, 1u) << "only the placeholder";
+}
+
+// A rejected airborne position does not end "on ground" (readsb drops the
+// whole message that gave a bad position).
+TEST(TrackEngine, ARejectedAirbornePositionLeavesTheGroundState) {
+  auto e = std::make_unique<TrackEngine>(chicago_receiver());
+  CollectSink sink;
+  std::uint64_t t = 10 * kSec;
+  // An airborne frame (no partner yet), then the aircraft is seen taxiing.
+  feed(*e, modes::encode_airborne_position(kIcao, 1000, modes::cpr_encode(41.7807, -87.7546, false, false)), t, sink);
+  t += kSec / 2;
+  // (Odd surface frames only, so the airborne even frame keeps its slot.)
+  for (std::uint64_t i = 0; i < 4; ++i, t += kSec / 2)
+    feed(*e, modes::encode_surface_position(kIcao, 5, 90, modes::cpr_encode(41.7807, -87.7546, true, true)), t, sink);
+  ASSERT_TRUE(sink.updates.back().flags & protocol::track_flags::kOnGround);
+  // A corrupt odd airborne frame: it pairs with the airborne even one and
+  // gives a position 60 km away, which is rejected.
+  // CA 7 ("either"): the frame itself says nothing about air/ground.
+  modes::Frame f = modes::encode_airborne_position(kIcao, 1000, modes::cpr_encode(41.9, -87.0, true, false));
+  f.bytes[0] = static_cast<std::uint8_t>((17u << 3) | 7u);
+  modes::write_parity(f.bytes, f.len, 0);
+  feed(*e, f, t, sink);
+  EXPECT_EQ(e->stats().cpr_rejected, 1u);
+  EXPECT_TRUE(sink.updates.back().flags & protocol::track_flags::kOnGround);
+}
+
+// A rejected frame is never kept for pairing: after one corrupt frame the
+// next frame of the other format still pairs with the last good one.
+TEST(TrackEngine, ARejectedFrameIsNotKeptForPairing) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  std::uint64_t t = 10 * kSec;
+  auto pos = [&](double la, double lo, bool odd) {
+    feed(*e, modes::encode_airborne_position(kIcao, 35000, modes::cpr_encode(la, lo, odd, false)), t, sink);
+    t += 500'000'000;
+  };
+  pos(40.0, -88.0, false);
+  pos(40.0, -88.0, true);
+  ASSERT_EQ(e->stats().cpr_global, 1u);
+  pos(10.0, -30.0, false);  // corrupt even: its fix with the stored odd is rejected
+  EXPECT_EQ(e->stats().cpr_rejected, 1u);
+  pos(40.001, -88.0, true);  // pairs with the good even, not the corrupt one
+  EXPECT_EQ(e->stats().cpr_global, 2u);
+  EXPECT_EQ(e->stats().cpr_rejected, 1u);
+  EXPECT_NEAR(sink.updates.back().lat_e7 / 1e7, 40.001, 1e-3);
 }
 
 TEST(TrackEngine, ExpiryAfterTimeout) {

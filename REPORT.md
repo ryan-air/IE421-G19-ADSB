@@ -93,7 +93,7 @@ Tiers from README_UPDATES.md §3; status from TEAM.md.
 | Could | J: ITCH 5.0 L3 book | Not started |
 | Could | E: io_uring transport | Built (publisher side) |
 | Could | H: deterministic simulation testing | Built, per-push and nightly in CI |
-| Added (§22) | IQ scenario generator for testing SDRs | Built, checked against readsb; MATLAB check not done |
+| Added (§22) | IQ scenario generator for testing SDRs | Built and checked against readsb and the MathWorks receiver on synthetic IQ |
 | Added (§22) | Transponder frequency-stability study | Method built and checked on synthetic IQ; the study `TODO (real recordings)` |
 
 ## 4. Baseline: the Fall 2025 system
@@ -149,6 +149,8 @@ Each subsection: what was built, how it was verified, results, limitations. Owne
 |---|---|---|---|
 | readsb on the generator's files, clean 15–30 dB | 98.8% decoded, timestamps within 0.28 µs | Synthetic | core/README.md |
 | Ours vs readsb, messages (busy / weak / impaired / multipath) | 6,332 / 6,257; 1,136 / 1,029; 2,462 / 2,391; 1,364 / 1,134 | Synthetic | core/README.md |
+| DF17 matched, baseline synthetic IQ | adsb-demod 2,746; MathWorks 2,571; truth 3,417 | Synthetic | [MATLAB comparison](bench/matlab/README.md) |
+| MATLAB weak-signal misses with no accepted preamble within 1.67 µs of truth | 8,677 of 9,413 across three seeds | Synthetic | [MATLAB diagnostics](bench/matlab/README.md#diagnostic-results) |
 | Start-time error | ≤ 0.14 samples (0.06 µs); readsb 0.54 | Synthetic | core/README.md |
 | Speed, 2.4 MS/s, one thread | 6.07 ns/sample (69× real time); readsb 5.35 ns | Laptop | core/README.md |
 | IQ sample → track state, 1.7 / 6.8 / 27.3 ms blocks | p50 1.2 / 5.2 / 20 ms | Laptop | core/README.md |
@@ -156,7 +158,7 @@ Each subsection: what was built, how it was verified, results, limitations. Owne
 | USB transfer-size sweep on a real RTL-SDR | `TODO (real recordings)` | | |
 | Speed in cycles/sample on AVX2 | `TODO (benchmark host)` | | |
 
-**Limitations.** Synthetic input only; no live `librtlsdr` source; 10-cycle target not met (what remains is mostly serial); no Mode A/C replies, antenna patterns or terrain in the generator; no MATLAB comparison (no licence).
+**Limitations.** The sensitivity results use synthetic IQ. The live `librtlsdr` path still needs a physical dongle run, and the 10-cycle target needs a benchmark-host measurement. The generator includes Mode A/C replies. Aircraft antenna patterns and terrain remain open. The MATLAB comparison covers DF17, and the stock example exceeded its candidate capacity on the 600-aircraft case.
 
 ### 6.2 Workstream A (study): transponder frequency stability
 

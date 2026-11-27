@@ -175,7 +175,7 @@ python3 scripts/iq-score.py /tmp/scene.sigmf-meta decoded.beast    # or a --raw 
 ./build/release/tools/adsb-iqsynth -o /tmp/ac --aircraft 100 --duration 20 --modeac-rate 10 --modeac-spi 0.1
 ```
 
-Not modelled yet: aircraft antenna patterns and fuselage shadowing, terrain, intra-message frequency chirp, and the RTL-SDR's own filter shape. MATLAB's receiver example (§22.3) has not been run on the files (no MATLAB licence on hand).
+Not modelled yet: aircraft antenna patterns and fuselage shadowing, terrain, intra-message frequency chirp, and the RTL-SDR's own filter shape. The [MATLAB comparison](../bench/matlab/README.md) runs the MathWorks example on the same synthetic IQ and scores DF17 against SigMF truth.
 
 ### Tools and scripts
 

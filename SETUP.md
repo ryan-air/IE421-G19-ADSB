@@ -48,6 +48,8 @@ brew install cmake ninja
 
 Apple clang 15+ works for everything except libFuzzer (use the `fuzz-standalone` preset instead; see §5).
 
+MATLAB with Communications Toolbox is only needed for the optional [MathWorks receiver comparison](bench/matlab/README.md). The regular C++ build and tests do not depend on MATLAB.
+
 ### Ubuntu 24.04 / Debian 12 / Raspberry Pi OS (Bookworm)
 
 ```bash

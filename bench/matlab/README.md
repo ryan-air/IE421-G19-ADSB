@@ -112,3 +112,53 @@ offset was 0.36 samples or less outside the multipath case, where it reached
 outputs from `adsb-demod` and two from MathWorks. These are synthetic waveform
 results on one seed. The horizon settings change which frames are rendered,
 so their recall denominators differ.
+
+## Where MATLAB loses DF17 messages
+
+`mathworksDiagnosticReceiver` calls the same interpolation, synchronization
+and bit parser helpers as the stock example and logs every accepted preamble
+with its candidate time, parsed format, payload and CRC status. It reports
+candidate overflow explicitly. Keep one adapter per recording and clear it
+after decoding to close the log.
+
+```matlab
+diagnostic = mathworksDiagnosticReceiver(pwd, [base '.candidates.csv']);
+decodeSigmf([base '.sigmf-meta'], [base '.diagnostic.beast'], diagnostic);
+clear diagnostic
+```
+
+From the repository root, replace `BASE` with the same capture path:
+
+```sh
+python3 core/scripts/iq-score.py BASE.sigmf-meta BASE.diagnostic.beast --df 17 --json > BASE.score.json
+python3 bench/matlab/scoreCandidates.py BASE.sigmf-meta BASE.score.json BASE.candidates.csv
+```
+
+The scorer aligns the receiver clock using the Beast score. It pairs each
+truth message with at most one candidate within four input samples
+(1.67 µs at 2.4 MS/s), preferring exact, CRC-passing payloads. It reports
+success, CRC rejection, unsupported parsed format, a different CRC-passing
+payload, or no on-time preamble. This last bucket includes candidates whose
+timing falls outside the window, including echoes. A time-only association
+can also belong to a different overlapping transmission. Treat these as
+diagnostic categories rather than proof of the underlying failure mechanism.
+
+### Diagnostic results
+
+MATLAB R2025b Update 7, seeds 421, 422 and 423, 150 aircraft, 6 seconds
+plus a 1-second tail per run, 2.4 MS/s `cu8`. The scenario flags match the
+weak and multipath rows above. The diagnostic adapter's Beast output was
+byte-for-byte identical to the stock receiver's in all six runs.
+
+| Scenario | DF17 truth | Matched | No on-time preamble | CRC rejected | Unsupported parsed format |
+|---|---:|---:|---:|---:|---:|
+| Weak | 10,122 | 709 | 8,677 | 589 | 147 |
+| Multipath | 10,425 | 4,855 | 3,419 | 1,994 | 157 |
+
+No truth message was assigned a different CRC-passing payload. The weak
+scenarios put 92.2% of misses in the preamble/timing bucket. This still
+accounts for 361 of 421 misses among weak-scenario frames at 15 dB or higher.
+In multipath, 38.6% of misses had an on-time candidate rejected by the parser.
+For weak signals, the next experiment should instrument peak selection and
+preamble validation separately. For multipath, test alternate sampling
+phases on failed candidates and track unmatched output and late copies.

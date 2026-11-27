@@ -1,4 +1,4 @@
-function receiver = mathworksReceiver(exampleDir, candidateCapacity)
+function [receiver, params] = mathworksReceiver(exampleDir, candidateCapacity)
 %MATHWORKSRECEIVER Adapt the MathWorks ADS-B example PHY to decodeSigmf.
 % Invoke from a project session with the example installed locally.
 % Pass a capacity only for a separately labeled high-density run.

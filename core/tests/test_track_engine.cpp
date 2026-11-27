@@ -169,9 +169,371 @@ TEST(TrackEngine, OutOfOrderFieldUpdatesAreIgnored) {
   feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
   feed(*e, modes::encode_df4(kIcao, 31000), 20 * kSec, sink);
   feed(*e, modes::encode_df4(kIcao, 29000), 19 * kSec, sink);  // older: ignored
-  // Two field groups in that frame were stale: altitude and air/ground status.
-  EXPECT_EQ(e->stats().out_of_order, 2u);
+  // The altitude was stale. (Flight status 0 says nothing about air/ground:
+  // only "on ground" is taken from Address/Parity replies.)
+  EXPECT_EQ(e->stats().out_of_order, 1u);
   EXPECT_EQ(sink.updates.back().alt_ft, 31000);
+}
+
+// ---- Altitude plausibility (readsb's rules) ---------------------------------
+
+std::int32_t last_alt(const CollectSink& s) {
+  for (auto it = s.updates.rbegin(); it != s.updates.rend(); ++it) {
+    if (it->update_mask & protocol::update_mask::kAltitude) return it->alt_ft;
+  }
+  return TrackUpdate::kAltFtNull;
+}
+
+bool ever_shown(const CollectSink& s, std::int32_t alt) {
+  return std::any_of(s.updates.begin(), s.updates.end(), [&](const TrackUpdate& u) {
+    return (u.update_mask & protocol::update_mask::kAltitude) && u.alt_ft == alt;
+  });
+}
+
+// The real case: an ADS-B aircraft at FL313, then one DF0 that claims
+// 4,900 ft a second later. A lower source is ignored while ADS-B is fresh.
+TEST(TrackEngine, AddressParityAltitudeIsIgnoredWhileAdsbIsFresh) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_airborne_position(kIcao, 31300, modes::cpr_encode(41.9, -87.6, false, false)), 10 * kSec,
+       sink);
+  feed(*e, modes::encode_df4(kIcao, 4900), 11 * kSec, sink);
+  feed(*e, modes::encode_df4(kIcao, 31200), 24 * kSec, sink);  // 14 s: still inside the window
+  EXPECT_EQ(e->stats().altitude_lower_source, 2u);
+  EXPECT_FALSE(ever_shown(sink, 4900));
+  EXPECT_EQ(last_alt(sink), 31300);
+  // 16 s after the ADS-B altitude a Mode S altitude is considered, and one
+  // that agrees is taken.
+  feed(*e, modes::encode_df4(kIcao, 31200), 26 * kSec, sink);
+  EXPECT_EQ(last_alt(sink), 31200);
+}
+
+// Mode S only: replies that agree build the score; one that implies
+// 100,000+ ft/min is rejected and the altitude stays.
+TEST(TrackEngine, OneImplausibleReplyCannotMoveAModeSAircraft) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
+  for (std::uint64_t i = 0; i < 5; ++i) feed(*e, modes::encode_df4(kIcao, 31000), (2 + i) * kSec, sink);
+  feed(*e, modes::encode_df4(kIcao, 4900), 7 * kSec, sink);
+  feed(*e, modes::encode_df4(kIcao, 31000), 8 * kSec, sink);
+  EXPECT_EQ(e->stats().altitude_implausible, 1u);
+  EXPECT_EQ(e->stats().altitude_dropped, 0u);
+  EXPECT_FALSE(ever_shown(sink, 4900));
+  EXPECT_EQ(last_alt(sink), 31000);
+}
+
+// With a score of 1 a rejection empties it: the altitude is cleared (as
+// readsb invalidates it) and the next altitude is taken as new.
+TEST(TrackEngine, ARejectionThatEmptiesTheScoreClearsTheAltitude) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
+  feed(*e, modes::encode_df4(kIcao, 31000), 2 * kSec, sink);
+  feed(*e, modes::encode_df4(kIcao, 4900), 3 * kSec, sink);
+  EXPECT_EQ(e->stats().altitude_dropped, 1u);
+  ASSERT_FALSE(sink.updates.empty());
+  EXPECT_EQ(sink.updates.back().alt_ft, TrackUpdate::kAltFtNull);
+  EXPECT_TRUE(sink.updates.back().update_mask & protocol::update_mask::kAltitude);
+  feed(*e, modes::encode_df4(kIcao, 4900), 4 * kSec, sink);
+  EXPECT_EQ(last_alt(sink), 4900);
+}
+
+// A change of 300 ft or more must fit a climb rate: +-12,500 ft/min without
+// a vertical rate, the vertical rate +- 1,500 ft/min (plus half its age)
+// with one.
+TEST(TrackEngine, AltitudeChangesMustFitTheClimbRate) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  // Event times start at 1,000 s, so a vertical rate without its own
+  // timestamp would look older than 60 s.
+  const auto feed = [&](const modes::Frame& f, std::uint64_t t, CollectSink& s) {
+    ::feed(*e, f, 1000 * kSec + t, s);
+  };
+  feed(modes::encode_df11(kIcao), 1 * kSec, sink);
+  for (std::uint64_t i = 0; i < 5; ++i) feed(modes::encode_df4(kIcao, 10000), (2 + i) * kSec, sink);
+  // +1,000 ft in 3 s = 15,000 ft/min: outside 12,500.
+  feed(modes::encode_df4(kIcao, 11000), 9 * kSec, sink);
+  EXPECT_EQ(last_alt(sink), 10000);
+  EXPECT_EQ(e->stats().altitude_implausible, 1u);
+  // +500 ft in 3 s = 7,500 ft/min: within 12,500.
+  feed(modes::encode_df4(kIcao, 10500), 9 * kSec, sink);
+  EXPECT_EQ(last_alt(sink), 10500);
+  // Descending at 2,000 ft/min: +500 ft in 3 s is outside (-5,000, 1,000).
+  feed(modes::encode_velocity(kIcao, 300, 0, -2000), 9 * kSec, sink);
+  feed(modes::encode_df4(kIcao, 11000), 12 * kSec, sink);
+  EXPECT_EQ(e->stats().altitude_implausible, 2u);
+  EXPECT_EQ(last_alt(sink), 10500);
+  // -250 ft is under the 300 ft threshold: always taken.
+  feed(modes::encode_df4(kIcao, 10250), 13 * kSec, sink);
+  EXPECT_EQ(last_alt(sink), 10250);
+}
+
+// ADS-B is trusted: a large change arriving quickly is taken (readsb
+// prefers that to missing a real emergency descent).
+TEST(TrackEngine, AdsbAltitudeChangesAreTrusted) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  auto pos = [&](std::int32_t alt, std::uint64_t t) {
+    feed(*e, modes::encode_airborne_position(kIcao, alt, modes::cpr_encode(41.9, -87.6, false, false)), t, sink);
+  };
+  pos(31000, 10 * kSec);
+  pos(31000, 11 * kSec);
+  pos(20000, 12 * kSec);
+  EXPECT_EQ(last_alt(sink), 20000);
+  EXPECT_EQ(e->stats().altitude_implausible, 0u);
+}
+
+// The real SWA700 case: parked at Midway (surface positions), then a DF0
+// with VS 0 and 27,000 ft, then one with VS 1 and 325 ft. The aircraft
+// stays on the ground; its first altitude cannot be checked against
+// anything (readsb takes it too), and the second, implausible against it,
+// clears it.
+TEST(TrackEngine, AParkedAircraftStaysOnTheGroundThroughAMisattributedReply) {
+  EngineConfig cfg;
+  cfg.has_receiver = true;
+  cfg.receiver_lat = 41.878;
+  cfg.receiver_lon = -87.647;
+  auto e = std::make_unique<TrackEngine>(cfg);
+  CollectSink sink;
+  const std::uint32_t icao = 0xA5AA78;
+  for (std::uint64_t i = 0; i < 3; ++i) {
+    feed(*e, modes::encode_surface_position(icao, 5, 90, modes::cpr_encode(41.7860, -87.7520, i % 2 == 1, true)),
+         (5 + i) * kSec, sink);
+  }
+  ASSERT_FALSE(sink.updates.empty());
+  EXPECT_TRUE(sink.updates.back().flags & protocol::track_flags::kOnGround);
+  const auto a = adsb::test::hex("02E19190CA27F5");
+  const auto b = adsb::test::hex("064600B5024FD1");
+  FrameMeta meta;
+  meta.rx_ns = 25 * kSec;
+  e->on_frame(a.data(), a.size(), meta, sink);
+  EXPECT_TRUE(sink.updates.back().flags & protocol::track_flags::kOnGround);
+  meta.rx_ns = 31 * kSec;
+  e->on_frame(b.data(), b.size(), meta, sink);
+  EXPECT_TRUE(sink.updates.back().flags & protocol::track_flags::kOnGround);
+  EXPECT_EQ(e->stats().altitude_dropped, 1u);
+}
+
+// The score fades over 30 s without an altitude: after a long silence any
+// altitude is taken (it cannot be checked against a stale one).
+TEST(TrackEngine, TheScoreFadesWithTheAltitudesAge) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
+  for (std::uint64_t i = 0; i < 5; ++i) feed(*e, modes::encode_df4(kIcao, 31000), (2 + i) * kSec, sink);
+  feed(*e, modes::encode_df11(kIcao), 30 * kSec, sink);  // keeps the track alive
+  feed(*e, modes::encode_df4(kIcao, 4900), 40 * kSec, sink);
+  EXPECT_EQ(last_alt(sink), 4900);
+  EXPECT_EQ(e->stats().altitude_implausible, 0u);
+}
+
+// An altitude from a better source than the stored one is taken even when
+// it is trusted less than the score (ADS-B arriving slowly: a third).
+TEST(TrackEngine, ABetterSourceReplacesAModeSAltitude) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
+  for (std::uint64_t i = 0; i < 10; ++i) feed(*e, modes::encode_df4(kIcao, 31000), 2 * kSec + i * 500'000'000ULL, sink);
+  feed(*e, modes::encode_airborne_position(kIcao, 25000, modes::cpr_encode(41.9, -87.6, false, false)), 9 * kSec,
+       sink);
+  EXPECT_EQ(last_alt(sink), 25000);
+}
+
+// TIS-B (DF18 CF 2) ranks below ADS-B: ignored while ADS-B is fresh.
+TEST(TrackEngine, TisBAltitudeIsIgnoredWhileAdsbIsFresh) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_airborne_position(kIcao, 31300, modes::cpr_encode(41.9, -87.6, false, false)), 10 * kSec,
+       sink);
+  auto tisb = modes::encode_airborne_position(kIcao, 31200, modes::cpr_encode(41.9, -87.6, true, false));
+  tisb.bytes[0] = static_cast<std::uint8_t>((18u << 3) | 2u);  // DF18, CF 2 (TIS-B, ICAO address)
+  modes::write_parity(tisb.bytes, tisb.len, 0);
+  feed(*e, tisb, 11 * kSec, sink);
+  EXPECT_EQ(e->stats().altitude_lower_source, 1u);
+  EXPECT_EQ(last_alt(sink), 31300);
+  // DF18 CF 0 (ADS-B from a non-transponder device) also ranks below DF17.
+  tisb.bytes[0] = static_cast<std::uint8_t>(18u << 3);
+  modes::write_parity(tisb.bytes, tisb.len, 0);
+  feed(*e, tisb, 12 * kSec, sink);
+  EXPECT_EQ(e->stats().altitude_lower_source, 2u);
+}
+
+// The score is capped by the altitude's age: after 15 s of silence a score
+// of 15 counts as 10, so ten implausible replies clear the altitude.
+TEST(TrackEngine, TheScoreIsCappedByTheAltitudesAge) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
+  for (std::uint64_t i = 0; i < 15; ++i) feed(*e, modes::encode_df4(kIcao, 31000), 2 * kSec + i * 100'000'000ULL, sink);
+  const std::uint64_t t0 = 2 * kSec + 14 * 100'000'000ULL + 15 * kSec;
+  feed(*e, modes::encode_df11(kIcao), t0 - kSec, sink);
+  for (std::uint64_t i = 0; i < 9; ++i) feed(*e, modes::encode_df4(kIcao, 4900), t0 + i * 10'000'000ULL, sink);
+  EXPECT_EQ(e->stats().altitude_dropped, 0u);
+  feed(*e, modes::encode_df4(kIcao, 4900), t0 + 9 * 10'000'000ULL, sink);
+  EXPECT_EQ(e->stats().altitude_dropped, 1u);
+}
+
+// The vertical rate's margin grows with its age (half the age in ms): a
+// 21 s old descent rate no longer rules out a climb of 7,500 ft/min.
+TEST(TrackEngine, AnOldVerticalRateWidensTheBand) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
+  feed(*e, modes::encode_velocity(kIcao, 300, 0, -2000), 2 * kSec, sink);
+  for (std::uint64_t i = 3; i <= 20; ++i) feed(*e, modes::encode_df4(kIcao, 10000), i * kSec, sink);
+  feed(*e, modes::encode_df4(kIcao, 10500), 23 * kSec, sink);
+  EXPECT_EQ(last_alt(sink), 10500);
+  EXPECT_EQ(e->stats().altitude_implausible, 0u);
+}
+
+// A vertical rate counts for 60 s: an expired descent rate no longer
+// narrows the band (+725 ft in 3 s = 10,875 ft/min is outside the
+// 71 s old rate's band of (-14,500, 10,500) but inside +-12,500).
+TEST(TrackEngine, AVerticalRateExpiresAfterSixtySeconds) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
+  feed(*e, modes::encode_velocity(kIcao, 300, 0, -2000), 2 * kSec, sink);
+  for (std::uint64_t i = 3; i <= 70; ++i) feed(*e, modes::encode_df4(kIcao, 10000), i * kSec, sink);
+  feed(*e, modes::encode_df4(kIcao, 10725), 73 * kSec, sink);
+  EXPECT_EQ(last_alt(sink), 10725);
+}
+
+// When a rejection clears a GNSS altitude, its GNSS flag goes too.
+TEST(TrackEngine, ClearingAGnssAltitudeClearsItsFlag) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_airborne_position(kIcao, 31000, modes::cpr_encode(41.9, -87.6, false, false), 20), 10 * kSec,
+       sink);
+  ASSERT_TRUE(sink.updates.back().flags & protocol::track_flags::kAltitudeGnss);
+  feed(*e, modes::encode_df11(kIcao), 30 * kSec, sink);
+  // 29.5 s later the score is down to 1; one implausible reply empties it.
+  feed(*e, modes::encode_df4(kIcao, 4900), 39 * kSec + 500'000'000ULL, sink);
+  EXPECT_EQ(e->stats().altitude_dropped, 1u);
+  EXPECT_EQ(sink.updates.back().alt_ft, TrackUpdate::kAltFtNull);
+  EXPECT_FALSE(sink.updates.back().flags & protocol::track_flags::kAltitudeGnss);
+}
+
+// ---- Air/ground (readsb's rules) --------------------------------------------
+
+bool on_ground(const CollectSink& s) {
+  return !s.updates.empty() && (s.updates.back().flags & protocol::track_flags::kOnGround) != 0;
+}
+
+// A transponder with CA 7 never says "airborne": the first airborne
+// position after surface positions clears "on ground".
+TEST(TrackEngine, AnAirbornePositionEndsTheGroundStateOfACa7Transponder) {
+  EngineConfig cfg;
+  cfg.has_receiver = true;
+  cfg.receiver_lat = 41.878;
+  cfg.receiver_lon = -87.647;
+  auto e = std::make_unique<TrackEngine>(cfg);
+  CollectSink sink;
+  for (std::uint64_t i = 0; i < 3; ++i) {
+    feed(*e, modes::encode_surface_position(kIcao, 20, 90, modes::cpr_encode(41.786, -87.752, i % 2 == 1, true), 7, 7),
+         (5 + i) * kSec, sink);
+  }
+  EXPECT_TRUE(on_ground(sink));
+  feed(*e, modes::encode_airborne_position(kIcao, 1500, modes::cpr_encode(41.79, -87.76, false, false), 11, 7),
+       60 * kSec, sink);
+  EXPECT_FALSE(on_ground(sink));
+}
+
+// The airborne state an airborne position sets counts as CRC-checked: a
+// reply's "on ground" cannot undo it for 120 s, even once the positions are
+// no longer recent.
+TEST(TrackEngine, AnAirbornePositionOutranksLaterRepliesForTwoMinutes) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao, 7), 1 * kSec, sink);
+  feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 2 * kSec, sink);
+  EXPECT_TRUE(on_ground(sink));
+  feed(*e, modes::encode_airborne_position(kIcao, 1500, modes::cpr_encode(41.79, -87.76, false, false), 11, 7),
+       60 * kSec, sink);
+  EXPECT_FALSE(on_ground(sink));
+  feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 100 * kSec, sink);
+  EXPECT_FALSE(on_ground(sink));
+  for (std::uint64_t t = 120; t <= 180; t += 20) feed(*e, modes::encode_df11(kIcao, 7), t * kSec, sink);  // keep it alive
+  feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 181 * kSec, sink);
+  EXPECT_TRUE(on_ground(sink));
+}
+
+// A transponder that says "on ground" (CA 4) while sending airborne
+// positions stays on the ground: an airborne position only overrides the
+// frame's own ground indication right after a surface position.
+TEST(TrackEngine, AirbornePositionsWithCa4KeepTheGroundState) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  for (std::uint64_t i = 0; i < 3; ++i) {
+    feed(*e, modes::encode_airborne_position(kIcao, 600, modes::cpr_encode(41.786, -87.752, i % 2 == 1, false), 11, 4),
+         (10 + i) * kSec, sink);
+  }
+  EXPECT_TRUE(on_ground(sink));
+}
+
+// A reply's "on ground" (FS 1) is ignored while positions are recent, so a
+// misattributed reply cannot ground a flying aircraft; without recent
+// positions it is taken.
+TEST(TrackEngine, AReplysOnGroundIsIgnoredWhilePositionsAreRecent) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_airborne_position(kIcao, 31000, modes::cpr_encode(41.9, -87.6, false, false)), 10 * kSec,
+       sink);
+  feed(*e, modes::encode_airborne_position(kIcao, 31000, modes::cpr_encode(41.9, -87.6, true, false)),
+       10 * kSec + 500'000'000ULL, sink);
+  EXPECT_FALSE(on_ground(sink));
+  feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 12 * kSec, sink);
+  EXPECT_FALSE(on_ground(sink));
+  feed(*e, modes::encode_df11(kIcao, 6), 31 * kSec, sink);  // CA 6: alive, no air/ground
+  // Positions are old now, but "airborne" came from DF17 (CA 5) 22 s ago:
+  // a reply cannot override that for 120 s.
+  feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 32 * kSec, sink);
+  EXPECT_FALSE(on_ground(sink));
+  for (std::uint64_t t = 40; t <= 120; t += 20) feed(*e, modes::encode_df11(kIcao, 6), t * kSec, sink);
+  feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 131 * kSec, sink);
+  EXPECT_TRUE(on_ground(sink));
+}
+
+// A Mode S-only aircraft (no positions; DF11 with CA 6 says nothing about
+// air/ground) takes "on ground" from its replies.
+TEST(TrackEngine, AModeSOnlyAircraftTakesOnGroundFromReplies) {
+  auto e = std::make_unique<TrackEngine>();
+  CollectSink sink;
+  feed(*e, modes::encode_df11(kIcao, 6), 1 * kSec, sink);
+  feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 2 * kSec, sink);
+  EXPECT_TRUE(on_ground(sink));
+}
+
+// A repaired frame (fix_single_bit) is not trusted like a clean one: it
+// cannot move an ADS-B altitude that is reliable.
+TEST(TrackEngine, ARepairedFrameCannotJumpAReliableAltitude) {
+  EngineConfig cfg;
+  cfg.fix_single_bit = true;
+  auto e = std::make_unique<TrackEngine>(cfg);
+  CollectSink sink;
+  for (std::uint64_t i = 0; i < 3; ++i) {
+    feed(*e, modes::encode_airborne_position(kIcao, 31000, modes::cpr_encode(41.9, -87.6, i % 2 == 1, false)),
+         10 * kSec + i * 500'000'000ULL, sink);
+  }
+  auto bad = modes::encode_airborne_position(kIcao, 4900, modes::cpr_encode(41.9, -87.6, true, false));
+  bad.bytes[9] ^= 0x10;  // one wrong bit in the ME field: repaired, so the altitude stays 4,900
+  feed(*e, bad, 11 * kSec + 500'000'000ULL, sink);
+  EXPECT_EQ(e->stats().corrected, 1u);
+  EXPECT_EQ(e->stats().altitude_implausible, 1u);
+  EXPECT_EQ(last_alt(sink), 31000);
+}
+
+TEST(TrackEngine, AltitudePlausibilityCanBeSwitchedOff) {
+  EngineConfig cfg;
+  cfg.altitude_plausibility = false;
+  auto e = std::make_unique<TrackEngine>(cfg);
+  CollectSink sink;
+  feed(*e, modes::encode_airborne_position(kIcao, 31300, modes::cpr_encode(41.9, -87.6, false, false)), 10 * kSec,
+       sink);
+  feed(*e, modes::encode_df4(kIcao, 4900), 11 * kSec, sink);
+  EXPECT_EQ(last_alt(sink), 4900);
+  EXPECT_EQ(e->stats().altitude_lower_source + e->stats().altitude_implausible, 0u);
 }
 
 TEST(TrackEngine, GlobalThenLocalPositionDecoding) {
@@ -583,7 +945,7 @@ TEST(TrackEngine, NacpAndSilFromOperationalStatusAndTargetState) {
   // Target state (TC 29, published frame, NACp 9 SIL 3 per hour) of another aircraft.
   auto e2 = std::make_unique<TrackEngine>();
   CollectSink s2;
-  const auto ts = test::hex("8DA05629EA21485CBF3F8CADAEEB");
+  const auto ts = adsb::test::hex("8DA05629EA21485CBF3F8CADAEEB");
   FrameMeta meta;
   meta.rx_ns = 20 * kSec;
   e2->on_frame(ts.data(), ts.size(), meta, s2);

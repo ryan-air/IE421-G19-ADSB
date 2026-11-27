@@ -23,6 +23,22 @@
 //    impossible speed is rejected, unless consecutive global decodes keep
 //    disagreeing with the stored position, in which case the stored one is
 //    assumed wrong and replaced.
+//  * Altitudes (readsb's rules, track.c v3.16.21): an altitude from a lower
+//    source (Address/Parity < TIS-B < ADS-R < ADS-B) is ignored while the
+//    stored one is younger than 15 s; otherwise a change of 300 ft or more
+//    must fit a climb rate (+-12,500 ft/min, or the vertical rate +- a
+//    margin growing with its age), or the message must be trusted more than
+//    the track's reliability score (ADS-B is; a single Address/Parity reply
+//    is not). A rejected altitude lowers the score; at zero the altitude is
+//    dropped and the next one is taken. This stops one corrupted or
+//    misattributed reply from moving an aircraft by thousands of feet.
+//  * Air/ground (readsb's rules): Address/Parity replies only ever say "on
+//    ground" (the decoder takes nothing else from them), and are ignored
+//    while both CPR slots are under 20 s old or while the state came from a
+//    CRC-checked frame (DF11/17/18) less than 120 s ago; an airborne position clears
+//    "on ground" unless the same frame says on ground and the previous
+//    position was airborne too (transponders with CA 6/7, which never say
+//    "airborne", would otherwise stay on the ground after takeoff).
 //  * Expiry: a 64-second timing wheel driven by event time; a track with no
 //    frames for `track_timeout_ns` is deleted.
 //
@@ -62,6 +78,8 @@ struct EngineConfig {
   // does it by default). Off: a corrupted frame is dropped. A repaired
   // frame only updates an already confirmed track (it never creates one).
   bool fix_single_bit = false;
+  // The altitude rules above; off = every in-order altitude is taken.
+  bool altitude_plausibility = true;
 };
 
 // Information about the frame that is not in DecodedMsg.
@@ -82,6 +100,9 @@ struct EngineStats {
   std::uint64_t ap_rejected = 0;         // Address/Parity with no confirmed track
   std::uint64_t duplicates = 0;
   std::uint64_t out_of_order = 0;        // field-group updates ignored as stale
+  std::uint64_t altitude_lower_source = 0;  // ignored: a better source's altitude is under 15 s old
+  std::uint64_t altitude_implausible = 0;   // rejected by the climb-rate / reliability check
+  std::uint64_t altitude_dropped = 0;       // ... of which emptied the reliability score: altitude cleared
   std::uint64_t cpr_global = 0;
   std::uint64_t cpr_local = 0;
   std::uint64_t cpr_unresolved = 0;      // no pair and no reference yet
@@ -379,12 +400,104 @@ class BasicTrackEngine {
     set_flag(h, tf::kAirDataCommB, true, mask, kAirData);
   }
 
+  // Altitude sources, lowest first (readsb's datasource_t order).
+  enum AltSource : std::uint8_t {
+    kAltNone = 0, kAltModeS = 1, kAltTisb = 2, kAltAdsr = 3, kAltNonTransponder = 4, kAltAdsb = 5
+  };
+  static std::uint8_t altitude_source(const modes::DecodedMsg& m) noexcept {
+    if (m.df == 17) return kAltAdsb;
+    if (m.df == 18) return m.ca <= 1 ? kAltNonTransponder : m.ca == 6 ? kAltAdsr : kAltTisb;  // CF
+    return kAltModeS;  // Address/Parity replies
+  }
+
+  // readsb's accept_data source rule plus its altitude reliability check
+  // (track.c v3.16.21, updateAltitude). Returns whether to store the
+  // altitude; on a rejection that empties the score the stored altitude is
+  // cleared (reported under kAltitude). A repaired frame (fix_single_bit)
+  // is not trusted, as in readsb (its CRC field stays non-zero).
+  // Differences from readsb: the 15 s source window is measured from the
+  // stored altitude, not from the aircraft's last reliable frame (in readsb,
+  // when ADS-B stops but replies continue, they stay blocked until the
+  // ADS-B altitude expires at 60 s; here after 15 s); GNSS altitudes (TC
+  // 20-22) share the field and the check with barometric ones (readsb keeps
+  // them apart); readsb's Gillham > 50,175 ft rule and its MLAT / network
+  // special cases do not apply here.
+  bool accept_altitude(HotTrack& h, ColdTrack& c, const modes::DecodedMsg& m, std::uint64_t rx,
+                       std::uint16_t& mask) noexcept {
+    constexpr int kMax = 20;  // ALTITUDE_BARO_RELIABLE_MAX
+    const std::uint8_t src = altitude_source(m);
+    const std::uint64_t age_ns = rx - h.alt_ts_ns;  // since the last accepted altitude
+    const auto age_ms = static_cast<std::int64_t>(std::min<std::uint64_t>(age_ns / 1'000'000, 1ULL << 40));
+    // How much this message is trusted: a clean frame from an ADS-B-class
+    // source fully while altitudes arrive quickly, a third otherwise.
+    const int good = (src >= kAltTisb && m.corrected_bit < 0) ? (age_ms < 2000 ? kMax : kMax / 3) : 0;
+    if (!cfg_.altitude_plausibility || !(h.valid & kHasAltitude)) {
+      c.alt_reliable = static_cast<std::int8_t>(std::min(kMax, good + 1));
+      c.alt_source = src;
+      return true;
+    }
+    const int delta = static_cast<int>(m.altitude_ft) - static_cast<int>(h.alt_ft);
+    int rel = c.alt_reliable;
+    // A change of 300 ft or more first caps the score by the altitude's age
+    // (readsb does this before its source check, so it sticks either way).
+    if (std::abs(delta) >= 300) {
+      rel = age_ms < 30000 ? std::min(rel, static_cast<int>(kMax - kMax * age_ms / 30000)) : 0;
+      c.alt_reliable = static_cast<std::int8_t>(rel);
+    }
+    if (src < c.alt_source && age_ns < 15'000'000'000ULL) {
+      ++stats_.altitude_lower_source;
+      return false;
+    }
+    bool accept = false;
+    if (std::abs(delta) < 300) {
+      accept = true;
+    } else {
+      const std::int64_t fpm = static_cast<std::int64_t>(delta) * 600 / (age_ms / 100 + 10);
+      std::int64_t lo = -12500, hi = 12500;
+      // A vertical rate counts while it is valid (readsb: 60 s), with a
+      // margin growing with its own age.
+      const std::uint64_t vr_age_ns = rx > c.vrate_ts_ns ? rx - c.vrate_ts_ns : 0;
+      if ((h.valid & kHasVerticalRate) && vr_age_ns < 60'000'000'000ULL) {
+        const auto vr_age_ms = static_cast<std::int64_t>(vr_age_ns / 1'000'000);
+        const std::int64_t slack = 1500 + std::min<std::int64_t>(11000, vr_age_ms / 2);
+        lo = h.vrate_fpm - slack;
+        hi = h.vrate_fpm + slack;
+      }
+      if (fpm > lo && fpm < hi) {
+        accept = true;
+      } else if (good >= rel || src > c.alt_source) {
+        accept = true;
+        rel = 0;
+      }
+    }
+    if (accept) {
+      c.alt_reliable = static_cast<std::int8_t>(std::min(kMax, rel + good + 1));
+      c.alt_source = src;
+      return true;
+    }
+    ++stats_.altitude_implausible;
+    rel -= good + 1;
+    if (rel <= 0) {
+      ++stats_.altitude_dropped;
+      rel = 0;
+      c.alt_source = kAltNone;
+      h.valid = static_cast<std::uint16_t>(h.valid & ~kHasAltitude);
+      h.wire_flags = static_cast<std::uint8_t>(h.wire_flags & ~protocol::track_flags::kAltitudeGnss);
+      mask |= protocol::update_mask::kAltitude;
+    }
+    c.alt_reliable = static_cast<std::int8_t>(rel);
+    return false;
+  }
+
   void apply_fields(HotTrack& h, ColdTrack& c, const modes::DecodedMsg& m, std::uint64_t rx,
                     std::uint16_t& mask) noexcept {
     namespace um = protocol::update_mask;
     namespace tf = protocol::track_flags;
 
-    if (m.has(modes::kFieldAltitude) && fresh(h.alt_ts_ns, rx)) {
+    if (m.has(modes::kFieldAltitude) && rx < h.alt_ts_ns) {
+      ++stats_.out_of_order;
+    } else if (m.has(modes::kFieldAltitude) && accept_altitude(h, c, m, rx, mask)) {
+      h.alt_ts_ns = rx;
       set_field(h.alt_ft, m.altitude_ft, h.valid, kHasAltitude, mask, um::kAltitude);
       const std::uint8_t gnss = m.altitude_gnss ? tf::kAltitudeGnss : 0;
       if ((h.wire_flags & tf::kAltitudeGnss) != gnss) {
@@ -410,6 +523,7 @@ class BasicTrackEngine {
       if (m.has(modes::kFieldVerticalRate)) {
         const auto vr = static_cast<std::int16_t>(std::clamp(m.vertical_rate_fpm, -32767, 32767));
         set_field(h.vrate_fpm, vr, h.valid, kHasVerticalRate, mask, um::kVerticalRate);
+        c.vrate_ts_ns = rx;
       }
       if (m.has(modes::kFieldHeading)) {
         auto hd = static_cast<std::uint16_t>(std::lround(static_cast<double>(m.heading_deg) * 100.0));
@@ -486,7 +600,17 @@ class BasicTrackEngine {
     if (m.has(modes::kFieldSquawk) && fresh(c.squawk_ts_ns, rx)) {
       set_field(h.squawk, m.squawk, h.valid, kHasSquawk, mask, um::kSquawk);
     }
-    if (m.has(modes::kFieldAirGround) && fresh(c.ground_ts_ns, rx)) {
+    // An Address/Parity reply's "on ground" is ignored while positions are
+    // recent: its address comes from its CRC, a position's from the frame.
+    const bool ap = m.df != 11 && m.df != 17 && m.df != 18;
+    constexpr std::uint64_t kCprRecentNs = 20'000'000'000ULL;
+    const bool cpr_recent = c.cpr_even.valid && c.cpr_odd.valid && rx < c.cpr_even.ts_ns + kCprRecentNs &&
+                            rx < c.cpr_odd.ts_ns + kCprRecentNs;
+    // ... and while the state came from a CRC-checked frame less than 120 s
+    // ago (readsb: a lower source waits 2 x TRACK_EXPIRE for ground state).
+    const bool better_state = c.ground_source > 1 && rx < c.ground_ts_ns + 120'000'000'000ULL;
+    if (m.has(modes::kFieldAirGround) && !(ap && (cpr_recent || better_state)) && fresh(c.ground_ts_ns, rx)) {
+      c.ground_source = ap ? 1 : 2;
       const std::uint8_t g = m.on_ground ? tf::kOnGround : 0;
       if (!(h.valid & kHasAirGround) || (h.wire_flags & tf::kOnGround) != g) {
         h.wire_flags = static_cast<std::uint8_t>((h.wire_flags & ~tf::kOnGround) | g);
@@ -522,6 +646,24 @@ class BasicTrackEngine {
         ((h.valid & kHasPosition) && rx < h.pos_ts_ns)) {
       ++stats_.out_of_order;
       return;
+    }
+    // An airborne position clears "on ground" (readsb track.c, new CPR):
+    // after a surface position always, otherwise unless this frame itself
+    // says on ground (readsb's "uncertain" state is shown here as not on
+    // ground). Surface positions set it through the decoder.
+    if (!surface && (h.valid & kHasAirGround) && (h.wire_flags & protocol::track_flags::kOnGround) &&
+        rx >= c.ground_ts_ns) {
+      const CprSlot& newest = (c.cpr_odd.valid && (!c.cpr_even.valid || c.cpr_odd.ts_ns >= c.cpr_even.ts_ns))
+                                  ? c.cpr_odd
+                                  : c.cpr_even;
+      const bool after_surface = newest.valid && newest.surface;
+      const bool says_ground = m.has(modes::kFieldAirGround) && m.on_ground;
+      if (after_surface || !says_ground) {
+        h.wire_flags = static_cast<std::uint8_t>(h.wire_flags & ~protocol::track_flags::kOnGround);
+        c.ground_ts_ns = rx;
+        c.ground_source = 2;
+        mask |= protocol::update_mask::kAirGround;
+      }
     }
     // Supplements expire like readsb's (TRACK_EXPIRE, 60 s after the last TC 31).
     constexpr std::uint64_t kSupplementTtlNs = 60'000'000'000ULL;

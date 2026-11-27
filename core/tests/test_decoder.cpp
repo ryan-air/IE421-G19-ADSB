@@ -210,6 +210,36 @@ TEST(Decoder, AddressParityFormatsRecoverAddress) {
   }
 }
 
+// Only "on ground" is taken from an Address/Parity reply (as readsb): VS 0
+// and flight status 0/2/4/5 carry no air/ground field. The two replies are
+// real (dump1090-fa capture, Chicago, 2026-11-19): A5AA78 parked at Midway.
+TEST(Decoder, AddressParityRepliesOnlyReportOnGround) {
+  const auto a = hex("02E19190CA27F5");  // DF0, VS 0, 27,000 ft (a misattributed reply)
+  const auto b = hex("064600B5024FD1");  // DF0, VS 1, 325 ft
+  DecodedMsg m;
+  ASSERT_EQ(decode(a.data(), a.size(), m), DecodeStatus::kAddressParity);
+  EXPECT_EQ(m.icao, 0xA5AA78u);
+  EXPECT_EQ(m.altitude_ft, 27000);
+  EXPECT_FALSE(m.has(kFieldAirGround));
+  ASSERT_EQ(decode(b.data(), b.size(), m), DecodeStatus::kAddressParity);
+  EXPECT_EQ(m.icao, 0xA5AA78u);
+  EXPECT_EQ(m.altitude_ft, 325);
+  ASSERT_TRUE(m.has(kFieldAirGround));
+  EXPECT_TRUE(m.on_ground);
+  for (unsigned fs = 0; fs < 8; ++fs) {
+    std::uint8_t f[7] = {static_cast<std::uint8_t>((4u << 3) | fs), 0, 0x18, 0x38};
+    const std::uint32_t ap = crc24(f, 4) ^ 0xABCDEFu;
+    f[4] = static_cast<std::uint8_t>(ap >> 16);
+    f[5] = static_cast<std::uint8_t>(ap >> 8);
+    f[6] = static_cast<std::uint8_t>(ap);
+    ASSERT_EQ(decode(f, 7, m), DecodeStatus::kAddressParity) << fs;
+    EXPECT_EQ(m.has(kFieldAirGround), fs == 1 || fs == 3) << fs;
+    if (m.has(kFieldAirGround)) {
+      EXPECT_TRUE(m.on_ground) << fs;
+    }
+  }
+}
+
 TEST(Decoder, Df11AllCall) {
   std::uint8_t f[7] = {static_cast<std::uint8_t>((11u << 3) | 5u), 0x48, 0x40, 0xD6};
   // II = 0: parity is the plain CRC.

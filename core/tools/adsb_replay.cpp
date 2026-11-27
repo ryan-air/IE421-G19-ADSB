@@ -34,6 +34,8 @@ namespace {
                "  --allow-truncated read a recording that has no footer (recorder was killed)\n"
                "  --hash-only       print only the output hash\n"
                "  --fix             repair one wrong bit in DF17/18 frames (as readsb does by default)\n"
+               "  --no-altitude-check  take every in-order altitude (no source / climb-rate check;\n"
+               "                    the behaviour before it existed, for comparisons)\n"
                "  --arbitrate       A/B line arbitration first: forward each frame's first copy only,\n"
                "                    and report each line's contribution (README_UPDATES.md §6)\n"
                "  --arb-window-us N arbitration window (default 5000)\n"
@@ -58,6 +60,7 @@ int main(int argc, char** argv) {
   adsb::replay::ReplayOptions opt;
   opt.flush_at_end = true;
   bool pipeline = false, allow_truncated = false, hash_only = false, book_digest = false, fix = false;
+  bool altitude_check = true;
   int reader_cpu = -1, worker_cpu = -1;
   bool arbitrate = false;
   adsb::ingest::ArbiterConfig arb_cfg;
@@ -84,6 +87,7 @@ int main(int argc, char** argv) {
     else if (a == "--allow-truncated") allow_truncated = true;
     else if (a == "--hash-only") hash_only = true;
     else if (a == "--fix") fix = true;
+    else if (a == "--no-altitude-check") altitude_check = false;
     else if (a == "--book-digest") book_digest = true;
     else if (a == "--arbitrate") arbitrate = true;
     else if (a == "--arb-window-us") {
@@ -109,6 +113,7 @@ int main(int argc, char** argv) {
 
   adsb::state::EngineConfig ecfg;
   ecfg.fix_single_bit = fix;
+  ecfg.altitude_plausibility = altitude_check;
   if (rd.info().has_receiver_position) {
     ecfg.has_receiver = true;
     ecfg.receiver_lat = rd.info().receiver_lat;
@@ -171,6 +176,8 @@ int main(int argc, char** argv) {
   if (s.mode_ac) std::printf("mode a/c    %llu replies (no address: not tracked)\n", u(s.mode_ac));
   std::printf("positions   global %llu, local %llu, unresolved %llu, rejected %llu, re-anchored %llu\n",
               u(s.cpr_global), u(s.cpr_local), u(s.cpr_unresolved), u(s.cpr_rejected), u(s.cpr_reanchored));
+  std::printf("altitudes   ignored (better source fresh) %llu, implausible %llu, cleared %llu\n",
+              u(s.altitude_lower_source), u(s.altitude_implausible), u(s.altitude_dropped));
   std::printf("tracks      created %llu, expired %llu, live %zu, table full %llu\n", u(s.tracks_created),
               u(s.tracks_expired), engine->track_count(), u(s.table_full));
   std::printf("output      %llu updates, %llu deletes\n", u(r.updates), u(r.deletes));

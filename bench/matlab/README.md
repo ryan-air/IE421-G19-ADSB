@@ -25,8 +25,9 @@ core/build/release/tools/adsb-demod core/build/matlab-comparison/busy.sigmf-meta
 ```
 
 Open the MathWorks receiver example from the documentation so MATLAB has local
-copies of its helpers and `defaultinputsADSB.mat`. From the example directory,
-run the following with an absolute path to the repository:
+copies of its helpers and `defaultinputsADSB.mat`. In R2025b, use
+`openExample('comm/AirplaneTrackingUsingADSBSignalsExample')`. From the
+example directory, run the following with an absolute path to the repository:
 
 ```matlab
 repo = '/absolute/path/to/IE421-G19-ADSB';
@@ -78,3 +79,36 @@ and radio-horizon loss.
 The frequency row exercises the method, including Doppler and receiver-error
 removal. Estimating stability by aircraft type requires real IQ and aircraft
 type metadata. See the [carrier study procedure](../../REPRODUCING.md#transponder-carrier-frequency-study-method).
+
+## Measured comparison
+
+MATLAB R2025b Update 7, Communications Toolbox 25.2, and `adsb-demod` from
+`af48290`. The pilot used 20 aircraft and 3 seconds of traffic. The remaining
+cases used 6 seconds of traffic, 150 aircraft unless specified, and the flags
+in the scenario matrix. Every case used seed 421, 2.4 MS/s `cu8`, and a
+1-second tail. The table counts matched DF17 messages out of the rendered
+truth, including weak and overlapping frames.
+
+| Scenario | DF17 truth | adsb-demod matched | MathWorks matched |
+|---|---:|---:|---:|
+| Pilot | 234 | 211 | 195 |
+| Baseline | 3,417 | 2,746 | 2,571 |
+| Weak | 3,316 | 373 | 197 |
+| Multipath | 3,417 | 1,801 | 1,526 |
+| Horizon, k = 1 | 2,635 | 1,995 | 1,810 |
+| Horizon, k = 1.333 | 2,940 | 2,358 | 2,064 |
+| Doppler disabled | 3,417 | 2,748 | 2,570 |
+| Busy, 600 aircraft | 13,615 | 7,614 | 6,564 with expanded capacity |
+
+The stock MathWorks example stopped on the busy case when the candidate count
+exceeded its 45-slot buffer. For the busy value in the table, construct the
+adapter with `mathworksReceiver(exampleDir, 180)`. This changes the candidate
+buffer capacity while leaving the example's detection logic and frame size
+in place. Other rows use the default adapter.
+
+The largest absolute MathWorks timestamp residual after fitting a constant
+offset was 0.36 samples or less outside the multipath case, where it reached
+2.60 samples. In the multipath case the scorer counted 10 unmatched DF17
+outputs from `adsb-demod` and two from MathWorks. These are synthetic waveform
+results on one seed. The horizon settings change which frames are rendered,
+so their recall denominators differ.

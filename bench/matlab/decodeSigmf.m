@@ -4,8 +4,12 @@ function count = decodeSigmf(metaFile, beastFile, receiver)
 % function returning a struct array with RawBits, CRCError, and Time.
 % Time is the packet time in seconds from the start of the recording.
 meta = jsondecode(fileread(metaFile));
-% jsondecode renames keys that are MATLAB keywords, including "global".
-globalInfo = meta.(matlab.lang.makeValidName('global'));
+% MATLAB keeps this key; Octave prefixes it because it is a keyword.
+if isfield(meta, 'global')
+    globalInfo = meta.('global');
+else
+    globalInfo = meta.(matlab.lang.makeValidName('global'));
+end
 sampleRate = globalInfo.core_sample_rate;
 if sampleRate ~= receiver.SampleRate
     error('adsb:SampleRate', 'Recording is %g Hz; receiver expects %g Hz.', ...

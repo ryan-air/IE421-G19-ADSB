@@ -214,7 +214,7 @@ TEST(TrackEngine, OneImplausibleReplyCannotMoveAModeSAircraft) {
   auto e = std::make_unique<TrackEngine>();
   CollectSink sink;
   feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
-  for (int i = 0; i < 5; ++i) feed(*e, modes::encode_df4(kIcao, 31000), (2 + i) * kSec, sink);
+  for (std::uint64_t i = 0; i < 5; ++i) feed(*e, modes::encode_df4(kIcao, 31000), (2 + i) * kSec, sink);
   feed(*e, modes::encode_df4(kIcao, 4900), 7 * kSec, sink);
   feed(*e, modes::encode_df4(kIcao, 31000), 8 * kSec, sink);
   EXPECT_EQ(e->stats().altitude_implausible, 1u);
@@ -251,7 +251,7 @@ TEST(TrackEngine, AltitudeChangesMustFitTheClimbRate) {
     ::feed(*e, f, 1000 * kSec + t, s);
   };
   feed(modes::encode_df11(kIcao), 1 * kSec, sink);
-  for (int i = 0; i < 5; ++i) feed(modes::encode_df4(kIcao, 10000), (2 + i) * kSec, sink);
+  for (std::uint64_t i = 0; i < 5; ++i) feed(modes::encode_df4(kIcao, 10000), (2 + i) * kSec, sink);
   // +1,000 ft in 3 s = 15,000 ft/min: outside 12,500.
   feed(modes::encode_df4(kIcao, 11000), 9 * kSec, sink);
   EXPECT_EQ(last_alt(sink), 10000);
@@ -297,7 +297,7 @@ TEST(TrackEngine, AParkedAircraftStaysOnTheGroundThroughAMisattributedReply) {
   auto e = std::make_unique<TrackEngine>(cfg);
   CollectSink sink;
   const std::uint32_t icao = 0xA5AA78;
-  for (int i = 0; i < 3; ++i) {
+  for (std::uint64_t i = 0; i < 3; ++i) {
     feed(*e, modes::encode_surface_position(icao, 5, 90, modes::cpr_encode(41.7860, -87.7520, i % 2 == 1, true)),
          (5 + i) * kSec, sink);
   }
@@ -321,7 +321,7 @@ TEST(TrackEngine, TheScoreFadesWithTheAltitudesAge) {
   auto e = std::make_unique<TrackEngine>();
   CollectSink sink;
   feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
-  for (int i = 0; i < 5; ++i) feed(*e, modes::encode_df4(kIcao, 31000), (2 + i) * kSec, sink);
+  for (std::uint64_t i = 0; i < 5; ++i) feed(*e, modes::encode_df4(kIcao, 31000), (2 + i) * kSec, sink);
   feed(*e, modes::encode_df11(kIcao), 30 * kSec, sink);  // keeps the track alive
   feed(*e, modes::encode_df4(kIcao, 4900), 40 * kSec, sink);
   EXPECT_EQ(last_alt(sink), 4900);
@@ -334,7 +334,7 @@ TEST(TrackEngine, ABetterSourceReplacesAModeSAltitude) {
   auto e = std::make_unique<TrackEngine>();
   CollectSink sink;
   feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
-  for (int i = 0; i < 10; ++i) feed(*e, modes::encode_df4(kIcao, 31000), 2 * kSec + i * 500'000'000ULL, sink);
+  for (std::uint64_t i = 0; i < 10; ++i) feed(*e, modes::encode_df4(kIcao, 31000), 2 * kSec + i * 500'000'000ULL, sink);
   feed(*e, modes::encode_airborne_position(kIcao, 25000, modes::cpr_encode(41.9, -87.6, false, false)), 9 * kSec,
        sink);
   EXPECT_EQ(last_alt(sink), 25000);
@@ -365,10 +365,10 @@ TEST(TrackEngine, TheScoreIsCappedByTheAltitudesAge) {
   auto e = std::make_unique<TrackEngine>();
   CollectSink sink;
   feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
-  for (int i = 0; i < 15; ++i) feed(*e, modes::encode_df4(kIcao, 31000), 2 * kSec + i * 100'000'000ULL, sink);
+  for (std::uint64_t i = 0; i < 15; ++i) feed(*e, modes::encode_df4(kIcao, 31000), 2 * kSec + i * 100'000'000ULL, sink);
   const std::uint64_t t0 = 2 * kSec + 14 * 100'000'000ULL + 15 * kSec;
   feed(*e, modes::encode_df11(kIcao), t0 - kSec, sink);
-  for (int i = 0; i < 9; ++i) feed(*e, modes::encode_df4(kIcao, 4900), t0 + i * 10'000'000ULL, sink);
+  for (std::uint64_t i = 0; i < 9; ++i) feed(*e, modes::encode_df4(kIcao, 4900), t0 + i * 10'000'000ULL, sink);
   EXPECT_EQ(e->stats().altitude_dropped, 0u);
   feed(*e, modes::encode_df4(kIcao, 4900), t0 + 9 * 10'000'000ULL, sink);
   EXPECT_EQ(e->stats().altitude_dropped, 1u);
@@ -381,7 +381,7 @@ TEST(TrackEngine, AnOldVerticalRateWidensTheBand) {
   CollectSink sink;
   feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
   feed(*e, modes::encode_velocity(kIcao, 300, 0, -2000), 2 * kSec, sink);
-  for (int i = 3; i <= 20; ++i) feed(*e, modes::encode_df4(kIcao, 10000), i * kSec, sink);
+  for (std::uint64_t i = 3; i <= 20; ++i) feed(*e, modes::encode_df4(kIcao, 10000), i * kSec, sink);
   feed(*e, modes::encode_df4(kIcao, 10500), 23 * kSec, sink);
   EXPECT_EQ(last_alt(sink), 10500);
   EXPECT_EQ(e->stats().altitude_implausible, 0u);
@@ -395,7 +395,7 @@ TEST(TrackEngine, AVerticalRateExpiresAfterSixtySeconds) {
   CollectSink sink;
   feed(*e, modes::encode_df11(kIcao), 1 * kSec, sink);
   feed(*e, modes::encode_velocity(kIcao, 300, 0, -2000), 2 * kSec, sink);
-  for (int i = 3; i <= 70; ++i) feed(*e, modes::encode_df4(kIcao, 10000), i * kSec, sink);
+  for (std::uint64_t i = 3; i <= 70; ++i) feed(*e, modes::encode_df4(kIcao, 10000), i * kSec, sink);
   feed(*e, modes::encode_df4(kIcao, 10725), 73 * kSec, sink);
   EXPECT_EQ(last_alt(sink), 10725);
 }
@@ -430,7 +430,7 @@ TEST(TrackEngine, AnAirbornePositionEndsTheGroundStateOfACa7Transponder) {
   cfg.receiver_lon = -87.647;
   auto e = std::make_unique<TrackEngine>(cfg);
   CollectSink sink;
-  for (int i = 0; i < 3; ++i) {
+  for (std::uint64_t i = 0; i < 3; ++i) {
     feed(*e, modes::encode_surface_position(kIcao, 20, 90, modes::cpr_encode(41.786, -87.752, i % 2 == 1, true), 7, 7),
          (5 + i) * kSec, sink);
   }
@@ -454,7 +454,7 @@ TEST(TrackEngine, AnAirbornePositionOutranksLaterRepliesForTwoMinutes) {
   EXPECT_FALSE(on_ground(sink));
   feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 100 * kSec, sink);
   EXPECT_FALSE(on_ground(sink));
-  for (int t = 120; t <= 180; t += 20) feed(*e, modes::encode_df11(kIcao, 7), t * kSec, sink);  // keep it alive
+  for (std::uint64_t t = 120; t <= 180; t += 20) feed(*e, modes::encode_df11(kIcao, 7), t * kSec, sink);  // keep it alive
   feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 181 * kSec, sink);
   EXPECT_TRUE(on_ground(sink));
 }
@@ -465,7 +465,7 @@ TEST(TrackEngine, AnAirbornePositionOutranksLaterRepliesForTwoMinutes) {
 TEST(TrackEngine, AirbornePositionsWithCa4KeepTheGroundState) {
   auto e = std::make_unique<TrackEngine>();
   CollectSink sink;
-  for (int i = 0; i < 3; ++i) {
+  for (std::uint64_t i = 0; i < 3; ++i) {
     feed(*e, modes::encode_airborne_position(kIcao, 600, modes::cpr_encode(41.786, -87.752, i % 2 == 1, false), 11, 4),
          (10 + i) * kSec, sink);
   }
@@ -490,7 +490,7 @@ TEST(TrackEngine, AReplysOnGroundIsIgnoredWhilePositionsAreRecent) {
   // a reply cannot override that for 120 s.
   feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 32 * kSec, sink);
   EXPECT_FALSE(on_ground(sink));
-  for (int t = 40; t <= 120; t += 20) feed(*e, modes::encode_df11(kIcao, 6), t * kSec, sink);
+  for (std::uint64_t t = 40; t <= 120; t += 20) feed(*e, modes::encode_df11(kIcao, 6), t * kSec, sink);
   feed(*e, modes::encode_df5(kIcao, 0x1200, 1), 131 * kSec, sink);
   EXPECT_TRUE(on_ground(sink));
 }
@@ -512,7 +512,7 @@ TEST(TrackEngine, ARepairedFrameCannotJumpAReliableAltitude) {
   cfg.fix_single_bit = true;
   auto e = std::make_unique<TrackEngine>(cfg);
   CollectSink sink;
-  for (int i = 0; i < 3; ++i) {
+  for (std::uint64_t i = 0; i < 3; ++i) {
     feed(*e, modes::encode_airborne_position(kIcao, 31000, modes::cpr_encode(41.9, -87.6, i % 2 == 1, false)),
          10 * kSec + i * 500'000'000ULL, sink);
   }

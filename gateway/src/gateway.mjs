@@ -636,6 +636,12 @@ export class Gateway {
   // /api/collisions/kalman?time_horizon=&confidence=: aircraft with a
   // position and altitude, updated in the last 2 minutes, with at least 2
   // positions in the last 10 minutes (all in event time).
+  //
+  // Aircraft on the ground take no part (a change from the Fall 2025 logic,
+  // which checked every pair): like TCAS, which does not treat aircraft on
+  // the ground as threats. On real traffic almost every warning was between
+  // aircraft parked at Midway, or an arrival passing over them. Counted in
+  // on_ground_excluded.
   async collisions(params) {
     const timeHorizon = Number.parseInt(params.get('time_horizon')) || 300;
     const confidence = Number.parseFloat(params.get('confidence')) || 0.95;
@@ -646,8 +652,13 @@ export class Gateway {
     if (hit && wallMs - hit.at < this.opts.collisionCacheMs) return { ...hit.body, timestamp: wallMs, cached: true };
     const t0 = performance.now();
     const nowMs = this.eventNowMs();
+    let onGround = 0;
     const active = this.aircraftList().filter((a) => {
       if (a.altitude === null) return false;
+      if (a.on_ground) {
+        onGround++;
+        return false;
+      }
       const u = this.book.tracks.get(Number.parseInt(a.hex, 16));
       return Number(u.readBigUInt64LE(8) / 1_000_000n) >= nowMs - kCollisionActiveMs;
     });
@@ -665,6 +676,7 @@ export class Gateway {
         collisions: [],
         message: 'Not enough aircraft with sufficient position history',
         aircraft_count: valid.length,
+        on_ground_excluded: onGround,
         time_horizon: timeHorizon,
         confidence_level: confidence,
       };
@@ -681,7 +693,7 @@ export class Gateway {
         f.flight2 = ac2?.flight || null;
         return f;
       });
-      body = { collisions, aircraft_count: valid.length, time_horizon: timeHorizon, confidence_level: confidence };
+      body = { collisions, aircraft_count: valid.length, on_ground_excluded: onGround, time_horizon: timeHorizon, confidence_level: confidence };
     }
     this.predictionStats.collision_runs++;
     this.predictionStats.last_collisions_ms = performance.now() - t0;

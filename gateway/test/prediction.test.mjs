@@ -296,14 +296,15 @@ async function gatewayWith(gwOpts = {}) {
 
 // Feed updates for a flight: one position update per fix, event time = the
 // fix's timestamp (ms -> ns), speed/track/vertical rate on the wire.
-function flightUpdates(f, icao) {
+function flightUpdates(f, icao, { onGround = false } = {}) {
   return f.history.map((p) =>
     trackUpdate({
       icao,
+      flags: onGround ? 2 : 0,
       lat: p.lat,
       lon: p.lon,
       alt: Math.round(p.altitude),
-      mask: 1 | 2 | 4 | 8,
+      mask: 1 | 2 | 4 | 8 | 256,
       eventTs: BigInt(p.timestamp) * 1_000_000n,
       callsign: `F${icao.toString(16)}`,
       gsDkt: f.aircraft.speed * 10,
@@ -380,6 +381,43 @@ test('gateway: enriched cones and Kalman collisions from its trails, in event ti
     const later = await get(port, '/api/collisions/kalman?time_horizon=301');
     assert.equal(later.aircraft_count, 0);
     assert.deepEqual(later.collisions, []);
+  } finally {
+    await cleanup();
+  }
+});
+
+// Aircraft on the ground take no part in the collision check: two parked
+// aircraft taxiing at each other, and an aircraft flying low over one on the
+// ground, give no warning; the airborne pair still does.
+test('gateway: no collision warnings involving an aircraft on the ground', async () => {
+  const { pub, gw, port, cleanup } = await gatewayWith({ collisionCacheMs: 0 });
+  try {
+    const t0Ms = 1_700_000_000;
+    const head = (hex, lat, lon, alt, kt, trackDeg) => straightFlight({ hex, lat, lon, alt, kt, trackDeg, n: 20, t0Ms });
+    const flights = [
+      [0xc00001, head('C00001', 40, -88.3, 30000, 420, 90), false],
+      [0xc00002, head('C00002', 40, -88.0, 30000, 420, 270), false],
+      [0xb00001, head('B00001', 41.786, -87.76, 600, 15, 90), true], // both on the ground
+      [0xb00002, head('B00002', 41.786, -87.74, 600, 15, 270), true],
+      [0xe00001, head('E00001', 43, -88.3, 900, 15, 90), true], // on the ground ...
+      [0xe00002, head('E00002', 43, -88.0, 900, 420, 270), false], // ... and one flying at it, as low
+    ];
+    const msgs = [];
+    for (let i = 0; i < 20; i++) for (const [icao, f, g] of flights) msgs.push(flightUpdates(f, icao, { onGround: g })[i]);
+    pub.publish(msgs);
+    await waitFor(() => gw.core.expected === msgs.length + 1, 3000, 'applied');
+    const col = await get(port, '/api/collisions/kalman');
+    assert.deepEqual(col.collisions.map((c) => [c.aircraft1, c.aircraft2]), [['C00001', 'C00002']]);
+    assert.equal(col.aircraft_count, 3);
+    assert.equal(col.on_ground_excluded, 3);
+    // The same aircraft all airborne: the Fall 2025 logic warns for all three pairs.
+    const enr = await get(port, '/api/aircraft/enriched?window=0&trails=true');
+    const list = enr.aircraft.map((a) => ({
+      ...a,
+      positionHistory: a.trail.map((p) => ({ lat: p.lat, lon: p.lon, altitude: p.altitude, timestamp: p.event_ms })),
+    }));
+    const all = atTime(t0Ms + 19_000, () => original.detectCollisions(list, 300, 0.95));
+    assert.equal(all.length, 3, 'without the ground rule every pair would warn');
   } finally {
     await cleanup();
   }

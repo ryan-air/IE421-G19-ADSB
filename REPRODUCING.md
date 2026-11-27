@@ -446,6 +446,8 @@ Never transmit these files over the air.
 
 ### Demodulator
 
+For a separate receiver implementation, see the [MATLAB comparison harness](bench/matlab/README.md).
+
 ```bash
 ./build/release/tools/adsb-demod /tmp/scene.sigmf-meta --beast /tmp/scene.beast
 python3 scripts/iq-score.py /tmp/scene.sigmf-meta /tmp/scene.beast

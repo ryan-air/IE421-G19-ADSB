@@ -88,6 +88,7 @@ To track real aircraft, run readsb with an RTL-SDR receiver and point `adsb-live
 - [SETUP.md](SETUP.md): build, test and tooling.
 - [protocol/feed_spec.md](protocol/feed_spec.md): the feed protocol.
 - [REPRODUCING.md](REPRODUCING.md): every reported result, with the commands that reproduce it and which numbers still need the benchmark host.
+- [MATLAB comparison](bench/matlab/README.md): optional DF17 cross-check and receiver diagnostics on synthetic IQ.
 - [REPORT.md](REPORT.md): the final report's skeleton, with the results so far and placeholders for the pending ones.
 
 ## Team

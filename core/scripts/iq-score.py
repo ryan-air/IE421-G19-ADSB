@@ -240,6 +240,8 @@ def main():
     ap.add_argument("meta")
     ap.add_argument("decoded")
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
+    ap.add_argument("--df", type=int, choices=range(32), action="append", metavar="N",
+                    help="score only these Mode S downlink formats (repeatable)")
     ap.add_argument("--require", action="append", default=[], help="KIND>=SNR[<SNR]:RATE, false<=N, false17<=N or timing<=SAMPLES")
     args = ap.parse_args()
 
@@ -248,6 +250,10 @@ def main():
     ac_truth = [a for a in truth_all if is_ac(a)]
     decoded = [d for d in decoded_all if len(d[1]) != 4]
     ac_decoded = [d for d in decoded_all if len(d[1]) == 4]
+    if args.df:
+        truth = [a for a in truth if int(a["adsb:hex"][:2], 16) >> 3 in args.df]
+        decoded = [d for d in decoded if int(d[1][:2], 16) >> 3 in args.df]
+        ac_truth, ac_decoded = [], []
     if timed:
         ticks = 12e6 / meta["global"]["core:sample_rate"]
         false_hex, timing = score_by_time(truth, decoded, ticks)

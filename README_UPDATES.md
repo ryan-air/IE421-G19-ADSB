@@ -657,7 +657,7 @@ Not started: hardware timestamps (§9.4), ITCH (J), and camera fusion (I).
 
 ### 22.3 What MATLAB offers
 
-Nothing like the generator described above.
+The MathWorks examples provide a receiver and a hardware-oriented packet transmitter. Our scenario generator supplies multi-aircraft traffic, channel effects, and per-message ground truth.
 
 | MATLAB resource | What it does | What it lacks |
 |---|---|---|
@@ -665,11 +665,11 @@ Nothing like the generator described above.
 | SoC Blockset example *HW/SW Co-Design Implementation of ADS-B Transmitter and Receiver* (AD9361/AD9364) | Generates one ADS-B waveform on an FPGA-based radio | One transmitter, no aircraft geometry, Doppler, or multipath; tied to that hardware |
 | General channel blocks (frequency offset, fading channels) | Building blocks that could be assembled by hand | No ADS-B scenario model |
 
-MATLAB is still useful to us as an **independent oracle**: its receiver example should decode the IQ files our generator writes (§22.4).
+We ran the MathWorks receiver as an independent comparison on the same 2.4 MS/s IQ as our demodulator. It matched 2,571 of 3,417 DF17 messages in the baseline versus 2,746 for our demodulator. The [MATLAB harness](bench/matlab/README.md) records the other scenarios, the stock buffer overflow under dense traffic, and stage-by-stage diagnostics.
 
 ### 22.4 IQ scenario generator (Workstream A)
 
-**Owner:** Role 1 (it extends the existing Must item "Synthetic IQ generator with ground truth"). Built by Ryan (`adsb-iqsynth`, `core/include/adsb/sim/iq.hpp`; status and results in `core/README.md`, *Synthetic IQ*). Everything in the tables below is modelled (ducting only as a larger k-factor); not yet checked against MATLAB's receiver. Mode A/C replies are generated too (optional, from simulated rotating SSR radars) and demodulated by our demodulator (`core/README.md`, *Mode A/C replies*).
+**Owner:** Role 1 (it extends the existing Must item "Synthetic IQ generator with ground truth"). Built by Ryan (`adsb-iqsynth`, `core/include/adsb/sim/iq.hpp`; status and results in `core/README.md`, *Synthetic IQ*). Everything in the tables below is modelled (ducting only as a larger k-factor). The MATLAB comparison covers DF17 on synthetic IQ, including weak signals, multipath, refraction settings and a Doppler-off control. Mode A/C replies are generated too (optional, from simulated rotating SSR radars) and demodulated by our demodulator (`core/README.md`, *Mode A/C replies*).
 
 **Scenario.** Reuse `adsb-synth`'s traffic and ground truth. Each aircraft has a position, altitude, velocity, transmit power class, and its own transmitter frequency model. The receiver has a location, an antenna pattern, and a model of its own impairments.
 

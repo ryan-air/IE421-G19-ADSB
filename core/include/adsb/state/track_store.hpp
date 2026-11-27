@@ -105,6 +105,10 @@ struct ColdTrack {
   CprSlot cpr_even;
   CprSlot cpr_odd;
   std::uint8_t position_reject_streak = 0;
+  // Set when rejected global fixes cleared both CPR slots (TrackEngine::apply_position):
+  // the next global fix, from two new frames, is taken without the jump check.
+  bool reanchoring = false;
+  std::uint64_t last_reject_ns = 0;  // newest rejected position fix
   // Altitude plausibility (readsb's alt_reliable, 0-20) and the source of
   // the stored altitude (TrackEngine AltSource; 0 = none).
   std::int8_t alt_reliable = 0;

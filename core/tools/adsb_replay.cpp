@@ -174,8 +174,9 @@ int main(int argc, char** argv) {
               u(s.bad_frames), u(s.duplicates), u(s.out_of_order), u(s.ap_accepted), u(s.ap_rejected));
   if (fix) std::printf("corrected   %llu frames (one bit repaired), %llu of them dropped (no confirmed track)\n", u(s.corrected), u(s.corrected_rejected));
   if (s.mode_ac) std::printf("mode a/c    %llu replies (no address: not tracked)\n", u(s.mode_ac));
-  std::printf("positions   global %llu, local %llu, unresolved %llu, rejected %llu, re-anchored %llu\n",
-              u(s.cpr_global), u(s.cpr_local), u(s.cpr_unresolved), u(s.cpr_rejected), u(s.cpr_reanchored));
+  std::printf("positions   global %llu, local %llu, unresolved %llu, rejected %llu, re-anchored %llu, resets %llu\n",
+              u(s.cpr_global), u(s.cpr_local), u(s.cpr_unresolved), u(s.cpr_rejected), u(s.cpr_reanchored),
+              u(s.cpr_resets));
   std::printf("altitudes   ignored (better source fresh) %llu, implausible %llu, cleared %llu\n",
               u(s.altitude_lower_source), u(s.altitude_implausible), u(s.altitude_dropped));
   std::printf("tracks      created %llu, expired %llu, live %zu, table full %llu\n", u(s.tracks_created),

@@ -71,8 +71,10 @@ struct EngineConfig {
   std::uint64_t dedup_window_ns = 2'000'000ULL;                   // 2 ms
   double max_speed_kt = 1000.0;          // airborne plausibility limit
   double max_surface_speed_kt = 200.0;
-  // A position is replaced after this many consecutive rejected *global*
-  // fixes: with 2, the third disagreeing global fix is accepted.
+  // After this many rejected position fixes in a row, the next rejection
+  // clears both CPR slots and the next global fix (from two new frames) is
+  // accepted without the jump check: a track anchored at a bad position
+  // recovers. A rejected frame is never kept for pairing.
   std::uint8_t reanchor_after_rejects = 2;
   // Repair one wrong bit in DF17/18 frames (modes::DecodeOptions; readsb
   // does it by default). Off: a corrupted frame is dropped. A repaired
@@ -107,7 +109,8 @@ struct EngineStats {
   std::uint64_t cpr_local = 0;
   std::uint64_t cpr_unresolved = 0;      // no pair and no reference yet
   std::uint64_t cpr_rejected = 0;        // implausible jump
-  std::uint64_t cpr_reanchored = 0;
+  std::uint64_t cpr_reanchored = 0;     // tracks moved by the first global fix after a reset
+  std::uint64_t cpr_resets = 0;         // rejections in a row that cleared both CPR slots
   std::uint64_t table_full = 0;
   std::uint64_t tracks_created = 0;
   std::uint64_t tracks_expired = 0;
@@ -639,7 +642,7 @@ class BasicTrackEngine {
                       std::uint16_t& mask) noexcept {
     const bool surface = m.cpr_surface;
     CprSlot& slot = m.cpr.odd ? c.cpr_odd : c.cpr_even;
-    const CprSlot& other = m.cpr.odd ? c.cpr_even : c.cpr_odd;
+    CprSlot& other = m.cpr.odd ? c.cpr_even : c.cpr_odd;
     // A position frame older than one already used is stale: applying it
     // would move the track backwards in time.
     if ((slot.valid && rx < slot.ts_ns) || (other.valid && rx < other.ts_ns) ||
@@ -647,10 +650,18 @@ class BasicTrackEngine {
       ++stats_.out_of_order;
       return;
     }
+    // CPR fields both zero: bogus (readsb's speed_check refuses them too).
+    // Not kept, not evidence against the stored position.
+    if (m.cpr.lat == 0 && m.cpr.lon == 0) {
+      ++stats_.cpr_rejected;
+      return;
+    }
     // An airborne position clears "on ground" (readsb track.c, new CPR):
     // after a surface position always, otherwise unless this frame itself
     // says on ground (readsb's "uncertain" state is shown here as not on
-    // ground). Surface positions set it through the decoder.
+    // ground). Surface positions set it through the decoder. Applied below,
+    // unless the frame's fix is rejected (readsb drops the whole message).
+    bool clear_ground = false;
     if (!surface && (h.valid & kHasAirGround) && (h.wire_flags & protocol::track_flags::kOnGround) &&
         rx >= c.ground_ts_ns) {
       const CprSlot& newest = (c.cpr_odd.valid && (!c.cpr_even.valid || c.cpr_odd.ts_ns >= c.cpr_even.ts_ns))
@@ -658,18 +669,24 @@ class BasicTrackEngine {
                                   : c.cpr_even;
       const bool after_surface = newest.valid && newest.surface;
       const bool says_ground = m.has(modes::kFieldAirGround) && m.on_ground;
-      if (after_surface || !says_ground) {
-        h.wire_flags = static_cast<std::uint8_t>(h.wire_flags & ~protocol::track_flags::kOnGround);
-        c.ground_ts_ns = rx;
-        c.ground_source = 2;
-        mask |= protocol::update_mask::kAirGround;
-      }
+      clear_ground = after_surface || !says_ground;
     }
+    auto apply_ground = [&] {
+      if (!clear_ground) return;
+      h.wire_flags = static_cast<std::uint8_t>(h.wire_flags & ~protocol::track_flags::kOnGround);
+      c.ground_ts_ns = rx;
+      c.ground_source = 2;
+      mask |= protocol::update_mask::kAirGround;
+    };
     // Supplements expire like readsb's (TRACK_EXPIRE, 60 s after the last TC 31).
     constexpr std::uint64_t kSupplementTtlNs = 60'000'000'000ULL;
     const unsigned version = c.adsb_version == 0xFF ? 0u : c.adsb_version;
     const bool nic_a = c.nic_a && rx <= c.nic_a_ts_ns + kSupplementTtlNs;
     const bool nic_c = c.nic_c && rx <= c.nic_c_ts_ns + kSupplementTtlNs;
+    // A frame whose position is rejected is not kept (readsb restores the
+    // aircraft to its state before such a message): one corrupt frame that
+    // passed the CRC must not pair again with every later frame.
+    const CprSlot kept = slot;
     slot = CprSlot{m.cpr, rx, true, surface, modes::position_nic(m.tc, version, nic_a, m.nic_supplement_b, nic_c),
                    (version == 0 || version > 2) ? modes::position_nuc(m.tc) : std::uint8_t{0}};
 
@@ -693,37 +710,75 @@ class BasicTrackEngine {
       }
       global = fix.has_value();
     }
-    // 2. Local decode against the track's recent position.
-    if (!fix && have_pos && rx - h.pos_ts_ns <= cfg_.local_decode_max_age_ns &&
-        ((h.wire_flags & protocol::track_flags::kSurfacePosition) != 0) == surface) {
+    // 2. Local decode against the track's recent position (not while
+    // re-anchoring: that position is the one in doubt). Surface and
+    // airborne alike, as readsb: on landing or take-off the track's last
+    // position, at most a minute old, is well within half a zone (45 NM
+    // for surface frames).
+    if (!fix && have_pos && !c.reanchoring && rx - h.pos_ts_ns <= cfg_.local_decode_max_age_ns) {
       fix = surface ? modes::cpr_local_surface(m.cpr, prev) : modes::cpr_local_airborne(m.cpr, prev);
       track_relative = fix.has_value();
     }
-    // 3. Surface positions only: local decode against the receiver.
+    // 3. Surface positions only, as a last resort: local decode against the
+    // receiver. It is right only within 45 NM of the receiver (elsewhere it
+    // lands a whole zone off), so a disagreement with the track says nothing
+    // about the frame: see below.
+    bool receiver_relative = false;
     if (!fix && surface && cfg_.has_receiver) {
       fix = modes::cpr_local_surface(m.cpr, {cfg_.receiver_lat, cfg_.receiver_lon});
+      receiver_relative = true;
     }
     if (!fix) {
       ++stats_.cpr_unresolved;
+      apply_ground();
       return;
     }
 
-    // Plausibility against the previous accepted position.
-    if (have_pos) {
+    // Plausibility against the previous accepted position. Once rejected
+    // global fixes have cleared the slots, the first global fix from two new
+    // frames re-anchors the track unchecked (readsb: reliability reached 0).
+    if (have_pos && !(global && c.reanchoring)) {
       const double dist = approx_distance_nm(prev.lat, prev.lon, fix->lat, fix->lon);
       const double dt_h = static_cast<double>(rx > h.pos_ts_ns ? rx - h.pos_ts_ns : 0) / 3.6e12;
       const double vmax = surface ? cfg_.max_surface_speed_kt : cfg_.max_speed_kt;
       const double allowed = vmax * dt_h + 0.5;  // +0.5 NM for CPR / timing slack
+      if (dist > allowed && receiver_relative) {
+        // Ambiguous, not wrong: treat the frame as unresolved (kept for
+        // pairing, no rejection). Rolling it back would leave a track far
+        // from the receiver without pairs, stuck at its stored position.
+        ++stats_.cpr_unresolved;
+        apply_ground();
+        return;
+      }
       if (dist > allowed) {
-        if (global && ++c.position_reject_streak > cfg_.reanchor_after_rejects) {
-          ++stats_.cpr_reanchored;  // the stored position was the bad one
+        ++stats_.cpr_rejected;
+        c.last_reject_ns = rx;
+        if (++c.position_reject_streak > cfg_.reanchor_after_rejects) {
+          // Too many fixes in a row disagree with the stored position:
+          // perhaps it is the bad one. As readsb's position_bad() at zero
+          // reliability, forget both CPR frames and let the next global fix
+          // decide. Unlike readsb this frame is dropped too, so that fix
+          // rests on two frames received from now on (if this one were the
+          // corrupt frame, it would otherwise be taken unchecked).
+          slot.valid = false;
+          other.valid = false;
+          c.position_reject_streak = 0;
+          c.reanchoring = true;
+          ++stats_.cpr_resets;
         } else {
-          ++stats_.cpr_rejected;
-          return;
+          slot = kept;
         }
+        return;
       }
     }
-    c.position_reject_streak = 0;
+    if (global && c.reanchoring) ++stats_.cpr_reanchored;
+    // Only a global fix from two frames received since the last rejection
+    // clears the doubt: a fix that reuses an older frame (possibly the bad
+    // one, which then keeps "confirming" a phantom) or rests on the stored
+    // position (a local fix) does not.
+    if (global && other.ts_ns > c.last_reject_ns) c.position_reject_streak = 0;
+    if (global) c.reanchoring = false;
+    apply_ground();
     ++(global ? stats_.cpr_global : stats_.cpr_local);
 
     const auto lat_e7 = static_cast<std::int32_t>(std::lround(fix->lat * 1e7));

@@ -162,10 +162,11 @@ int main(int argc, char** argv) {
   const adsb::modes::DecodeOptions opts{fix};
 
   adsb::record::Record r;
+  constexpr std::uint64_t kNsPerS = 1'000'000'000;
   std::uint64_t i = 0;
   while (i < limit && rd.next(r)) {
-    std::fprintf(out, "{\"i\":%" PRIu64 ",\"t\":%" PRIu64 ".%09" PRIu64 ",\"hex\":\"", i, r.rx_ns / 1'000'000'000ULL,
-                 r.rx_ns % 1'000'000'000ULL);
+    std::fprintf(out, "{\"i\":%" PRIu64 ",\"t\":%" PRIu64 ".%09" PRIu64 ",\"hex\":\"", i, r.rx_ns / kNsPerS,
+                 r.rx_ns % kNsPerS);
     for (unsigned k = 0; k < r.len; ++k) std::fprintf(out, "%02X", r.payload[k]);
     std::fputc('"', out);
     ++i;

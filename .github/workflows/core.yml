@@ -175,6 +175,8 @@ jobs:
       # 12 MHz counter), then replayed.
       - name: Beast import
         run: ./scripts/check-beast-import.sh build/release
+      - name: Decoder dump (adsb-decode)
+        run: ./scripts/check-decode.sh build/release
 
   protocol:
     name: feed protocol (generator + C++/JS/Python golden tests)
